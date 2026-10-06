@@ -1,6 +1,6 @@
 # stigenai fleet (k0s, Substrate installed from stigenai/substrate's k0s
 # profile). redis.yaml goes on as-is (it repeats the ax-system Namespace, so
-# it cannot share a kustomization with ax-server.yaml):
+# it cannot share a kustomization with the others):
 #   kubectl apply -f deploy/redis.yaml
 #   kubectl kustomize --load-restrictor LoadRestrictionsNone deploy/stigenai | KO_DOCKER_REPO=ghcr.io/stigenai/ax \
 #     ko resolve --bare=false -f - | kubectl apply -f -
@@ -9,19 +9,21 @@ kind: Kustomization
 
 resources:
   - ../ax-server.yaml
+  - ../ax-controller.yaml
+  - workerpool.yaml
 
 patches:
   - patch: |-
       apiVersion: apps/v1
       kind: Deployment
       metadata:
-        name: ax-server
+        name: ax-controller
         namespace: ax-system
       spec:
         template:
           spec:
             containers:
-              - name: ax-server
+              - name: controller
                 env:
                   # Substrate's k0s profile keeps snapshots in its in-cluster
                   # rustfs bucket; the storage layer reads only bucket + path,

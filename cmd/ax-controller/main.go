@@ -25,6 +25,7 @@ import (
 	"github.com/google/ax/internal/controller"
 	"github.com/google/ax/internal/store/redis"
 	"github.com/google/ax/internal/substrate"
+	"github.com/google/ax/pkg/apis/v1alpha1"
 	goredis "github.com/redis/go-redis/v9"
 )
 
@@ -63,6 +64,9 @@ func main() {
 	}
 	if envPass := os.Getenv("REDIS_PASSWORD"); envPass != "" && redisPassword == "" {
 		redisPassword = envPass
+	}
+	if envImage := os.Getenv("AX_DEFAULT_TASK_IMAGE"); envImage != "" {
+		v1alpha1.DefaultTaskImage = envImage
 	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))

@@ -1,0 +1,26 @@
+# Warm workers for AX tasks. AX's ActorTemplates carry no workerSelector, so
+# they schedule onto any pool; this is the one that exists for them. The
+# worker image must match the installed Substrate version, as must the
+# nodeSelector (ate-setup stamps ate.dev/substrate-version on worker nodes).
+apiVersion: ate.dev/v1alpha1
+kind: WorkerPool
+metadata:
+  name: ax
+  namespace: ax-system
+  labels:
+    workload: ax
+spec:
+  replicas: 2
+  workerImage: ghcr.io/stigenai/substrate/ateom-gvisor:v0.3.0-stigenai.2@sha256:9c4721241aaf7da1dd8832467c0e6bf472a1c8a18233ac206d3b7535f44c6dc1
+  template:
+    nodeSelector:
+      ate.dev/substrate-version: v0.3.0-stigenai.2
+    # Sized for AX's Task defaults (up to 2 CPU / 4Gi per task) with room for
+    # a second actor; the pool multiplexes many more over time.
+    resources:
+      limits:
+        cpu: "4"
+        memory: 8Gi
+      requests:
+        cpu: 500m
+        memory: 2Gi
