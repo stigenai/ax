@@ -27,13 +27,16 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// DefaultTaskImage runs a Task that names no image. It is a var so ax-server
+// can point it at a registry its cluster can pull from (AX_DEFAULT_TASK_IMAGE):
+// the upstream default is not publicly pullable.
+var DefaultTaskImage = "gcr.io/ax-substrate/ate-images/ax-task-runner"
+
 const (
 	APIVersion    = "ax.io/v1alpha1"
 	KindTask      = "Task"
 	KindWorkspace = "Workspace"
 	KindModel     = "Model"
-
-	DefaultTaskImage = "gcr.io/ax-substrate/ate-images/ax-task-runner"
 
 	// PhaseTerminating marks a task whose deletion has been requested and whose
 	// actor is being torn down. The record disappears once cleanup completes.
