@@ -30,5 +30,6 @@ patches:
                   # so the gs:// scheme is just the form AX validates.
                   - name: AX_SNAPSHOTS_BUCKET
                     value: gs://ate-snapshots/ax/
+                  # Substrate rejects actor images not pinned by digest.
                   - name: AX_DEFAULT_TASK_IMAGE
-                    value: ghcr.io/stigenai/ax/ax-task-runner:v0.3.1-stigenai.1
+                    value: ghcr.io/stigenai/ax/ax-task-runner:v0.3.1-stigenai.1@sha256:fdc4c5d665e3668d8d08e0ccfab620864654f2c1a9c21570f46ca97462cdac98
