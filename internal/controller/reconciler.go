@@ -159,6 +159,10 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 	launchTask := proto.Clone(task).(*v1alpha1.Task)
 	launchTask.Status = nil
 	launchTask.Spec.Suspend = false
+	// The container already gets spec.env as its environment, and the task
+	// runner never reads it back out of AX_TASK_YAML. Copying it in would put
+	// every value into this one variable, which Substrate caps at 32 KiB.
+	launchTask.Spec.Env = nil
 	if taskYAML, err := yaml.Marshal(launchTask); err == nil {
 		extraEnv["AX_TASK_YAML"] = string(taskYAML)
 	}
@@ -175,8 +179,13 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 
 		tmpl, err := r.client.EnsureActorTemplateWithImage(ctx, templateAtespace, templateName, atespace, customTemplateName, task.Spec.Image, extraEnv)
 		if err != nil {
-			slog.Warn("could not create custom ActorTemplate, falling back to default template", "error", err)
-		} else if tmpl != nil && tmpl.Metadata != nil {
+			// The default template has neither this image nor this env, so an
+			// actor made from it would not be this task: fail with the reason.
+			r.setNotReady(task, "ActorTemplateCreationFailed", err.Error(), now)
+			task.Status.Phase = "Failed"
+			return task, fmt.Errorf("ensuring actor template: %w", err)
+		}
+		if tmpl != nil && tmpl.Metadata != nil {
 			templateAtespace = tmpl.Metadata.Atespace
 			templateName = tmpl.Metadata.Name
 			slog.Info("using custom ActorTemplate for actor", "templateAtespace", templateAtespace, "templateName", templateName)

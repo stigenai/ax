@@ -18,6 +18,7 @@ import (
 	"context"
 	"net"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -41,6 +42,9 @@ type mockControlServer struct {
 	deletedActors    []string
 	actorTemplates   map[string]bool
 	deletedTemplates []string
+	// rejectTemplates makes CreateActorTemplate fail, as Substrate's validation does
+	rejectTemplates error
+	lastTemplate    *ateapipb.ActorTemplate
 }
 
 // noSecrets is a SecretResolver for tests: it never finds a key and never touches a cluster.
@@ -57,10 +61,14 @@ func (m *mockControlServer) GetActorTemplate(_ context.Context, req *ateapipb.Ge
 }
 
 func (m *mockControlServer) CreateActorTemplate(_ context.Context, req *ateapipb.CreateActorTemplateRequest) (*ateapipb.ActorTemplate, error) {
+	if m.rejectTemplates != nil {
+		return nil, m.rejectTemplates
+	}
 	if m.actorTemplates == nil {
 		m.actorTemplates = make(map[string]bool)
 	}
 	tmpl := req.GetActorTemplate()
+	m.lastTemplate = tmpl
 	m.actorTemplates[tmpl.GetMetadata().GetName()] = true
 	return tmpl, nil
 }
@@ -121,7 +129,6 @@ func (m *mockControlServer) SuspendActor(ctx context.Context, req *ateapipb.Susp
 	m.suspendedActors = append(m.suspendedActors, name)
 	return &ateapipb.SuspendActorResponse{}, nil
 }
-
 
 func (m *mockControlServer) DeleteActor(ctx context.Context, req *ateapipb.DeleteActorRequest) (*ateapipb.Actor, error) {
 	name := req.GetActor().GetName()
@@ -455,5 +462,88 @@ func TestReconcileDelete_RemovesActorAndTemplates(t *testing.T) {
 		if !mockSrv.actorTemplates[keep] {
 			t.Errorf("template %s should not have been deleted", keep)
 		}
+	}
+}
+
+// newTestReconciler serves mockSrv over gRPC and returns a reconciler bound to it.
+func newTestReconciler(t *testing.T, mockSrv *mockControlServer) *controller.TaskReconciler {
+	t.Helper()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	grpcServer := grpc.NewServer()
+	ateapipb.RegisterControlServer(grpcServer, mockSrv)
+	go grpcServer.Serve(lis)
+	t.Cleanup(grpcServer.Stop)
+	client, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("failed to create substrate client: %v", err)
+	}
+	t.Cleanup(func() { client.Close() })
+	reconciler := controller.NewTaskReconciler(client, "test-template", "ax-system")
+	reconciler.SecretResolver = noSecrets
+	reconciler.WorkspaceReadyTimeout = 200 * time.Millisecond
+	return reconciler
+}
+
+func envTask(value string) *v1alpha1.Task {
+	return &v1alpha1.Task{
+		ApiVersion: v1alpha1.APIVersion,
+		Kind:       v1alpha1.KindTask,
+		Metadata:   &v1alpha1.ObjectMeta{Name: "env-task", Atespace: "default"},
+		Spec: &v1alpha1.TaskSpec{
+			Image:   "ghcr.io/my-org/my-image",
+			Command: []string{"/bin/task-runner"},
+			Env:     []*v1alpha1.EnvVar{{Name: "BRIEF", Value: value}},
+		},
+	}
+}
+
+// Each env value reaches the container once, as itself: AX_TASK_YAML does not
+// repeat them, so the values together are not held to one variable's limit.
+func TestTaskReconciler_TaskYAMLLeavesOutEnv(t *testing.T) {
+	mockSrv := &mockControlServer{}
+	value := strings.Repeat("b", 20_000)
+	if _, err := newTestReconciler(t, mockSrv).Reconcile(context.Background(), envTask(value)); err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	env := map[string]string{}
+	for _, e := range mockSrv.lastTemplate.GetContainers()[0].GetEnv() {
+		env[e.GetName()] = e.GetValue()
+	}
+	if env["BRIEF"] != value {
+		t.Errorf("BRIEF did not reach the template whole")
+	}
+	if strings.Contains(env["AX_TASK_YAML"], value) {
+		t.Errorf("AX_TASK_YAML repeats the env values")
+	}
+	if !strings.Contains(env["AX_TASK_YAML"], "/bin/task-runner") {
+		t.Errorf("AX_TASK_YAML lost the task's command: %q", env["AX_TASK_YAML"])
+	}
+}
+
+// A template Substrate refuses fails the task with Substrate's reason, rather
+// than an actor made from a default template that is not this task.
+func TestTaskReconciler_TemplateRefusedFailsTask(t *testing.T) {
+	mockSrv := &mockControlServer{rejectTemplates: status.Error(codes.InvalidArgument, "env[0].value: Too long")}
+	task, err := newTestReconciler(t, mockSrv).Reconcile(context.Background(), envTask("x"))
+	if err == nil {
+		t.Fatal("Reconcile succeeded with a refused template")
+	}
+	if task.Status.Phase != "Failed" {
+		t.Errorf("expected phase Failed, got %q", task.Status.Phase)
+	}
+	var reason, message string
+	for _, c := range task.Status.Conditions {
+		if c.Type == "Ready" {
+			reason, message = c.Reason, c.Message
+		}
+	}
+	if reason != "ActorTemplateCreationFailed" || !strings.Contains(message, "Too long") {
+		t.Errorf("expected ActorTemplateCreationFailed naming Substrate's reason, got %q: %q", reason, message)
+	}
+	if len(mockSrv.createdActors) != 0 {
+		t.Errorf("an actor was created from another template: %v", mockSrv.createdActors)
 	}
 }
