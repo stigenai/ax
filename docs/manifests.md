@@ -31,7 +31,12 @@ spec:
       goal: "Install dependencies and run the test suite"   # Antigravity prepares the workspace to this goal on first run
 
   debug: true   # serve guest services inside the sandbox so `ax ssh` works; off by default
+  capabilities: ["SETUID", "SETGID"]   # added to the container's default set; see below
 ```
+
+### Capabilities
+
+The task container starts as root with Substrate's default capabilities, `AUDIT_WRITE`, `KILL` and `NET_BIND_SERVICE`, so it cannot change user. `spec.capabilities` adds to that set, named without the `CAP_` prefix, and becomes the container's `securityContext.capabilities.add` in its ActorTemplate. `SETUID` and `SETGID` let a task drop its work to a non-root user, which tools that refuse root (PostgreSQL's `initdb`, say) need. Substrate refuses `ALL` and names it does not know, and the task fails with its reason. The sandbox stays the isolation boundary.
 
 ### Binding several workspaces
 

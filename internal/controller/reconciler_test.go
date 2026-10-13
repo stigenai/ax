@@ -523,6 +523,25 @@ func TestTaskReconciler_TaskYAMLLeavesOutEnv(t *testing.T) {
 	}
 }
 
+// spec.capabilities reach the container's securityContext, but not AX_TASK_YAML, which a runner built before the field would refuse.
+func TestTaskReconciler_Capabilities(t *testing.T) {
+	mockSrv := &mockControlServer{}
+	task := envTask("x")
+	task.Spec.Capabilities = []string{"SETUID", "SETGID"}
+	if _, err := newTestReconciler(t, mockSrv).Reconcile(context.Background(), task); err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	c := mockSrv.lastTemplate.GetContainers()[0]
+	if got := c.GetSecurityContext().GetCapabilities().GetAdd(); strings.Join(got, ",") != "SETUID,SETGID" {
+		t.Errorf("securityContext.capabilities.add = %v", got)
+	}
+	for _, e := range c.GetEnv() {
+		if e.GetName() == "AX_TASK_YAML" && strings.Contains(e.GetValue(), "SETUID") {
+			t.Errorf("AX_TASK_YAML carries the capabilities: %q", e.GetValue())
+		}
+	}
+}
+
 // A template Substrate refuses fails the task with Substrate's reason, rather
 // than an actor made from a default template that is not this task.
 func TestTaskReconciler_TemplateRefusedFailsTask(t *testing.T) {

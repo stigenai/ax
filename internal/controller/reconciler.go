@@ -163,6 +163,9 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 	// runner never reads it back out of AX_TASK_YAML. Copying it in would put
 	// every value into this one variable, which Substrate caps at 32 KiB.
 	launchTask.Spec.Env = nil
+	// The template carries spec.capabilities and the runner has no use for them,
+	// and a runner built before the field existed refuses a Task that has it.
+	launchTask.Spec.Capabilities = nil
 	if taskYAML, err := yaml.Marshal(launchTask); err == nil {
 		extraEnv["AX_TASK_YAML"] = string(taskYAML)
 	}
@@ -175,9 +178,9 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 	// If a custom image, workspace, or extra environment is specified, provision or use a dedicated ActorTemplate
 	if task.Spec != nil && (task.Spec.Image != "" || len(extraEnv) > 0) {
 		slog.Info("ensuring custom ActorTemplate for task", "image", task.Spec.Image)
-		customTemplateName := taskTemplateName(task.Metadata.Name, task.Spec.Image, extraEnv)
+		customTemplateName := taskTemplateName(task.Metadata.Name, task.Spec.Image, task.Spec.Capabilities, extraEnv)
 
-		tmpl, err := r.client.EnsureActorTemplateWithImage(ctx, templateAtespace, templateName, atespace, customTemplateName, task.Spec.Image, extraEnv)
+		tmpl, err := r.client.EnsureActorTemplateWithImage(ctx, templateAtespace, templateName, atespace, customTemplateName, task.Spec.Image, task.Spec.Capabilities, extraEnv)
 		if err != nil {
 			// The default template has neither this image nor this env, so an
 			// actor made from it would not be this task: fail with the reason.
@@ -378,10 +381,13 @@ func (r *TaskReconciler) lookupGeminiKey(ctx context.Context, atespace string) s
 }
 
 // taskTemplateName derives the per-task ActorTemplate name from the task name and a
-// digest of the image and container environment, so a spec change yields a new template.
-func taskTemplateName(taskName, image string, env map[string]string) string {
+// digest of the image, capabilities and container environment, so a spec change yields a new template.
+func taskTemplateName(taskName, image string, capabilities []string, env map[string]string) string {
 	h := sha256.New()
 	h.Write([]byte(image))
+	for _, c := range capabilities {
+		h.Write([]byte("cap:" + c + ";"))
+	}
 	keys := make([]string, 0, len(env))
 	for k := range env {
 		keys = append(keys, k)

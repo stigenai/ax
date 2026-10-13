@@ -209,7 +209,8 @@ const (
 )
 
 // BuildActorTemplate constructs a Substrate ActorTemplate based on the standard ate-env specification.
-func BuildActorTemplate(atespace, name, image string, envMap map[string]string, command []string, snapshotsBucket string) *ateapipb.ActorTemplate {
+// capabilities are added to the container's default set (the Task's spec.capabilities).
+func BuildActorTemplate(atespace, name, image string, envMap map[string]string, command []string, snapshotsBucket string, capabilities []string) *ateapipb.ActorTemplate {
 	if atespace == "" {
 		atespace = "default"
 	}
@@ -235,16 +236,22 @@ func BuildActorTemplate(atespace, name, image string, envMap map[string]string, 
 		})
 	}
 
+	var security *ateapipb.SecurityContext
+	if len(capabilities) > 0 {
+		security = &ateapipb.SecurityContext{Capabilities: &ateapipb.Capabilities{Add: capabilities}}
+	}
+
 	return &ateapipb.ActorTemplate{
 		Metadata: &ateapipb.ResourceMetadata{
 			Name:     name,
 			Atespace: atespace,
 		},
 		Containers: []*ateapipb.Container{{
-			Name:    "guest",
-			Image:   image,
-			Command: command,
-			Env:     envList,
+			Name:            "guest",
+			Image:           image,
+			Command:         command,
+			Env:             envList,
+			SecurityContext: security,
 			Readyz: &ateapipb.ContainerReadyz{
 				HttpGet: &ateapipb.HTTPGetAction{
 					Path: "/readyz",
@@ -275,8 +282,9 @@ func BuildActorTemplate(atespace, name, image string, envMap map[string]string, 
 	}
 }
 
-// EnsureActorTemplateWithImage creates an ActorTemplate using the specified container image and optional environment variables.
-func (c *Client) EnsureActorTemplateWithImage(ctx context.Context, baseAtespace, baseTemplate, targetAtespace, targetTemplate, image string, extraEnv ...map[string]string) (*ateapipb.ActorTemplate, error) {
+// EnsureActorTemplateWithImage creates an ActorTemplate using the specified container image, added capabilities
+// and optional environment variables.
+func (c *Client) EnsureActorTemplateWithImage(ctx context.Context, baseAtespace, baseTemplate, targetAtespace, targetTemplate, image string, capabilities []string, extraEnv ...map[string]string) (*ateapipb.ActorTemplate, error) {
 	existing, err := c.GetActorTemplate(ctx, targetAtespace, targetTemplate)
 	if err == nil && existing != nil {
 		return existing, nil
@@ -289,7 +297,7 @@ func (c *Client) EnsureActorTemplateWithImage(ctx context.Context, baseAtespace,
 		}
 	}
 
-	tmpl := BuildActorTemplate(targetAtespace, targetTemplate, image, envMap, nil, "")
+	tmpl := BuildActorTemplate(targetAtespace, targetTemplate, image, envMap, nil, "", capabilities)
 	req := &ateapipb.CreateActorTemplateRequest{
 		ActorTemplate: tmpl,
 	}
@@ -444,5 +452,3 @@ func (c *Client) DeleteActorTemplate(ctx context.Context, atespace, templateName
 	}
 	return nil
 }
-
-

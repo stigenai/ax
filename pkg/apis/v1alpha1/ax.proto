@@ -88,6 +88,12 @@ message TaskSpec {
   // debug enables the in-container guest services (process execution and file
   // access) that back `ax ssh`. Off by default.
   bool debug = 10;
+  // capabilities are Linux capabilities added to the task container's default
+  // set (AUDIT_WRITE, KILL, NET_BIND_SERVICE), named without the CAP_ prefix as
+  // Substrate's securityContext.capabilities.add takes them: SETUID and SETGID
+  // let a task that starts as root run its work as another user. The sandbox
+  // stays the isolation boundary. Substrate refuses ALL and unknown names.
+  repeated string capabilities = 11;
 }
 
 message EnvVar {
