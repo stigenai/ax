@@ -414,13 +414,18 @@ func taskTemplatePattern(taskName string) *regexp.Regexp {
 
 // ReconcileDelete cleans up Substrate resources when a Task is deleted: the actor,
 // which shares the task's name, then every ActorTemplate provisioned for the task.
-func (r *TaskReconciler) ReconcileDelete(ctx context.Context, atespace, taskName string) error {
+func (r *TaskReconciler) ReconcileDelete(ctx context.Context, atespace, taskName string, actorUID ...string) error {
 	if atespace == "" {
 		atespace = "default"
 	}
 	slog.Info("deleting Substrate actor for task", "atespace", atespace, "task", taskName)
-	if err := r.client.DeleteActor(ctx, atespace, taskName); err != nil {
+	if err := r.client.DeleteActor(ctx, atespace, taskName, actorUID...); err != nil {
 		return err
+	}
+	// Protected templates remain with the activation receipt; a name pattern
+	// cannot distinguish templates belonging to a later task incarnation.
+	if len(actorUID) > 0 && actorUID[0] != "" {
+		return nil
 	}
 	if err := r.deleteTaskTemplates(ctx, atespace, taskName); err != nil {
 		slog.Warn("could not clean up actor templates for task", "task", taskName, "error", err)

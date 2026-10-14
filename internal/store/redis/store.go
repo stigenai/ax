@@ -82,7 +82,6 @@ func (s *Store) taskKey(atespace, name string) string {
 	return fmt.Sprintf("%s:task:%s:%s", s.opts.KeyPrefix, atespace, name)
 }
 
-
 func (s *Store) modelKey(atespace, name string) string {
 	return fmt.Sprintf("%s:model:%s:%s", s.opts.KeyPrefix, atespace, name)
 }
@@ -153,25 +152,33 @@ func (s *Store) SaveTask(ctx context.Context, task *v1alpha1.Task) error {
 	score := float64(time.Now().UnixNano())
 	member := fmt.Sprintf("%s:%s", atespace, name)
 
-	pipe := s.client.TxPipeline()
-	pipe.Set(ctx, s.taskKey(atespace, name), data, s.opts.TTL)
-	pipe.ZAdd(ctx, s.taskIndexKey(), redis.Z{Score: score, Member: member})
-	pipe.ZAdd(ctx, s.taskAtespaceIndexKey(atespace), redis.Z{Score: score, Member: name})
-	pipe.XAdd(ctx, &redis.XAddArgs{
-		Stream: s.opts.StreamName,
-		Values: map[string]interface{}{
-			"action":   "reconcile",
-			"atespace": atespace,
-			"name":     name,
-		},
-	})
-	pipe.Publish(ctx, s.taskPubSubChannel(atespace, name), data)
+	key := s.taskKey(atespace, name)
+	return s.client.Watch(ctx, func(tx *redis.Tx) error {
+		existing, err := taskForDelete(ctx, tx, key)
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
+			return err
+		}
+		if existing.GetSpec().GetSupervisorProfile() != "" && existing.GetStatus().GetPhase() == v1alpha1.PhaseTerminating {
+			return store.ErrConflict
+		}
+		_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+			pipe.Set(ctx, s.taskKey(atespace, name), data, s.opts.TTL)
+			pipe.ZAdd(ctx, s.taskIndexKey(), redis.Z{Score: score, Member: member})
+			pipe.ZAdd(ctx, s.taskAtespaceIndexKey(atespace), redis.Z{Score: score, Member: name})
+			pipe.XAdd(ctx, &redis.XAddArgs{
+				Stream: s.opts.StreamName,
+				Values: map[string]interface{}{
+					"action":   "reconcile",
+					"atespace": atespace,
+					"name":     name,
+				},
+			})
+			pipe.Publish(ctx, s.taskPubSubChannel(atespace, name), data)
 
-	_, err = pipe.Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("saving task to redis: %w", err)
-	}
-	return nil
+			return nil
+		})
+		return err
+	}, key)
 }
 
 // GetTask retrieves a task by atespace and name.
@@ -258,80 +265,121 @@ func (s *Store) ListTasks(ctx context.Context, atespace string, limit, offset in
 
 // UpdateTaskStatus updates only the status portion of a task.
 func (s *Store) UpdateTaskStatus(ctx context.Context, atespace, name string, status *v1alpha1.TaskStatus) error {
-	task, err := s.GetTask(ctx, atespace, name)
-	if err != nil {
+	if atespace == "" {
+		atespace = "default"
+	}
+	key := s.taskKey(atespace, name)
+	return s.client.Watch(ctx, func(tx *redis.Tx) error {
+		task, err := taskForDelete(ctx, tx, key)
+		if err != nil {
+			return err
+		}
+		if task.GetSpec().GetSupervisorProfile() != "" && task.GetStatus().GetPhase() == v1alpha1.PhaseTerminating {
+			return nil
+		}
+		task.Status = status
+		data, err := jsonMarshalOpts.Marshal(task)
+		if err != nil {
+			return err
+		}
+		_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+			pipe.Set(ctx, key, data, s.opts.TTL)
+			pipe.Publish(ctx, s.taskPubSubChannel(atespace, name), data)
+			return nil
+		})
 		return err
-	}
-
-	task.Status = status
-	data, err := jsonMarshalOpts.Marshal(task)
-	if err != nil {
-		return fmt.Errorf("marshaling task status: %w", err)
-	}
-
-	pipe := s.client.TxPipeline()
-	pipe.Set(ctx, s.taskKey(atespace, name), data, s.opts.TTL)
-	pipe.Publish(ctx, s.taskPubSubChannel(atespace, name), data)
-	_, err = pipe.Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("updating task status in redis: %w", err)
-	}
-	return nil
+	}, key)
 }
 
 // MarkTaskDeleting flips the task to the Terminating phase, notifies watchers, and
 // publishes a delete event for the controller. The record stays until DeleteTask.
-func (s *Store) MarkTaskDeleting(ctx context.Context, atespace, name string) error {
-	if atespace == "" {
-		atespace = "default"
-	}
-	task, err := s.GetTask(ctx, atespace, name)
+func (s *Store) MarkTaskDeleting(ctx context.Context, atespace, name string, preconditions ...store.TaskDeletePreconditions) error {
+	precondition, err := store.DeletePreconditions(preconditions)
 	if err != nil {
 		return err
 	}
-	if task.Status == nil {
-		task.Status = &v1alpha1.TaskStatus{}
+	if atespace == "" {
+		atespace = "default"
 	}
-	task.Status.Phase = v1alpha1.PhaseTerminating
-	data, err := protojson.Marshal(task)
-	if err != nil {
-		return fmt.Errorf("marshaling task: %w", err)
-	}
-
-	pipe := s.client.TxPipeline()
-	pipe.Set(ctx, s.taskKey(atespace, name), data, s.opts.TTL)
-	pipe.Publish(ctx, s.taskPubSubChannel(atespace, name), data)
-	pipe.XAdd(ctx, &redis.XAddArgs{
-		Stream: s.opts.StreamName,
-		Values: map[string]interface{}{
-			"action":   "delete",
-			"atespace": atespace,
-			"name":     name,
-		},
-	})
-	if _, err := pipe.Exec(ctx); err != nil {
-		return fmt.Errorf("marking task deleting in redis: %w", err)
-	}
-	return nil
+	key := s.taskKey(atespace, name)
+	return s.client.Watch(ctx, func(tx *redis.Tx) error {
+		task, err := taskForDelete(ctx, tx, key)
+		if err != nil {
+			return err
+		}
+		if err := precondition.Check(task); err != nil {
+			return err
+		}
+		if task.Status == nil {
+			task.Status = &v1alpha1.TaskStatus{}
+		}
+		task.Status.Phase = v1alpha1.PhaseTerminating
+		data, err := protojson.Marshal(task)
+		if err != nil {
+			return err
+		}
+		_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+			pipe.Set(ctx, key, data, s.opts.TTL)
+			pipe.Publish(ctx, s.taskPubSubChannel(atespace, name), data)
+			pipe.XAdd(ctx, &redis.XAddArgs{Stream: s.opts.StreamName, Values: map[string]interface{}{
+				"action": "delete", "atespace": atespace, "name": name,
+				"actor_uid": precondition.ActorUID, "creation_timestamp": precondition.CreationTimestamp,
+			}})
+			return nil
+		})
+		return err
+	}, key)
 }
 
-// DeleteTask removes the task record and its index entries. No event is published.
-func (s *Store) DeleteTask(ctx context.Context, atespace, name string) error {
+func taskForDelete(ctx context.Context, tx *redis.Tx, key string) (*v1alpha1.Task, error) {
+	data, err := tx.Get(ctx, key).Bytes()
+	if errors.Is(err, redis.Nil) {
+		return nil, store.ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	task := &v1alpha1.Task{}
+	if err := jsonUnmarshalOpts.Unmarshal(data, task); err != nil {
+		return nil, err
+	}
+	return task, nil
+}
+
+// DeleteTask removes only the task incarnation carried by the delete event.
+func (s *Store) DeleteTask(ctx context.Context, atespace, name string, preconditions ...store.TaskDeletePreconditions) error {
+	precondition, err := store.DeletePreconditions(preconditions)
+	if err != nil {
+		return err
+	}
 	if atespace == "" {
 		atespace = "default"
 	}
 	member := fmt.Sprintf("%s:%s", atespace, name)
-
-	pipe := s.client.TxPipeline()
-	pipe.Del(ctx, s.taskKey(atespace, name))
-	pipe.ZRem(ctx, s.taskIndexKey(), member)
-	pipe.ZRem(ctx, s.taskAtespaceIndexKey(atespace), name)
-	if _, err := pipe.Exec(ctx); err != nil {
-		return fmt.Errorf("deleting task from redis: %w", err)
-	}
-	return nil
+	key := s.taskKey(atespace, name)
+	return s.client.Watch(ctx, func(tx *redis.Tx) error {
+		task, err := taskForDelete(ctx, tx, key)
+		if errors.Is(err, store.ErrNotFound) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if err := precondition.Check(task); err != nil {
+			return err
+		}
+		if precondition.ActorUID != "" && task.GetStatus().GetPhase() != v1alpha1.PhaseTerminating {
+			return store.ErrConflict
+		}
+		_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+			pipe.Del(ctx, key)
+			pipe.ZRem(ctx, s.taskIndexKey(), member)
+			pipe.ZRem(ctx, s.taskAtespaceIndexKey(atespace), name)
+			return nil
+		})
+		return err
+	}, key)
 }
-
 
 // SaveModel stores a model.
 func (s *Store) SaveModel(ctx context.Context, model *v1alpha1.Model) error {
@@ -676,6 +724,8 @@ func eventFromMessage(msg redis.XMessage) store.TaskEvent {
 	if action, ok := msg.Values["action"].(string); ok {
 		ev.Action = action
 	}
+	ev.Deletion.ActorUID, _ = msg.Values["actor_uid"].(string)
+	ev.Deletion.CreationTimestamp, _ = msg.Values["creation_timestamp"].(string)
 	return ev
 }
 

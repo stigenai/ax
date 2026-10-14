@@ -29,7 +29,31 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
+
+func TestProtectedDeleteRequiresRetainedIdentity(t *testing.T) {
+	ctx := context.Background()
+	s := memory.NewStore()
+	created := time.Now().UTC()
+	task := &v1alpha1.Task{Metadata: &v1alpha1.ObjectMeta{Name: "job", Atespace: "private", CreationTimestamp: timestamppb.New(created)}, Spec: &v1alpha1.TaskSpec{SupervisorProfile: "fabriek-native-v1"}}
+	if err := s.SaveTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	srv := server.NewServer(s)
+	for _, request := range []*v1alpha1.DeleteTaskRequest{
+		{Atespace: "private", Name: "job"},
+		{Atespace: "private", Name: "job", ActorUid: "observed-actor"},
+		{Atespace: "private", Name: "job", ActorUid: "observed-actor", CreationTimestamp: created.Add(time.Second).Format(time.RFC3339Nano)},
+	} {
+		if _, err := srv.DeleteTask(ctx, request); status.Code(err) != codes.FailedPrecondition {
+			t.Fatalf("identity not required: %v", err)
+		}
+	}
+	if _, err := srv.DeleteTask(ctx, &v1alpha1.DeleteTaskRequest{Atespace: "private", Name: "job", ActorUid: "observed-actor", CreationTimestamp: created.Format(time.RFC3339Nano)}); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestServerHealthzHTTP(t *testing.T) {
 	memStore := memory.NewStore()
@@ -166,7 +190,6 @@ func TestServerGRPC(t *testing.T) {
 	if resTask.Spec.Suspend {
 		t.Errorf("expected task to be resumed")
 	}
-
 
 	// 5. Workspaces
 	ws, err = client.GetWorkspace(ctx, &v1alpha1.GetWorkspaceRequest{Atespace: "default", Name: "grpc-ws"})
