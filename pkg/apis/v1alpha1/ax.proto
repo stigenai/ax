@@ -88,6 +88,8 @@ message TaskSpec {
   // debug enables the in-container guest services (process execution and file
   // access) that back `ax ssh`. Off by default.
   bool debug = 10;
+  // supervisor_profile opts into a protected platform bootstrap projection.
+  string supervisor_profile = 11;
 }
 
 message EnvVar {

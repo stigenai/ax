@@ -462,3 +462,67 @@ spec:
 		t.Errorf("round trip changed the task:\n%s", out)
 	}
 }
+
+func TestValidateFabriekSupervisor(t *testing.T) {
+	valid := func() *v1alpha1.Task {
+		return &v1alpha1.Task{Spec: &v1alpha1.TaskSpec{
+			SupervisorProfile: v1alpha1.FabriekSupervisorProfile,
+			Resources:         &v1alpha1.ResourceReqs{Limits: &v1alpha1.ResourceList{Cpu: "500m", Memory: "512Mi"}},
+			Image:             "ghcr.io/stigenai/native@sha256:" + strings.Repeat("a", 64),
+			Command:           []string{"/usr/local/bin/python", "-m", "factory.execution.ax_worker", "serve"},
+			Env:               []*v1alpha1.EnvVar{{Name: "FACTORY_ATTEMPT_ID", Value: "11111111-1111-4111-8111-111111111111"}, {Name: "FACTORY_NATIVE_LAUNCH_DIGEST", Value: "sha256:" + strings.Repeat("b", 64)}},
+			Workspaces:        []*v1alpha1.WorkspaceRef{{Name: "session", Path: "/workspace/session"}},
+		}}
+	}
+	if err := v1alpha1.ValidateTask(valid()); err != nil {
+		t.Fatal(err)
+	}
+	for name, mutate := range map[string]func(*v1alpha1.TaskSpec){
+		"unknown profile": func(s *v1alpha1.TaskSpec) { s.SupervisorProfile = "other" },
+		"debug":           func(s *v1alpha1.TaskSpec) { s.Debug = true },
+		"mutable image":   func(s *v1alpha1.TaskSpec) { s.Image = "worker:latest" },
+		"custom command":  func(s *v1alpha1.TaskSpec) { s.Command = []string{"sh"} },
+		"secret env": func(s *v1alpha1.TaskSpec) {
+			s.Env = append(s.Env, &v1alpha1.EnvVar{Name: "GEMINI_API_KEY", Value: "never-project"})
+		},
+		"duplicate env":   func(s *v1alpha1.TaskSpec) { s.Env = append(s.Env, s.Env[0]) },
+		"missing digest":  func(s *v1alpha1.TaskSpec) { s.Env = s.Env[:1] },
+		"invalid attempt": func(s *v1alpha1.TaskSpec) { s.Env[0].Value = "not-a-uuid" },
+		"workspace goal":  func(s *v1alpha1.TaskSpec) { s.Workspaces[0].Goal = "start work" },
+		"workspace path":  func(s *v1alpha1.TaskSpec) { s.Workspaces[0].Path = "/etc/fabriek" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			task := valid()
+			mutate(task.Spec)
+			if err := v1alpha1.ValidateTask(task); err == nil {
+				t.Fatal("unsafe supervisor task accepted")
+			}
+		})
+	}
+	for _, spec := range []*v1alpha1.WorkspaceSpec{
+		{Git: []*v1alpha1.GitRepo{{Repo: "https://example.test/repo"}}},
+		{Mcp: &v1alpha1.MCPConfig{}},
+		{Skills: &v1alpha1.SkillsConfig{}},
+	} {
+		if err := v1alpha1.ValidateSupervisorWorkspaces(valid(), []*v1alpha1.Workspace{{Spec: spec}}); err == nil {
+			t.Fatal("workspace setup accepted")
+		}
+	}
+	if err := v1alpha1.ValidateSupervisorWorkspaces(valid(), []*v1alpha1.Workspace{{Spec: &v1alpha1.WorkspaceSpec{}}}); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := yaml.Marshal(valid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(encoded), "supervisorProfile: fabriek-native-v1") {
+		t.Fatalf("missing profile in YAML: %s", encoded)
+	}
+	var decoded v1alpha1.Task
+	if err := yaml.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if err := v1alpha1.ValidateTask(&decoded); err != nil {
+		t.Fatal(err)
+	}
+}

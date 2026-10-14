@@ -1,0 +1,29 @@
+# Protected Fabriek supervisors
+
+`spec.supervisorProfile: fabriek-native-v1` opts a Task into Substrate's protected
+activation bootstrap. Ordinary AX tasks retain their existing behavior.
+
+This profile requires a digest-pinned image, `debug: false`, the fixed command
+`/usr/local/bin/python -m factory.execution.ax_worker serve`, explicit CPU/memory
+limits, and only `FACTORY_ATTEMPT_ID` and `FACTORY_NATIVE_LAUNCH_DIGEST` in task
+environment. Workspace goals and nonempty Workspace specs are rejected before
+provisioning. The controller does not fetch or inject its shared Gemini key.
+
+AX mounts the dedicated SystemInfo projection at
+`/run/substrate/fabriek-supervisor`. Substrate owns `activation.jwt`, its root-only
+permissions, freshness on activation, and restricted issuance. No credential is
+stored in Task environment or metadata. The qualified worker image supplies the
+public controller trust configuration; the root supervisor exchanges the platform
+proof before any native child can receive a boot permit.
+
+The template carries actual container CPU/memory limits and Data-only pause/commit
+with Golden resume. Substrate must ensure golden actors contain no credentials
+and reject Full restore for this profile. AX checks a retained template against
+the immutable requested spec and rejects an existing actor bound to another
+template. It does not automatically delete a protected crashed actor.
+
+This profile needs the matching Substrate bootstrap extension and a separately
+qualified Fabriek worker image. A private AX endpoint with exclusive authorized
+writers remains required: this opt-in field is not API authorization. Unit tests
+and a successful build do not qualify gVisor UID isolation, Golden/Data restore,
+hosted account routing or factory delivery. No deployment is activated here.
