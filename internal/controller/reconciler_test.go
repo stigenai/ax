@@ -44,9 +44,11 @@ type mockControlServer struct {
 	actorTemplates   map[string]bool
 	deletedTemplates []string
 	// rejectTemplates makes CreateActorTemplate fail, as Substrate's validation does
-	rejectTemplates error
-	lastTemplate    *ateapipb.ActorTemplate
-	existingActor   *ateapipb.Actor
+	rejectTemplates   error
+	lastTemplate      *ateapipb.ActorTemplate
+	existingActor     *ateapipb.Actor
+	deleteUID         string
+	expectedDeleteUID string
 }
 
 // noSecrets is a SecretResolver for tests: it never finds a key and never touches a cluster.
@@ -143,9 +145,45 @@ func (m *mockControlServer) SuspendActor(ctx context.Context, req *ateapipb.Susp
 }
 
 func (m *mockControlServer) DeleteActor(ctx context.Context, req *ateapipb.DeleteActorRequest) (*ateapipb.Actor, error) {
+	m.deleteUID = req.GetOptions().GetUid()
+	if m.expectedDeleteUID != "" && m.deleteUID != m.expectedDeleteUID {
+		return nil, status.Error(codes.Aborted, "actor UID differs")
+	}
 	name := req.GetActor().GetName()
 	m.deletedActors = append(m.deletedActors, name)
 	return &ateapipb.Actor{Metadata: &ateapipb.ResourceMetadata{Name: name}}, nil
+}
+
+func TestProtectedDeleteCannotTargetReplacementActor(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	mock := &mockControlServer{expectedDeleteUID: "original-uid", actorTemplates: map[string]bool{"job-tmpl-0a1b2c3d": true}}
+	srv := grpc.NewServer()
+	ateapipb.RegisterControlServer(srv, mock)
+	go srv.Serve(listener)
+	defer srv.Stop()
+	client, err := substrate.NewClient(listener.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	reconciler := controller.NewTaskReconciler(client, "default-template", "ax-system")
+	if err := reconciler.ReconcileDelete(context.Background(), "private", "job", "original-uid"); err != nil {
+		t.Fatal(err)
+	}
+	if mock.deleteUID != "original-uid" || len(mock.deletedActors) != 1 || len(mock.deletedTemplates) != 0 {
+		t.Fatal("protected identity or template retention lost")
+	}
+	mock.expectedDeleteUID = "replacement-uid"
+	if err := reconciler.ReconcileDelete(context.Background(), "private", "job", "original-uid"); status.Code(err) != codes.Aborted {
+		t.Fatalf("replacement deletion did not fail closed: %v", err)
+	}
+	if len(mock.deletedActors) != 1 {
+		t.Fatal("replacement actor deleted")
+	}
 }
 
 func (m *mockControlServer) ListActorTemplates(ctx context.Context, req *ateapipb.ListActorTemplatesRequest) (*ateapipb.ListActorTemplatesResponse, error) {

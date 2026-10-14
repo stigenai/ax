@@ -139,7 +139,11 @@ func (s *Server) DeleteTask(ctx context.Context, req *v1alpha1.DeleteTaskRequest
 	}
 	// Deletion is two-phase: mark the task Terminating and let the controller tear
 	// down the actor before the record is removed. Clients poll GetTask for NotFound.
-	if err := s.store.MarkTaskDeleting(ctx, atespace, req.Name); err != nil {
+	precondition := store.TaskDeletePreconditions{ActorUID: req.GetActorUid(), CreationTimestamp: req.GetCreationTimestamp()}
+	if err := s.store.MarkTaskDeleting(ctx, atespace, req.Name, precondition); err != nil {
+		if errors.Is(err, store.ErrConflict) {
+			return nil, status.Error(codes.FailedPrecondition, "task deletion identity is missing or changed")
+		}
 		if errors.Is(err, store.ErrNotFound) {
 			return nil, status.Errorf(codes.NotFound, "task %q not found in atespace %q", req.Name, atespace)
 		}
@@ -236,7 +240,6 @@ func (s *Server) WatchTask(req *v1alpha1.WatchTaskRequest, stream grpc.ServerStr
 		}
 	}
 }
-
 
 // --- Workspaces ---
 

@@ -86,6 +86,10 @@ func (s *MemoryStore) SaveTask(ctx context.Context, task *v1alpha1.Task) error {
 	key := taskKey(task.Metadata.Atespace, task.Metadata.Name)
 
 	s.mu.Lock()
+	if existing := s.tasks[key]; existing.GetSpec().GetSupervisorProfile() != "" && existing.GetStatus().GetPhase() == v1alpha1.PhaseTerminating {
+		s.mu.Unlock()
+		return store.ErrConflict
+	}
 	cp := clone(task)
 	s.tasks[key] = cp
 
@@ -160,6 +164,9 @@ func (s *MemoryStore) UpdateTaskStatus(ctx context.Context, atespace, name strin
 	if !ok {
 		return store.ErrNotFound
 	}
+	if t.GetSpec().GetSupervisorProfile() != "" && t.GetStatus().GetPhase() == v1alpha1.PhaseTerminating {
+		return nil
+	}
 	t.Status = status
 	cp := clone(t)
 
@@ -174,7 +181,11 @@ func (s *MemoryStore) UpdateTaskStatus(ctx context.Context, atespace, name strin
 	return nil
 }
 
-func (s *MemoryStore) MarkTaskDeleting(ctx context.Context, atespace, name string) error {
+func (s *MemoryStore) MarkTaskDeleting(ctx context.Context, atespace, name string, preconditions ...store.TaskDeletePreconditions) error {
+	precondition, err := store.DeletePreconditions(preconditions)
+	if err != nil {
+		return err
+	}
 	key := taskKey(atespace, name)
 
 	s.mu.Lock()
@@ -182,6 +193,10 @@ func (s *MemoryStore) MarkTaskDeleting(ctx context.Context, atespace, name strin
 	if !ok {
 		s.mu.Unlock()
 		return store.ErrNotFound
+	}
+	if err := precondition.Check(t); err != nil {
+		s.mu.Unlock()
+		return err
 	}
 	if t.Status == nil {
 		t.Status = &v1alpha1.TaskStatus{}
@@ -204,19 +219,33 @@ func (s *MemoryStore) MarkTaskDeleting(ctx context.Context, atespace, name strin
 		Atespace: atespace,
 		Name:     name,
 		Action:   "delete",
+		Deletion: precondition,
 	}:
 	default:
 	}
 	return nil
 }
 
-func (s *MemoryStore) DeleteTask(ctx context.Context, atespace, name string) error {
+func (s *MemoryStore) DeleteTask(ctx context.Context, atespace, name string, preconditions ...store.TaskDeletePreconditions) error {
+	precondition, err := store.DeletePreconditions(preconditions)
+	if err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	task := s.tasks[taskKey(atespace, name)]
+	if task == nil {
+		return nil
+	}
+	if err := precondition.Check(task); err != nil {
+		return err
+	}
+	if precondition.ActorUID != "" && task.GetStatus().GetPhase() != v1alpha1.PhaseTerminating {
+		return store.ErrConflict
+	}
 	delete(s.tasks, taskKey(atespace, name))
 	return nil
 }
-
 
 func (s *MemoryStore) SaveModel(ctx context.Context, model *v1alpha1.Model) error {
 	if model.Metadata.Name == "" {

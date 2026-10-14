@@ -254,6 +254,9 @@ message UpdateTaskRequest {
 message DeleteTaskRequest {
   string atespace = 1;
   string name = 2;
+  // Required for protected supervisors, from the caller's retained observation.
+  string actor_uid = 3;
+  string creation_timestamp = 4;
 }
 
 message DeleteTaskResponse {}

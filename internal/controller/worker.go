@@ -107,12 +107,33 @@ func (w *Worker) Run(ctx context.Context) error {
 func (w *Worker) processEvent(ctx context.Context, ev store.TaskEvent) error {
 	if ev.Action == "delete" {
 		slog.Info("handling task deletion event", "atespace", ev.Atespace, "name", ev.Name)
-		if err := w.reconciler.ReconcileDelete(ctx, ev.Atespace, ev.Name); err != nil {
+		task, err := w.store.GetTask(ctx, ev.Atespace, ev.Name)
+		if errors.Is(err, store.ErrNotFound) {
+			if ev.Deletion.ActorUID == "" && ev.Deletion.CreationTimestamp == "" {
+				// Legacy deletion still cleans up when the task key has expired.
+				return w.reconciler.ReconcileDelete(ctx, ev.Atespace, ev.Name)
+			}
+			if ev.Deletion.ActorUID == "" || ev.Deletion.CreationTimestamp == "" {
+				return store.ErrConflict
+			}
+			// Missing protected task state cannot authorize cleanup or prove it.
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if err := ev.Deletion.Check(task); err != nil {
+			return err
+		}
+		if ev.Deletion.ActorUID != "" && task.GetStatus().GetPhase() != v1alpha1.PhaseTerminating {
+			return store.ErrConflict
+		}
+		if err := w.reconciler.ReconcileDelete(ctx, ev.Atespace, ev.Name, ev.Deletion.ActorUID); err != nil {
 			// Leave the record in Terminating so the failure is visible; re-running
 			// `ax delete` republishes the event and retries the cleanup.
 			return fmt.Errorf("cleaning up task %s/%s: %w", ev.Atespace, ev.Name, err)
 		}
-		if err := w.store.DeleteTask(ctx, ev.Atespace, ev.Name); err != nil {
+		if err := w.store.DeleteTask(ctx, ev.Atespace, ev.Name, ev.Deletion); err != nil {
 			return fmt.Errorf("removing task record %s/%s: %w", ev.Atespace, ev.Name, err)
 		}
 		return nil
@@ -125,6 +146,10 @@ func (w *Worker) processEvent(ctx context.Context, ev store.TaskEvent) error {
 			return nil
 		}
 		return fmt.Errorf("fetching task %s/%s: %w", ev.Atespace, ev.Name, err)
+	}
+
+	if task.GetStatus().GetPhase() == v1alpha1.PhaseTerminating {
+		return nil
 	}
 
 	// Resolve every bound workspace. A missing one is skipped so the task still

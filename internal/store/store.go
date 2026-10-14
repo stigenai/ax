@@ -18,13 +18,46 @@ import (
 	"context"
 	"errors"
 	"io"
+	"time"
 
 	"github.com/google/ax/pkg/apis/v1alpha1"
 )
 
 var (
 	ErrNotFound = errors.New("resource not found")
+	ErrConflict = errors.New("task deletion precondition failed")
 )
+
+// TaskDeletePreconditions binds queued deletion to an already observed actor and task.
+type TaskDeletePreconditions struct {
+	ActorUID          string
+	CreationTimestamp string
+}
+
+func (p TaskDeletePreconditions) Check(task *v1alpha1.Task) error {
+	if task == nil {
+		return ErrNotFound
+	}
+	if p.ActorUID == "" && p.CreationTimestamp == "" && task.GetSpec().GetSupervisorProfile() == "" {
+		return nil
+	}
+	created := task.GetMetadata().GetCreationTimestamp()
+	expected, err := time.Parse(time.RFC3339Nano, p.CreationTimestamp)
+	if p.ActorUID == "" || created == nil || created.CheckValid() != nil || err != nil || !created.AsTime().Equal(expected) {
+		return ErrConflict
+	}
+	return nil
+}
+
+func DeletePreconditions(values []TaskDeletePreconditions) (TaskDeletePreconditions, error) {
+	if len(values) > 1 {
+		return TaskDeletePreconditions{}, ErrConflict
+	}
+	if len(values) == 1 {
+		return values[0], nil
+	}
+	return TaskDeletePreconditions{}, nil
+}
 
 // TaskEvent represents an event published to the task event stream.
 type TaskEvent struct {
@@ -32,6 +65,7 @@ type TaskEvent struct {
 	Atespace string
 	Name     string
 	Action   string // "reconcile", "delete"
+	Deletion TaskDeletePreconditions
 }
 
 // EventQueue delivers task events to groups of cooperating workers. Every event
@@ -65,10 +99,10 @@ type Store interface {
 	// "Terminating" and a delete event is published for the controller, which
 	// removes the actor and then calls DeleteTask. Returns ErrNotFound if the
 	// task does not exist.
-	MarkTaskDeleting(ctx context.Context, atespace, name string) error
+	MarkTaskDeleting(ctx context.Context, atespace, name string, preconditions ...TaskDeletePreconditions) error
 	// DeleteTask removes the task record. It publishes no event; callers are
 	// expected to have cleaned up the task's actor first.
-	DeleteTask(ctx context.Context, atespace, name string) error
+	DeleteTask(ctx context.Context, atespace, name string, preconditions ...TaskDeletePreconditions) error
 
 	SaveWorkspace(ctx context.Context, ws *v1alpha1.Workspace) error
 	GetWorkspace(ctx context.Context, atespace, name string) (*v1alpha1.Workspace, error)

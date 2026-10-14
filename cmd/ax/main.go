@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"net"
@@ -395,7 +396,6 @@ func runGet(serverURL, atespace string, args []string) error {
 		return yaml.NewEncoder(os.Stdout).Encode(task)
 	}
 
-
 	if (resource == "workspaces" || resource == "workspace") && len(args) == 1 {
 		resp, err := client.ListWorkspaces(ctx, &v1alpha1.ListWorkspacesRequest{Atespace: atespace})
 		if err != nil {
@@ -602,7 +602,6 @@ func runDescribe(serverURL, atespace string, args []string) error {
 		return nil
 	}
 
-
 	task, err := client.GetTask(ctx, &v1alpha1.GetTaskRequest{Atespace: atespace, Name: name})
 	if err != nil {
 		return fmt.Errorf("getting task %q: %w", name, err)
@@ -725,6 +724,20 @@ func runDelete(serverURL, atespace string, args []string) error {
 	if err != nil {
 		return err
 	}
+	flags := flag.NewFlagSet("delete", flag.ContinueOnError)
+	actorUID := flags.String("actor-uid", "", "Previously observed protected Actor UID")
+	created := flags.String("creation-timestamp", "", "Previously observed Task creation timestamp")
+	if err := flags.Parse(args[2:]); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 || (*actorUID == "") != (*created == "") || (kind != v1alpha1.KindTask && (*actorUID != "" || *created != "")) {
+		return fmt.Errorf("protected deletion requires task, --actor-uid and --creation-timestamp")
+	}
+	if *created != "" {
+		if _, err := time.Parse(time.RFC3339Nano, *created); err != nil {
+			return fmt.Errorf("invalid creation timestamp")
+		}
+	}
 
 	client, conn, err := getAXClient(serverURL)
 	if err != nil {
@@ -741,7 +754,7 @@ func runDelete(serverURL, atespace string, args []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	return deleteResource(ctx, client, kind, atespace, args[1])
+	return deleteResource(ctx, client, kind, atespace, args[1], &v1alpha1.DeleteTaskRequest{ActorUid: *actorUID, CreationTimestamp: *created})
 }
 
 const (
@@ -751,13 +764,20 @@ const (
 
 // deleteResource requests deletion, then blocks until the resource is really gone
 // and prints a kubectl-style confirmation.
-func deleteResource(ctx context.Context, client v1alpha1.AXClient, kind, atespace, name string) error {
+func deleteResource(ctx context.Context, client v1alpha1.AXClient, kind, atespace, name string, preconditions ...*v1alpha1.DeleteTaskRequest) error {
 	lower := strings.ToLower(kind)
 
 	var err error
 	switch kind {
 	case v1alpha1.KindTask:
-		_, err = client.DeleteTask(ctx, &v1alpha1.DeleteTaskRequest{Atespace: atespace, Name: name})
+		req := &v1alpha1.DeleteTaskRequest{Atespace: atespace, Name: name}
+		if len(preconditions) > 1 {
+			return fmt.Errorf("multiple task deletion identities")
+		}
+		if len(preconditions) == 1 {
+			req.ActorUid, req.CreationTimestamp = preconditions[0].GetActorUid(), preconditions[0].GetCreationTimestamp()
+		}
+		_, err = client.DeleteTask(ctx, req)
 	case v1alpha1.KindWorkspace:
 		_, err = client.DeleteWorkspace(ctx, &v1alpha1.DeleteWorkspaceRequest{Atespace: atespace, Name: name})
 	case v1alpha1.KindModel:

@@ -192,3 +192,24 @@ ax --context=dev-cluster get tasks
 ## License
 
 Apache License 2.0. See [LICENSE](LICENSE) for details.
+
+### Protected supervisor deletion
+
+Tasks with `supervisorProfile: fabriek-native-v1` require both identities retained
+by the caller before deletion:
+
+```sh
+ax delete task TASK --actor-uid ACTOR_UID --creation-timestamp RFC3339_CREATION_TIME
+```
+
+AX compares the original Task creation timestamp, retains both preconditions in
+the deletion event, and forwards the actor UID to Substrate. A protected Task in
+`Terminating` cannot be overwritten or returned to a runnable phase. A stale
+event cannot delete a replacement Task or actor. Protected deletion retains
+actor templates instead of deleting templates by a reused name pattern.
+
+This path requires one serial controller worker and an exclusive management API
+writer; it does not add a distributed lifecycle fence. Queue, transport, or
+precondition failures do not prove termination. Fabriek must independently read
+the exact Substrate termination receipt before releasing capacity. Ordinary
+Tasks keep the existing deletion interface and cleanup behavior.

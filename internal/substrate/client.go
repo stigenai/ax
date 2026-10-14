@@ -472,13 +472,19 @@ func (c *Client) SuspendActor(ctx context.Context, atespace, actorName string) e
 }
 
 // DeleteActor deletes the specified actor from Substrate.
-func (c *Client) DeleteActor(ctx context.Context, atespace, actorName string) error {
+func (c *Client) DeleteActor(ctx context.Context, atespace, actorName string, actorUID ...string) error {
+	if len(actorUID) > 1 {
+		return fmt.Errorf("multiple actor deletion identities")
+	}
 	req := &ateapipb.DeleteActorRequest{
 		Actor: &ateapipb.ObjectRef{
 			Atespace: atespace,
 			Name:     actorName,
 		},
 		AnyState: true,
+	}
+	if len(actorUID) == 1 && actorUID[0] != "" {
+		req.Options = &ateapipb.DeleteOptions{Uid: actorUID[0]}
 	}
 	_, err := c.control.DeleteActor(ctx, req)
 	if err != nil && status.Code(err) != codes.NotFound {
