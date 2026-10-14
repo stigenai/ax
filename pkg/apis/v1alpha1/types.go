@@ -18,6 +18,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -33,10 +35,11 @@ import (
 var DefaultTaskImage = "gcr.io/ax-substrate/ate-images/ax-task-runner"
 
 const (
-	APIVersion    = "ax.io/v1alpha1"
-	KindTask      = "Task"
-	KindWorkspace = "Workspace"
-	KindModel     = "Model"
+	APIVersion               = "ax.io/v1alpha1"
+	KindTask                 = "Task"
+	KindWorkspace            = "Workspace"
+	KindModel                = "Model"
+	FabriekSupervisorProfile = "fabriek-native-v1"
 
 	// PhaseTerminating marks a task whose deletion has been requested and whose
 	// actor is being torn down. The record disappears once cleanup completes.
@@ -251,6 +254,9 @@ func ValidateTask(t *Task) error {
 	if spec == nil {
 		return nil
 	}
+	if err := validateSupervisorTask(spec); err != nil {
+		return err
+	}
 	refs := spec.WorkspaceRefs()
 	paths := spec.WorkspacePaths()
 	names := make(map[string]bool, len(refs))
@@ -275,6 +281,63 @@ func ValidateTask(t *Task) error {
 			return fmt.Errorf("%s: path %q is already used by workspace %q", field, paths[i], other)
 		}
 		seen[p] = r.GetName()
+	}
+	return nil
+}
+
+var (
+	fabriekImage   = regexp.MustCompile(`^.+@sha256:[0-9a-f]{64}$`)
+	fabriekDigest  = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+	fabriekAttempt = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+)
+
+func validateSupervisorTask(spec *TaskSpec) error {
+	if spec.GetSupervisorProfile() == "" {
+		return nil
+	}
+	if spec.GetSupervisorProfile() != FabriekSupervisorProfile {
+		return fmt.Errorf("spec.supervisorProfile: unsupported profile")
+	}
+	if len(spec.GetCapabilities()) > 0 {
+		return fmt.Errorf("Fabriek supervisor rejects task-supplied capabilities")
+	}
+	if spec.GetDebug() || !fabriekImage.MatchString(spec.GetImage()) || !slices.Equal(spec.GetCommand(), []string{"/usr/local/bin/python", "-m", "factory.execution.ax_worker", "serve"}) {
+		return fmt.Errorf("Fabriek supervisor requires debug=false, a digest-pinned image and the protected worker command")
+	}
+	limits := spec.GetResources().GetLimits()
+	if limits.GetCpu() == "" || limits.GetMemory() == "" {
+		return fmt.Errorf("Fabriek supervisor requires explicit CPU and memory limits")
+	}
+	env := map[string]string{}
+	for _, e := range spec.GetEnv() {
+		if e.GetName() != "FACTORY_ATTEMPT_ID" && e.GetName() != "FACTORY_NATIVE_LAUNCH_DIGEST" {
+			return fmt.Errorf("Fabriek supervisor accepts only public attempt and launch references in spec.env")
+		}
+		if _, duplicate := env[e.GetName()]; duplicate {
+			return fmt.Errorf("Fabriek supervisor rejects duplicate spec.env names")
+		}
+		env[e.GetName()] = e.GetValue()
+	}
+	if !fabriekAttempt.MatchString(env["FACTORY_ATTEMPT_ID"]) || !fabriekDigest.MatchString(env["FACTORY_NATIVE_LAUNCH_DIGEST"]) {
+		return fmt.Errorf("Fabriek supervisor requires an attempt UUID and launch SHA256 digest")
+	}
+	for _, ref := range spec.GetWorkspaces() {
+		if ref.GetGoal() != "" || ref.GetPath() != "/workspace/session" {
+			return fmt.Errorf("Fabriek supervisor workspaces must have no goal and use /workspace/session")
+		}
+	}
+	return nil
+}
+
+// ValidateSupervisorWorkspaces prevents setup side effects before Fabriek grants a boot permit.
+func ValidateSupervisorWorkspaces(task *Task, workspaces []*Workspace) error {
+	if task.GetSpec().GetSupervisorProfile() == "" {
+		return nil
+	}
+	for _, ws := range workspaces {
+		if spec := ws.GetSpec(); spec != nil && !proto.Equal(spec, &WorkspaceSpec{}) {
+			return fmt.Errorf("Fabriek supervisor requires empty workspace specs")
+		}
 	}
 	return nil
 }

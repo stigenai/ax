@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -31,6 +32,7 @@ import (
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 )
 
 // ClientOptions configures connection to the Substrate Control API server.
@@ -209,8 +211,7 @@ const (
 )
 
 // BuildActorTemplate constructs a Substrate ActorTemplate based on the standard ate-env specification.
-// capabilities are added to the container's default set (the Task's spec.capabilities).
-func BuildActorTemplate(atespace, name, image string, envMap map[string]string, command []string, snapshotsBucket string, capabilities []string) *ateapipb.ActorTemplate {
+func BuildActorTemplate(atespace, name, image string, envMap map[string]string, command []string, snapshotsBucket, supervisorProfile string, resources *v1alpha1.ResourceReqs, capabilities []string) *ateapipb.ActorTemplate {
 	if atespace == "" {
 		atespace = "default"
 	}
@@ -228,20 +229,30 @@ func BuildActorTemplate(atespace, name, image string, envMap map[string]string, 
 		}
 	}
 
+	keys := make([]string, 0, len(envMap))
+	for k := range envMap {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
 	var envList []*ateapipb.EnvVar
-	for k, v := range envMap {
+	for _, k := range keys {
 		envList = append(envList, &ateapipb.EnvVar{
 			Name:  k,
-			Value: v,
+			Value: envMap[k],
 		})
 	}
 
+	if supervisorProfile != "" {
+		// The protected root supervisor owns UID changes and native scratch cleanup.
+		// Task-supplied capabilities are rejected before provisioning.
+		capabilities = []string{"CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"}
+	}
 	var security *ateapipb.SecurityContext
 	if len(capabilities) > 0 {
 		security = &ateapipb.SecurityContext{Capabilities: &ateapipb.Capabilities{Add: capabilities}}
 	}
 
-	return &ateapipb.ActorTemplate{
+	tmpl := &ateapipb.ActorTemplate{
 		Metadata: &ateapipb.ResourceMetadata{
 			Name:     name,
 			Atespace: atespace,
@@ -252,7 +263,8 @@ func BuildActorTemplate(atespace, name, image string, envMap map[string]string, 
 			Command:         command,
 			Env:             envList,
 			SecurityContext: security,
-			Readyz: &ateapipb.ContainerReadyz{
+			WakeupProbe: &ateapipb.ContainerWakeupProbe{
+				TimeoutSeconds: 30,
 				HttpGet: &ateapipb.HTTPGetAction{
 					Path: "/readyz",
 					Port: 80,
@@ -267,7 +279,7 @@ func BuildActorTemplate(atespace, name, image string, envMap map[string]string, 
 			Name:       "workspace",
 			DurableDir: &ateapipb.DurableDirVolumeSource{},
 		}},
-		SnapshotsConfig: &ateapipb.SnapshotsConfig{
+		SnapshotConfig: &ateapipb.SnapshotConfig{
 			StorageLocation: snapshotsBucket,
 			OnPause:         ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_DATA,
 			OnCommit:        ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_DATA,
@@ -280,16 +292,26 @@ func BuildActorTemplate(atespace, name, image string, envMap map[string]string, 
 			ConfigName:   "gvisor-default",
 		},
 	}
+	if supervisorProfile != "" {
+		tmpl.Containers[0].Resources = &ateapipb.Resources{Limits: []*ateapipb.Limits{
+			{Name: "cpu", Quantity: resources.GetLimits().GetCpu()},
+			{Name: "memory", Quantity: resources.GetLimits().GetMemory()},
+		}}
+		tmpl.Volumes = append(tmpl.Volumes, &ateapipb.Volume{
+			Name: "fabriek-supervisor",
+			SystemInfo: &ateapipb.SystemInfoVolumeSource{DataSources: []*ateapipb.SystemInfoDataSource{{
+				SupervisorBootstrap: &ateapipb.SupervisorBootstrapDataSource{Profile: supervisorProfile},
+			}}},
+		})
+		tmpl.Containers[0].VolumeMounts = append(tmpl.Containers[0].VolumeMounts, &ateapipb.VolumeMount{
+			Name: "fabriek-supervisor", MountPath: "/run/substrate/fabriek-supervisor",
+		})
+	}
+	return tmpl
 }
 
-// EnsureActorTemplateWithImage creates an ActorTemplate using the specified container image, added capabilities
-// and optional environment variables.
-func (c *Client) EnsureActorTemplateWithImage(ctx context.Context, baseAtespace, baseTemplate, targetAtespace, targetTemplate, image string, capabilities []string, extraEnv ...map[string]string) (*ateapipb.ActorTemplate, error) {
-	existing, err := c.GetActorTemplate(ctx, targetAtespace, targetTemplate)
-	if err == nil && existing != nil {
-		return existing, nil
-	}
-
+// EnsureActorTemplateWithImage creates an ActorTemplate using the specified container image and optional environment variables.
+func (c *Client) EnsureActorTemplateWithImage(ctx context.Context, baseAtespace, baseTemplate, targetAtespace, targetTemplate, image, supervisorProfile string, resources *v1alpha1.ResourceReqs, capabilities []string, extraEnv ...map[string]string) (*ateapipb.ActorTemplate, error) {
 	envMap := make(map[string]string)
 	for _, envs := range extraEnv {
 		for k, v := range envs {
@@ -297,7 +319,17 @@ func (c *Client) EnsureActorTemplateWithImage(ctx context.Context, baseAtespace,
 		}
 	}
 
-	tmpl := BuildActorTemplate(targetAtespace, targetTemplate, image, envMap, nil, "", capabilities)
+	tmpl := BuildActorTemplate(targetAtespace, targetTemplate, image, envMap, nil, "", supervisorProfile, resources, capabilities)
+	existing, err := c.GetActorTemplate(ctx, targetAtespace, targetTemplate)
+	if err == nil && existing != nil {
+		if supervisorProfile != "" && !sameTemplateSpec(existing, tmpl) {
+			return nil, fmt.Errorf("existing supervisor template differs from immutable task intent")
+		}
+		return existing, nil
+	}
+	if err != nil && status.Code(err) != codes.NotFound {
+		return nil, err
+	}
 	req := &ateapipb.CreateActorTemplateRequest{
 		ActorTemplate: tmpl,
 	}
@@ -306,13 +338,31 @@ func (c *Client) EnsureActorTemplateWithImage(ctx context.Context, baseAtespace,
 		return nil, fmt.Errorf("creating actor template %s/%s: %w", targetAtespace, targetTemplate, err)
 	}
 	if created != nil {
+		if supervisorProfile != "" && !sameTemplateSpec(created, tmpl) {
+			return nil, fmt.Errorf("created supervisor template differs from immutable task intent")
+		}
 		return created, nil
 	}
-	return c.GetActorTemplate(ctx, targetAtespace, targetTemplate)
+	existing, err = c.GetActorTemplate(ctx, targetAtespace, targetTemplate)
+	if err == nil && supervisorProfile != "" && !sameTemplateSpec(existing, tmpl) {
+		return nil, fmt.Errorf("existing supervisor template differs from immutable task intent")
+	}
+	return existing, err
+}
+
+func sameTemplateSpec(a, b *ateapipb.ActorTemplate) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	a = proto.Clone(a).(*ateapipb.ActorTemplate)
+	b = proto.Clone(b).(*ateapipb.ActorTemplate)
+	a.Metadata, b.Metadata = nil, nil
+	a.Status, b.Status = nil, nil
+	return proto.Equal(a, b)
 }
 
 // EnsureActor creates an Actor in the specified atespace deriving from an ActorTemplate.
-func (c *Client) EnsureActor(ctx context.Context, atespace, actorName, templateAtespace, templateName string) (*ateapipb.Actor, error) {
+func (c *Client) EnsureActor(ctx context.Context, atespace, actorName, templateAtespace, templateName string, protectedSupervisor bool) (*ateapipb.Actor, error) {
 	req := &ateapipb.CreateActorRequest{
 		Actor: &ateapipb.Actor{
 			Metadata: &ateapipb.ResourceMetadata{
@@ -335,6 +385,12 @@ func (c *Client) EnsureActor(ctx context.Context, atespace, actorName, templateA
 				},
 			})
 			if getErr == nil && existing != nil {
+				if protectedSupervisor {
+					if !proto.Equal(existing.GetActorTemplate(), req.Actor.ActorTemplate) {
+						return nil, fmt.Errorf("existing supervisor actor references another template")
+					}
+					return existing, nil
+				}
 				state := existing.GetStatus().GetState()
 				if state == ateapipb.ActorState_ACTOR_STATE_CRASHED {
 					slog.Warn("existing actor is crashed, deleting and recreating", "actor", actorName)

@@ -111,6 +111,12 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 	if task.Spec.Image == "" {
 		task.Spec.Image = v1alpha1.DefaultTaskImage
 	}
+	if err := v1alpha1.ValidateTask(task); err != nil {
+		return task, err
+	}
+	if err := v1alpha1.ValidateSupervisorWorkspaces(task, workspaces); err != nil {
+		return task, err
+	}
 
 	slog.Info("reconciling task", "name", task.Metadata.Name, "atespace", atespace, "image", task.Spec.Image)
 
@@ -150,8 +156,10 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 		}
 	}
 
-	if geminiKey := r.lookupGeminiKey(ctx, atespace); geminiKey != "" {
-		extraEnv[geminiSecretKey] = geminiKey
+	if task.Spec.GetSupervisorProfile() == "" {
+		if geminiKey := r.lookupGeminiKey(ctx, atespace); geminiKey != "" {
+			extraEnv[geminiSecretKey] = geminiKey
+		}
 	}
 
 	// Only launch configuration belongs in the template; status and suspend
@@ -163,8 +171,7 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 	// runner never reads it back out of AX_TASK_YAML. Copying it in would put
 	// every value into this one variable, which Substrate caps at 32 KiB.
 	launchTask.Spec.Env = nil
-	// The template carries spec.capabilities and the runner has no use for them,
-	// and a runner built before the field existed refuses a Task that has it.
+	// Capabilities belong to the template; older runners reject this field.
 	launchTask.Spec.Capabilities = nil
 	if taskYAML, err := yaml.Marshal(launchTask); err == nil {
 		extraEnv["AX_TASK_YAML"] = string(taskYAML)
@@ -180,7 +187,7 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 		slog.Info("ensuring custom ActorTemplate for task", "image", task.Spec.Image)
 		customTemplateName := taskTemplateName(task.Metadata.Name, task.Spec.Image, task.Spec.Capabilities, extraEnv)
 
-		tmpl, err := r.client.EnsureActorTemplateWithImage(ctx, templateAtespace, templateName, atespace, customTemplateName, task.Spec.Image, task.Spec.Capabilities, extraEnv)
+		tmpl, err := r.client.EnsureActorTemplateWithImage(ctx, templateAtespace, templateName, atespace, customTemplateName, task.Spec.Image, task.Spec.SupervisorProfile, task.Spec.Resources, task.Spec.Capabilities, extraEnv)
 		if err != nil {
 			// The default template has neither this image nor this env, so an
 			// actor made from it would not be this task: fail with the reason.
@@ -195,7 +202,7 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 		}
 	}
 
-	_, err := r.client.EnsureActor(ctx, atespace, actorName, templateAtespace, templateName)
+	_, err := r.client.EnsureActor(ctx, atespace, actorName, templateAtespace, templateName, task.Spec.SupervisorProfile != "")
 	if err != nil {
 		r.setNotReady(task, "ActorCreationFailed", err.Error(), now)
 		task.Status.Phase = "Failed"

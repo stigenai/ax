@@ -94,6 +94,8 @@ message TaskSpec {
   // let a task that starts as root run its work as another user. The sandbox
   // stays the isolation boundary. Substrate refuses ALL and unknown names.
   repeated string capabilities = 11;
+  // supervisor_profile opts into a protected platform bootstrap projection.
+  string supervisor_profile = 12;
 }
 
 message EnvVar {

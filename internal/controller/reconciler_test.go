@@ -30,6 +30,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 )
 
 type mockControlServer struct {
@@ -45,6 +46,7 @@ type mockControlServer struct {
 	// rejectTemplates makes CreateActorTemplate fail, as Substrate's validation does
 	rejectTemplates error
 	lastTemplate    *ateapipb.ActorTemplate
+	existingActor   *ateapipb.Actor
 }
 
 // noSecrets is a SecretResolver for tests: it never finds a key and never touches a cluster.
@@ -56,6 +58,9 @@ func (m *mockControlServer) GetActorTemplate(_ context.Context, req *ateapipb.Ge
 	ref := req.GetActorTemplate()
 	if !m.actorTemplates[ref.GetName()] {
 		return nil, status.Error(codes.NotFound, "template not found")
+	}
+	if m.lastTemplate != nil && m.lastTemplate.GetMetadata().GetName() == ref.GetName() {
+		return proto.Clone(m.lastTemplate).(*ateapipb.ActorTemplate), nil
 	}
 	return &ateapipb.ActorTemplate{Metadata: &ateapipb.ResourceMetadata{Name: ref.GetName(), Atespace: ref.GetAtespace()}}, nil
 }
@@ -82,7 +87,14 @@ func (m *mockControlServer) CreateAtespace(ctx context.Context, req *ateapipb.Cr
 	return &ateapipb.Atespace{Metadata: &ateapipb.ResourceMetadata{Name: name}}, nil
 }
 
+func (m *mockControlServer) GetActor(context.Context, *ateapipb.GetActorRequest) (*ateapipb.Actor, error) {
+	return m.existingActor, nil
+}
+
 func (m *mockControlServer) CreateActor(ctx context.Context, req *ateapipb.CreateActorRequest) (*ateapipb.Actor, error) {
+	if m.existingActor != nil {
+		return nil, status.Error(codes.AlreadyExists, "actor exists")
+	}
 	name := ""
 	if req.Actor != nil && req.Actor.Metadata != nil {
 		name = req.Actor.Metadata.Name
@@ -564,5 +576,117 @@ func TestTaskReconciler_TemplateRefusedFailsTask(t *testing.T) {
 	}
 	if len(mockSrv.createdActors) != 0 {
 		t.Errorf("an actor was created from another template: %v", mockSrv.createdActors)
+	}
+}
+
+func supervisorTask() *v1alpha1.Task {
+	return &v1alpha1.Task{Metadata: &v1alpha1.ObjectMeta{Name: "fabriek-task", Atespace: "fabriek"}, Spec: &v1alpha1.TaskSpec{
+		SupervisorProfile: v1alpha1.FabriekSupervisorProfile,
+		Image:             "ghcr.io/stigenai/native@sha256:" + strings.Repeat("a", 64),
+		Command:           []string{"/usr/local/bin/python", "-m", "factory.execution.ax_worker", "serve"},
+		Env:               []*v1alpha1.EnvVar{{Name: "FACTORY_ATTEMPT_ID", Value: "11111111-1111-4111-8111-111111111111"}, {Name: "FACTORY_NATIVE_LAUNCH_DIGEST", Value: "sha256:" + strings.Repeat("b", 64)}},
+		Resources:         &v1alpha1.ResourceReqs{Limits: &v1alpha1.ResourceList{Cpu: "500m", Memory: "512Mi"}},
+		Workspaces:        []*v1alpha1.WorkspaceRef{{Name: "session", Path: "/workspace/session"}},
+	}}
+}
+
+func TestFabriekSupervisorProjection(t *testing.T) {
+	mock := &mockControlServer{}
+	r := newTestReconciler(t, mock)
+	r.SecretResolver = func(context.Context, string, string, string) (string, error) {
+		t.Fatal("protected task looked up shared credentials")
+		return "", nil
+	}
+	t.Setenv("GEMINI_API_KEY", "must-not-reach-template")
+	task := supervisorTask()
+	if _, err := r.Reconcile(context.Background(), task); err != nil {
+		t.Fatal(err)
+	}
+	tmpl := mock.lastTemplate
+	if len(tmpl.GetVolumes()) != 2 {
+		t.Fatalf("volumes: %v", tmpl.GetVolumes())
+	}
+	projection := tmpl.GetVolumes()[1].GetSystemInfo().GetDataSources()
+	if len(projection) != 1 || projection[0].GetSupervisorBootstrap().GetProfile() != v1alpha1.FabriekSupervisorProfile {
+		t.Fatal("protected bootstrap missing")
+	}
+	guest := tmpl.GetContainers()[0]
+	if got := guest.GetSecurityContext().GetCapabilities().GetAdd(); strings.Join(got, ",") != "CHOWN,DAC_OVERRIDE,FOWNER,SETGID,SETUID" {
+		t.Fatalf("unexpected protected supervisor capabilities: %v", got)
+	}
+	if guest.GetVolumeMounts()[1].GetMountPath() != "/run/substrate/fabriek-supervisor" {
+		t.Fatal("wrong protected mount")
+	}
+	if got := guest.GetResources().GetLimits(); len(got) != 2 || got[0].GetQuantity() != "500m" || got[1].GetQuantity() != "512Mi" {
+		t.Fatalf("limits not enforced: %v", got)
+	}
+	for _, e := range guest.GetEnv() {
+		if e.GetName() == "GEMINI_API_KEY" || strings.Contains(e.GetValue(), "must-not-reach-template") {
+			t.Fatal("shared credential injected")
+		}
+	}
+	snapshot := tmpl.GetSnapshotConfig()
+	if snapshot.GetOnPause() != ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_DATA || snapshot.GetOnCommit() != ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_DATA || snapshot.GetOnResume().GetFromData() != ateapipb.ResumeSource_RESUME_SOURCE_GOLDEN {
+		t.Fatal("unsafe snapshot policy")
+	}
+	if _, err := r.Reconcile(context.Background(), supervisorTask()); err != nil {
+		t.Fatalf("identical reconcile failed: %v", err)
+	}
+	// A different environment order must not alter the signed template's protobuf digest.
+	if !proto.Equal(tmpl, mock.lastTemplate) {
+		t.Fatal("reconcile changed immutable template")
+	}
+	mock.lastTemplate.Containers[0].Command = []string{"sh"}
+	before := len(mock.resumedActors)
+	if _, err := r.Reconcile(context.Background(), supervisorTask()); err == nil {
+		t.Fatal("mutated template accepted")
+	}
+	if len(mock.resumedActors) != before {
+		t.Fatal("resumed changed template")
+	}
+}
+
+func TestFabriekSupervisorRejectsWorkspaceActionsBeforeProvisioning(t *testing.T) {
+	mock := &mockControlServer{}
+	r := newTestReconciler(t, mock)
+	ws := &v1alpha1.Workspace{Spec: &v1alpha1.WorkspaceSpec{Git: []*v1alpha1.GitRepo{{Repo: "https://example.test/repo"}}}}
+	if _, err := r.Reconcile(context.Background(), supervisorTask(), ws); err == nil {
+		t.Fatal("workspace actions accepted")
+	}
+	if len(mock.createdAtespaces) != 0 || len(mock.createdActors) != 0 {
+		t.Fatal("provisioning before validation")
+	}
+}
+
+func TestFabriekSupervisorDoesNotReplaceExistingActor(t *testing.T) {
+	mock := &mockControlServer{}
+	r := newTestReconciler(t, mock)
+	if _, err := r.Reconcile(context.Background(), supervisorTask()); err != nil {
+		t.Fatal(err)
+	}
+	mock.existingActor = &ateapipb.Actor{ActorTemplate: &ateapipb.ObjectRef{Atespace: "fabriek", Name: "another-template"}, Status: &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_CRASHED}}
+	before := len(mock.resumedActors)
+	if _, err := r.Reconcile(context.Background(), supervisorTask()); err == nil {
+		t.Fatal("existing actor with another template accepted")
+	}
+	if len(mock.deletedActors) != 0 || len(mock.resumedActors) != before {
+		t.Fatal("unexpected existing actor mutation")
+	}
+}
+
+func TestFabriekSupervisorRejectsTaskCapabilitiesBeforeProvisioning(t *testing.T) {
+	for _, capability := range []string{"SETUID", "SYS_ADMIN", "UNKNOWN_CAPABILITY"} {
+		t.Run(capability, func(t *testing.T) {
+			mock := &mockControlServer{}
+			r := newTestReconciler(t, mock)
+			task := supervisorTask()
+			task.Spec.Capabilities = []string{capability}
+			if _, err := r.Reconcile(context.Background(), task); err == nil {
+				t.Fatal("task capability accepted")
+			}
+			if len(mock.createdAtespaces) != 0 || len(mock.createdActors) != 0 || mock.lastTemplate != nil {
+				t.Fatal("provisioning before capability validation")
+			}
+		})
 	}
 }
