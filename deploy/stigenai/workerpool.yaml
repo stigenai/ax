@@ -1,6 +1,7 @@
-# Warm workers for AX tasks. AX's ActorTemplates carry no workerSelector, so
-# they schedule onto any pool; this is the one that exists for them. The
-# worker image must match the installed Substrate version, as must the
+# Warm workers for ordinary AX tasks, whose templates carry no workerSelector.
+# Protected Fabriek supervisors require a separate labeled pool; see
+# docs/fabriek-supervisor.md.
+# The worker image must match the installed Substrate version, as must the
 # nodeSelector (ate-setup stamps ate.dev/substrate-version on worker nodes).
 apiVersion: ate.dev/v1alpha1
 kind: WorkerPool

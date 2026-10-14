@@ -307,6 +307,11 @@ func BuildActorTemplate(atespace, name, image string, envMap map[string]string, 
 			Name: "fabriek-supervisor", MountPath: "/run/substrate/fabriek-supervisor",
 		})
 	}
+	if supervisorProfile == v1alpha1.FabriekSupervisorProfile {
+		tmpl.WorkerSelector = &ateapipb.Selector{MatchLabels: map[string]string{
+			"fabriek.dev/supervisor-profile": v1alpha1.FabriekSupervisorProfile,
+		}}
+	}
 	return tmpl
 }
 

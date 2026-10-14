@@ -16,6 +16,27 @@ retain their existing `spec.capabilities` behavior.
 
 The controller does not fetch or inject its shared Gemini key.
 
+Protected templates select only WorkerPools labeled
+`fabriek.dev/supervisor-profile: fabriek-native-v1`. Without a matching pool,
+Substrate cannot place the actor; AX does not fall back to an unlabeled pool.
+A retained protected template with a missing or different selector is rejected
+before any actor is created or resumed; it is not rewritten or deleted.
+
+Provision a separate pool with that metadata label and a digest-pinned worker
+image and node version that support the protected bootstrap. Keep any serving
+pool unchanged while actors are active; adding this label to an old pool would
+advertise support it does not have. The candidate pool's placement label is:
+
+```yaml
+metadata:
+  labels:
+    fabriek.dev/supervisor-profile: fabriek-native-v1
+```
+
+Ordinary AX templates keep their existing unconstrained placement, so this label
+does not make the pool exclusive or replace private API and writer controls.
+Pool provisioning and gVisor placement qualification are separate deployment steps.
+
 AX mounts the dedicated SystemInfo projection at
 `/run/substrate/fabriek-supervisor`. Substrate owns `activation.jwt`, its root-only
 permissions, freshness on activation, and restricted issuance. No credential is

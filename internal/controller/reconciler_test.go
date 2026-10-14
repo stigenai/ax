@@ -225,6 +225,10 @@ func TestTaskReconciler(t *testing.T) {
 		t.Errorf("expected worker IP '10.244.1.42', got %q", reconciled.Status.WorkerIp)
 	}
 
+	if got := mockSrv.lastTemplate.GetWorkerSelector(); got != nil {
+		t.Fatalf("ordinary task gained a worker selector: %v", got)
+	}
+
 	// Verify mock was called
 	if len(mockSrv.createdAtespaces) != 1 || mockSrv.createdAtespaces[0] != "default" {
 		t.Errorf("expected atespace 'default' created, got %v", mockSrv.createdAtespaces)
@@ -603,6 +607,12 @@ func TestFabriekSupervisorProjection(t *testing.T) {
 		t.Fatal(err)
 	}
 	tmpl := mock.lastTemplate
+	wantSelector := &ateapipb.Selector{MatchLabels: map[string]string{
+		"fabriek.dev/supervisor-profile": v1alpha1.FabriekSupervisorProfile,
+	}}
+	if !proto.Equal(tmpl.GetWorkerSelector(), wantSelector) {
+		t.Fatalf("protected worker placement missing: %v", tmpl.GetWorkerSelector())
+	}
 	if len(tmpl.GetVolumes()) != 2 {
 		t.Fatalf("volumes: %v", tmpl.GetVolumes())
 	}
@@ -686,6 +696,34 @@ func TestFabriekSupervisorRejectsTaskCapabilitiesBeforeProvisioning(t *testing.T
 			}
 			if len(mock.createdAtespaces) != 0 || len(mock.createdActors) != 0 || mock.lastTemplate != nil {
 				t.Fatal("provisioning before capability validation")
+			}
+		})
+	}
+}
+
+func TestFabriekSupervisorRejectsRetainedWorkerSelectorChange(t *testing.T) {
+	for name, selector := range map[string]*ateapipb.Selector{
+		"missing":         nil,
+		"wrong profile":   {MatchLabels: map[string]string{"fabriek.dev/supervisor-profile": "another-profile"}},
+		"unrelated label": {MatchLabels: map[string]string{"workload": "ax"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			mock := &mockControlServer{}
+			r := newTestReconciler(t, mock)
+			if _, err := r.Reconcile(context.Background(), supervisorTask()); err != nil {
+				t.Fatal(err)
+			}
+			mock.lastTemplate.WorkerSelector = selector
+			retained := proto.Clone(mock.lastTemplate).(*ateapipb.ActorTemplate)
+			created, resumed := len(mock.createdActors), len(mock.resumedActors)
+			if _, err := r.Reconcile(context.Background(), supervisorTask()); err == nil || !strings.Contains(err.Error(), "immutable task intent") {
+				t.Fatalf("retained selector change was not rejected: %v", err)
+			}
+			if len(mock.createdActors) != created || len(mock.resumedActors) != resumed || len(mock.deletedActors) != 0 || len(mock.deletedTemplates) != 0 {
+				t.Fatal("changed placement mutated an actor or deleted its template")
+			}
+			if !proto.Equal(mock.lastTemplate, retained) {
+				t.Fatal("changed placement overwrote the retained template")
 			}
 		})
 	}
