@@ -211,7 +211,7 @@ const (
 )
 
 // BuildActorTemplate constructs a Substrate ActorTemplate based on the standard ate-env specification.
-func BuildActorTemplate(atespace, name, image string, envMap map[string]string, command []string, snapshotsBucket, supervisorProfile string, resources *v1alpha1.ResourceReqs) *ateapipb.ActorTemplate {
+func BuildActorTemplate(atespace, name, image string, envMap map[string]string, command []string, snapshotsBucket, supervisorProfile string, resources *v1alpha1.ResourceReqs, capabilities []string) *ateapipb.ActorTemplate {
 	if atespace == "" {
 		atespace = "default"
 	}
@@ -242,16 +242,27 @@ func BuildActorTemplate(atespace, name, image string, envMap map[string]string, 
 		})
 	}
 
+	if supervisorProfile != "" {
+		// The protected root supervisor owns UID changes and native scratch cleanup.
+		// Task-supplied capabilities are rejected before provisioning.
+		capabilities = []string{"CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"}
+	}
+	var security *ateapipb.SecurityContext
+	if len(capabilities) > 0 {
+		security = &ateapipb.SecurityContext{Capabilities: &ateapipb.Capabilities{Add: capabilities}}
+	}
+
 	tmpl := &ateapipb.ActorTemplate{
 		Metadata: &ateapipb.ResourceMetadata{
 			Name:     name,
 			Atespace: atespace,
 		},
 		Containers: []*ateapipb.Container{{
-			Name:    "guest",
-			Image:   image,
-			Command: command,
-			Env:     envList,
+			Name:            "guest",
+			Image:           image,
+			Command:         command,
+			Env:             envList,
+			SecurityContext: security,
 			WakeupProbe: &ateapipb.ContainerWakeupProbe{
 				TimeoutSeconds: 30,
 				HttpGet: &ateapipb.HTTPGetAction{
@@ -300,7 +311,7 @@ func BuildActorTemplate(atespace, name, image string, envMap map[string]string, 
 }
 
 // EnsureActorTemplateWithImage creates an ActorTemplate using the specified container image and optional environment variables.
-func (c *Client) EnsureActorTemplateWithImage(ctx context.Context, baseAtespace, baseTemplate, targetAtespace, targetTemplate, image, supervisorProfile string, resources *v1alpha1.ResourceReqs, extraEnv ...map[string]string) (*ateapipb.ActorTemplate, error) {
+func (c *Client) EnsureActorTemplateWithImage(ctx context.Context, baseAtespace, baseTemplate, targetAtespace, targetTemplate, image, supervisorProfile string, resources *v1alpha1.ResourceReqs, capabilities []string, extraEnv ...map[string]string) (*ateapipb.ActorTemplate, error) {
 	envMap := make(map[string]string)
 	for _, envs := range extraEnv {
 		for k, v := range envs {
@@ -308,7 +319,7 @@ func (c *Client) EnsureActorTemplateWithImage(ctx context.Context, baseAtespace,
 		}
 	}
 
-	tmpl := BuildActorTemplate(targetAtespace, targetTemplate, image, envMap, nil, "", supervisorProfile, resources)
+	tmpl := BuildActorTemplate(targetAtespace, targetTemplate, image, envMap, nil, "", supervisorProfile, resources, capabilities)
 	existing, err := c.GetActorTemplate(ctx, targetAtespace, targetTemplate)
 	if err == nil && existing != nil {
 		if supervisorProfile != "" && !sameTemplateSpec(existing, tmpl) {

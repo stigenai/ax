@@ -7,7 +7,14 @@ This profile requires a digest-pinned image, `debug: false`, the fixed command
 `/usr/local/bin/python -m factory.execution.ax_worker serve`, explicit CPU/memory
 limits, and only `FACTORY_ATTEMPT_ID` and `FACTORY_NATIVE_LAUNCH_DIGEST` in task
 environment. Workspace goals and nonempty Workspace specs are rejected before
-provisioning. The controller does not fetch or inject its shared Gemini key.
+provisioning. Task-supplied capabilities are rejected, including unknown names.
+The protected root supervisor receives only `CHOWN`, `DAC_OVERRIDE`, `FOWNER`,
+`SETGID` and `SETUID` in addition to Substrate defaults (`AUDIT_WRITE`, `KILL`,
+`NET_BIND_SERVICE`), for UID isolation and native scratch cleanup. The native
+UID must have no effective, permitted or ambient capabilities. Ordinary Tasks
+retain their existing `spec.capabilities` behavior.
+
+The controller does not fetch or inject its shared Gemini key.
 
 AX mounts the dedicated SystemInfo projection at
 `/run/substrate/fabriek-supervisor`. Substrate owns `activation.jwt`, its root-only
@@ -22,7 +29,10 @@ and reject Full restore for this profile. AX checks a retained template against
 the immutable requested spec and rejects an existing actor bound to another
 template. It does not automatically delete a protected crashed actor.
 
-This profile needs the matching Substrate bootstrap extension and a separately
+This profile pins [Substrate bootstrap PR #1](https://github.com/stigenai/substrate/pull/1)
+at `6fbe6ab2aeed95bef9aa9240f02232cbbacf48e6` through the published
+`github.com/stigenai/substrate` Go module replacement. It needs that platform
+version deployed and a separately
 qualified Fabriek worker image. A private AX endpoint with exclusive authorized
 writers remains required: this opt-in field is not API authorization. Unit tests
 and a successful build do not qualify gVisor UID isolation, Golden/Data restore,

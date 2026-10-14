@@ -535,6 +535,25 @@ func TestTaskReconciler_TaskYAMLLeavesOutEnv(t *testing.T) {
 	}
 }
 
+// spec.capabilities reach the container's securityContext, but not AX_TASK_YAML, which a runner built before the field would refuse.
+func TestTaskReconciler_Capabilities(t *testing.T) {
+	mockSrv := &mockControlServer{}
+	task := envTask("x")
+	task.Spec.Capabilities = []string{"SETUID", "SETGID"}
+	if _, err := newTestReconciler(t, mockSrv).Reconcile(context.Background(), task); err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	c := mockSrv.lastTemplate.GetContainers()[0]
+	if got := c.GetSecurityContext().GetCapabilities().GetAdd(); strings.Join(got, ",") != "SETUID,SETGID" {
+		t.Errorf("securityContext.capabilities.add = %v", got)
+	}
+	for _, e := range c.GetEnv() {
+		if e.GetName() == "AX_TASK_YAML" && strings.Contains(e.GetValue(), "SETUID") {
+			t.Errorf("AX_TASK_YAML carries the capabilities: %q", e.GetValue())
+		}
+	}
+}
+
 // A template Substrate refuses fails the task with Substrate's reason, rather
 // than an actor made from a default template that is not this task.
 func TestTaskReconciler_TemplateRefusedFailsTask(t *testing.T) {
@@ -592,6 +611,9 @@ func TestFabriekSupervisorProjection(t *testing.T) {
 		t.Fatal("protected bootstrap missing")
 	}
 	guest := tmpl.GetContainers()[0]
+	if got := guest.GetSecurityContext().GetCapabilities().GetAdd(); strings.Join(got, ",") != "CHOWN,DAC_OVERRIDE,FOWNER,SETGID,SETUID" {
+		t.Fatalf("unexpected protected supervisor capabilities: %v", got)
+	}
 	if guest.GetVolumeMounts()[1].GetMountPath() != "/run/substrate/fabriek-supervisor" {
 		t.Fatal("wrong protected mount")
 	}
@@ -649,5 +671,22 @@ func TestFabriekSupervisorDoesNotReplaceExistingActor(t *testing.T) {
 	}
 	if len(mock.deletedActors) != 0 || len(mock.resumedActors) != before {
 		t.Fatal("unexpected existing actor mutation")
+	}
+}
+
+func TestFabriekSupervisorRejectsTaskCapabilitiesBeforeProvisioning(t *testing.T) {
+	for _, capability := range []string{"SETUID", "SYS_ADMIN", "UNKNOWN_CAPABILITY"} {
+		t.Run(capability, func(t *testing.T) {
+			mock := &mockControlServer{}
+			r := newTestReconciler(t, mock)
+			task := supervisorTask()
+			task.Spec.Capabilities = []string{capability}
+			if _, err := r.Reconcile(context.Background(), task); err == nil {
+				t.Fatal("task capability accepted")
+			}
+			if len(mock.createdAtespaces) != 0 || len(mock.createdActors) != 0 || mock.lastTemplate != nil {
+				t.Fatal("provisioning before capability validation")
+			}
+		})
 	}
 }

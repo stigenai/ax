@@ -478,10 +478,12 @@ func TestValidateFabriekSupervisor(t *testing.T) {
 		t.Fatal(err)
 	}
 	for name, mutate := range map[string]func(*v1alpha1.TaskSpec){
-		"unknown profile": func(s *v1alpha1.TaskSpec) { s.SupervisorProfile = "other" },
-		"debug":           func(s *v1alpha1.TaskSpec) { s.Debug = true },
-		"mutable image":   func(s *v1alpha1.TaskSpec) { s.Image = "worker:latest" },
-		"custom command":  func(s *v1alpha1.TaskSpec) { s.Command = []string{"sh"} },
+		"unknown profile":    func(s *v1alpha1.TaskSpec) { s.SupervisorProfile = "other" },
+		"debug":              func(s *v1alpha1.TaskSpec) { s.Debug = true },
+		"known capability":   func(s *v1alpha1.TaskSpec) { s.Capabilities = []string{"SETUID"} },
+		"unknown capability": func(s *v1alpha1.TaskSpec) { s.Capabilities = []string{"UNKNOWN_CAPABILITY"} },
+		"mutable image":      func(s *v1alpha1.TaskSpec) { s.Image = "worker:latest" },
+		"custom command":     func(s *v1alpha1.TaskSpec) { s.Command = []string{"sh"} },
 		"secret env": func(s *v1alpha1.TaskSpec) {
 			s.Env = append(s.Env, &v1alpha1.EnvVar{Name: "GEMINI_API_KEY", Value: "never-project"})
 		},
@@ -524,5 +526,26 @@ func TestValidateFabriekSupervisor(t *testing.T) {
 	}
 	if err := v1alpha1.ValidateTask(&decoded); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// The deployment branch already published capabilities at field 11. Keep that
+// wire contract intact when adding the independently opted-in profile.
+func TestTaskCapabilityAndSupervisorWireNumbers(t *testing.T) {
+	fields := (&v1alpha1.TaskSpec{}).ProtoReflect().Descriptor().Fields()
+	if fields.ByName("capabilities").Number() != 11 || fields.ByName("supervisor_profile").Number() != 12 {
+		t.Fatal("task extension protobuf field numbers changed")
+	}
+	before := &v1alpha1.Task{Spec: &v1alpha1.TaskSpec{Capabilities: []string{"SETUID", "SETGID"}}}
+	encoded, err := yaml.Marshal(before)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var after v1alpha1.Task
+	if err := yaml.Unmarshal(encoded, &after); err != nil {
+		t.Fatal(err)
+	}
+	if !proto.Equal(before, &after) {
+		t.Fatal("ordinary task capabilities lost in YAML")
 	}
 }

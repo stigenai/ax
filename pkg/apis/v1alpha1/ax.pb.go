@@ -187,8 +187,14 @@ type TaskSpec struct {
 	// debug enables the in-container guest services (process execution and file
 	// access) that back `ax ssh`. Off by default.
 	Debug bool `protobuf:"varint,10,opt,name=debug,proto3" json:"debug,omitempty"`
+	// capabilities are Linux capabilities added to the task container's default
+	// set (AUDIT_WRITE, KILL, NET_BIND_SERVICE), named without the CAP_ prefix as
+	// Substrate's securityContext.capabilities.add takes them: SETUID and SETGID
+	// let a task that starts as root run its work as another user. The sandbox
+	// stays the isolation boundary. Substrate refuses ALL and unknown names.
+	Capabilities []string `protobuf:"bytes,11,rep,name=capabilities,proto3" json:"capabilities,omitempty"`
 	// supervisor_profile opts into a protected platform bootstrap projection.
-	SupervisorProfile string `protobuf:"bytes,11,opt,name=supervisor_profile,json=supervisorProfile,proto3" json:"supervisor_profile,omitempty"`
+	SupervisorProfile string `protobuf:"bytes,12,opt,name=supervisor_profile,json=supervisorProfile,proto3" json:"supervisor_profile,omitempty"`
 	unknownFields     protoimpl.UnknownFields
 	sizeCache         protoimpl.SizeCache
 }
@@ -270,6 +276,13 @@ func (x *TaskSpec) GetDebug() bool {
 		return x.Debug
 	}
 	return false
+}
+
+func (x *TaskSpec) GetCapabilities() []string {
+	if x != nil {
+		return x.Capabilities
+	}
+	return nil
 }
 
 func (x *TaskSpec) GetSupervisorProfile() string {
@@ -2529,7 +2542,7 @@ const file_pkg_apis_v1alpha1_ax_proto_rawDesc = "" +
 	"\x04kind\x18\x02 \x01(\tR\x04kind\x123\n" +
 	"\bmetadata\x18\x03 \x01(\v2\x17.ax.v1alpha1.ObjectMetaR\bmetadata\x12)\n" +
 	"\x04spec\x18\x04 \x01(\v2\x15.ax.v1alpha1.TaskSpecR\x04spec\x12/\n" +
-	"\x06status\x18\x05 \x01(\v2\x17.ax.v1alpha1.TaskStatusR\x06status\"\xdf\x02\n" +
+	"\x06status\x18\x05 \x01(\v2\x17.ax.v1alpha1.TaskStatusR\x06status\"\x83\x03\n" +
 	"\bTaskSpec\x12\x18\n" +
 	"\asuspend\x18\x02 \x01(\bR\asuspend\x12\x14\n" +
 	"\x05image\x18\x03 \x01(\tR\x05image\x12\x18\n" +
@@ -2540,8 +2553,9 @@ const file_pkg_apis_v1alpha1_ax_proto_rawDesc = "" +
 	"workspaces\x18\a \x03(\v2\x19.ax.v1alpha1.WorkspaceRefR\n" +
 	"workspaces\x12\x14\n" +
 	"\x05debug\x18\n" +
-	" \x01(\bR\x05debug\x12-\n" +
-	"\x12supervisor_profile\x18\v \x01(\tR\x11supervisorProfileJ\x04\b\x01\x10\x02J\x04\b\b\x10\tJ\x04\b\t\x10\n" +
+	" \x01(\bR\x05debug\x12\"\n" +
+	"\fcapabilities\x18\v \x03(\tR\fcapabilities\x12-\n" +
+	"\x12supervisor_profile\x18\f \x01(\tR\x11supervisorProfileJ\x04\b\x01\x10\x02J\x04\b\b\x10\tJ\x04\b\t\x10\n" +
 	"R\x04goalR\agatewayR\bpolicies\"2\n" +
 	"\x06EnvVar\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x14\n" +

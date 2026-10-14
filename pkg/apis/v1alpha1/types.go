@@ -298,6 +298,9 @@ func validateSupervisorTask(spec *TaskSpec) error {
 	if spec.GetSupervisorProfile() != FabriekSupervisorProfile {
 		return fmt.Errorf("spec.supervisorProfile: unsupported profile")
 	}
+	if len(spec.GetCapabilities()) > 0 {
+		return fmt.Errorf("Fabriek supervisor rejects task-supplied capabilities")
+	}
 	if spec.GetDebug() || !fabriekImage.MatchString(spec.GetImage()) || !slices.Equal(spec.GetCommand(), []string{"/usr/local/bin/python", "-m", "factory.execution.ax_worker", "serve"}) {
 		return fmt.Errorf("Fabriek supervisor requires debug=false, a digest-pinned image and the protected worker command")
 	}
