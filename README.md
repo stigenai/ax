@@ -230,6 +230,9 @@ resume; no policy is overwritten. A missing policy on a running actor is not
 silently recreated. This removes the operator race between actor start and
 policy installation. The Fabriek attempt deadline still begins at admission;
 policy failures consume or hold that attempt under its existing accounting.
+The worker acknowledges failed events and marks the Task Failed; it does not
+automatically retry. A trusted operator must reconcile a lost create response
+within the original allowance or proceed through the existing cleanup path.
 
 The destination must match the private gateway's operator pin and its fixed
 Envoy TCP cluster. This option alone does not establish native TLS transport,
