@@ -213,3 +213,27 @@ writer; it does not add a distributed lifecycle fence. Queue, transport, or
 precondition failures do not prove termination. Fabriek must independently read
 the exact Substrate termination receipt before releasing capacity. Ordinary
 Tasks keep the existing deletion interface and cleanup behavior.
+
+### Private native egress before start
+
+The isolated Fabriek controller can opt into
+`--native-tls-destination=HOST:PORT` with `POD_NAMESPACE=fabriek-native`, the
+verified `api.fabriek-native.svc.cluster.local:443` endpoint and
+`api.fabriek-native.svc` authority. Only protected tasks in atespace
+`fabriek-native` use it. Ordinary tasks and controllers without the flag keep
+existing behavior.
+
+Before ResumeActor, the controller reads or creates one exact TLS_PASSTHROUGH
+policy for HOST and PORT, verifies it by rereading, and checks the retained actor
+UID again. Conflicting policy, unknown creation and changed actor identity deny
+resume; no policy is overwritten. A missing policy on a running actor is not
+silently recreated. This removes the operator race between actor start and
+policy installation. The Fabriek attempt deadline still begins at admission;
+policy failures consume or hold that attempt under its existing accounting.
+The worker acknowledges failed events and marks the Task Failed; it does not
+automatically retry. A trusted operator must reconcile a lost create response
+within the original allowance or proceed through the existing cleanup path.
+
+The destination must match the private gateway's operator pin and its fixed
+Envoy TCP cluster. This option alone does not establish native TLS transport,
+private API writer isolation, or hosted qualification.

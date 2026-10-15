@@ -43,6 +43,7 @@ func main() {
 		redisPassword           string
 		redisGroup              string
 		redisConsumer           string
+		nativeTLSDestination    string
 	)
 
 	flag.StringVar(&redisAddr, "redis-addr", "localhost:6379", "Redis server address (e.g. localhost:6379)")
@@ -57,6 +58,7 @@ func main() {
 	flag.BoolVar(&substratePlaintext, "substrate-plaintext", false, "Use insecure plaintext gRPC connection to Substrate")
 	flag.StringVar(&defaultTemplate, "template", "default-template", "Default Substrate ActorTemplate name")
 	flag.StringVar(&defaultTemplateAtespace, "template-atespace", "ax-system", "Default Substrate ActorTemplate atespace")
+	flag.StringVar(&nativeTLSDestination, "native-tls-destination", "", "Private protected-actor TLS destination; install or verify exact policy before resume")
 	flag.Parse()
 
 	if envRedis := os.Getenv("REDIS_ADDR"); envRedis != "" {
@@ -96,6 +98,12 @@ func main() {
 	defer subClient.Close()
 
 	reconciler := controller.NewTaskReconciler(subClient, defaultTemplate, defaultTemplateAtespace)
+	if nativeTLSDestination != "" {
+		if err := reconciler.ConfigureNativeTLS(nativeTLSDestination, os.Getenv("POD_NAMESPACE"), substrateEndpoint, substrateAuthority, substrateInsecureTLS || substratePlaintext); err != nil {
+			slog.Error("invalid native TLS configuration", "error", err)
+			os.Exit(1)
+		}
+	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
