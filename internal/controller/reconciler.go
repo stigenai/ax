@@ -28,6 +28,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"github.com/google/ax/internal/model"
 	"github.com/google/ax/internal/substrate"
 	"github.com/google/ax/pkg/apis/v1alpha1"
@@ -60,6 +61,7 @@ type SecretResolver func(ctx context.Context, namespace, secretName, key string)
 // sandboxed Actors on Agent Substrate.
 type TaskReconciler struct {
 	client                  *substrate.Client
+	nativeTLSPolicy         *ateapipb.EgressPolicy
 	httpClient              *http.Client
 	defaultTemplate         string
 	defaultTemplateAtespace string
@@ -116,6 +118,10 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 	}
 	if err := v1alpha1.ValidateSupervisorWorkspaces(task, workspaces); err != nil {
 		return task, err
+	}
+
+	if r.nativeTLSPolicy != nil && task.Spec.SupervisorProfile != "" && atespace != "fabriek-native" {
+		return task, fmt.Errorf("private native policy requires atespace fabriek-native")
 	}
 
 	slog.Info("reconciling task", "name", task.Metadata.Name, "atespace", atespace, "image", task.Spec.Image)
@@ -202,7 +208,7 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 		}
 	}
 
-	_, err := r.client.EnsureActor(ctx, atespace, actorName, templateAtespace, templateName, task.Spec.SupervisorProfile != "")
+	actor, err := r.client.EnsureActor(ctx, atespace, actorName, templateAtespace, templateName, task.Spec.SupervisorProfile != "")
 	if err != nil {
 		r.setNotReady(task, "ActorCreationFailed", err.Error(), now)
 		task.Status.Phase = "Failed"
@@ -222,6 +228,14 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 		r.setCondition(task, condReady, "False", "TaskSuspended", "Task is suspended", now)
 		slog.Info("task successfully suspended", "name", task.Metadata.Name, "actor", actorName)
 		return task, nil
+	}
+
+	if r.nativeTLSPolicy != nil && task.Spec.SupervisorProfile != "" {
+		if err := r.client.EnsureNativeTLSPolicy(ctx, actor, r.nativeTLSPolicy); err != nil {
+			r.setNotReady(task, "NativeEgressPolicyDenied", err.Error(), now)
+			task.Status.Phase = "Failed"
+			return task, fmt.Errorf("prepare native egress: %w", err)
+		}
 	}
 
 	// Resume the Actor to activate container execution
