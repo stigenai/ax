@@ -204,6 +204,27 @@ func resolveTaskLivenessInterval(flagValue time.Duration, envValue string) (time
 	return d, nil
 }
 
+// claimMinIdleDefault is the --stream-claim-min-idle / AX_STREAM_CLAIM_MIN_IDLE
+// value used when neither is set: how long a pending task-stream entry must
+// sit unacknowledged before another consumer may reclaim it with XAUTOCLAIM
+// (ax-bsl). It matches the redis store's own default.
+const claimMinIdleDefault = 5 * time.Minute
+
+// resolveClaimMinIdle reads the AX_STREAM_CLAIM_MIN_IDLE override for the
+// --stream-claim-min-idle flag. The caller passes the env value. An empty
+// envValue keeps flagValue. A negative duration turns reclaim off. The
+// controller must not start with a value it cannot parse as a duration.
+func resolveClaimMinIdle(flagValue time.Duration, envValue string) (time.Duration, error) {
+	if envValue == "" {
+		return flagValue, nil
+	}
+	d, err := time.ParseDuration(envValue)
+	if err != nil {
+		return 0, fmt.Errorf("invalid duration %q: %w", envValue, err)
+	}
+	return d, nil
+}
+
 // taskLivenessSweepEnabled reports whether main must start the LivenessChecker
 // sweep goroutine. The sweep needs a router address to probe through
 // (atenet-router, read from ATENET_ROUTER_ADDR) and an interval greater than
@@ -234,6 +255,7 @@ func main() {
 		taskLivenessThreshold   int
 		deleteSweepInterval     time.Duration
 		deleteSweepMinAge       time.Duration
+		claimMinIdle            time.Duration
 	)
 
 	flag.StringVar(&redisAddr, "redis-addr", "localhost:6379", "Redis server address (e.g. localhost:6379)")
@@ -256,6 +278,7 @@ func main() {
 	flag.IntVar(&taskLivenessThreshold, "task-liveness-threshold", controller.DefaultLivenessThreshold, "Consecutive stale probes that mark a Running task Failed")
 	flag.DurationVar(&deleteSweepInterval, "delete-sweep-interval", deleteSweepIntervalDefault, "How often DeletionSweeper checks for stuck Terminating tasks and stuck DELETING actors; 0 disables it (env AX_DELETE_SWEEP_INTERVAL)")
 	flag.DurationVar(&deleteSweepMinAge, "delete-sweep-min-age", deleteSweepMinAgeDefault, "How long a Terminating task or a DELETING actor must sit before DeletionSweeper counts and acts on it; must be greater than zero (env AX_DELETE_SWEEP_MIN_AGE)")
+	flag.DurationVar(&claimMinIdle, "stream-claim-min-idle", claimMinIdleDefault, "How long a pending task-stream entry must sit unacknowledged before another consumer may reclaim it with XAUTOCLAIM; negative disables reclaim (env AX_STREAM_CLAIM_MIN_IDLE)")
 	flag.Parse()
 
 	if envRedis := os.Getenv("REDIS_ADDR"); envRedis != "" {
@@ -310,6 +333,11 @@ func main() {
 		slog.Error("invalid --delete-sweep-min-age / AX_DELETE_SWEEP_MIN_AGE", "error", err)
 		os.Exit(1)
 	}
+	claimMinIdle, err = resolveClaimMinIdle(claimMinIdle, os.Getenv("AX_STREAM_CLAIM_MIN_IDLE"))
+	if err != nil {
+		slog.Error("invalid --stream-claim-min-idle / AX_STREAM_CLAIM_MIN_IDLE", "error", err)
+		os.Exit(1)
+	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
@@ -324,6 +352,7 @@ func main() {
 		"defaultTaskMemory", defaultTaskMemory,
 		"maxTaskMemory", maxTaskMemoryQuantity.String(),
 		"sandboxCheckInterval", sandboxCheckIntervalDuration,
+		"claimMinIdle", claimMinIdle,
 	)
 
 	subClient, err := substrate.NewClientWithOptions(substrate.ClientOptions{
@@ -359,7 +388,7 @@ func main() {
 	})
 	defer rClient.Close()
 
-	rStore := redis.NewStore(rClient, redis.Options{})
+	rStore := redis.NewStore(rClient, redis.Options{ClaimMinIdle: claimMinIdle})
 
 	routerAddr := os.Getenv("ATENET_ROUTER_ADDR")
 	livenessSweepEnabled := taskLivenessSweepEnabled(routerAddr, taskLivenessInterval)
