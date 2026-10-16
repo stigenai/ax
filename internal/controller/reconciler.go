@@ -37,6 +37,7 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"gopkg.in/yaml.v3"
+	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 // ErrWaitingForCapacity means Substrate has no free worker right now.
@@ -47,6 +48,11 @@ var ErrWaitingForCapacity = errors.New("waiting for substrate capacity")
 // waits. The worker's startup sweep looks for this value to find stranded
 // tasks.
 const reasonWaitingForCapacity = "WaitingForCapacity"
+
+// reasonMemoryExceedsCapacity is the task's Ready condition reason when its
+// effective memory limit exceeds TaskReconciler.MaxTaskMemory. This task can
+// never fit any worker, so Reconcile fails it instead of asking for a retry.
+const reasonMemoryExceedsCapacity = "MemoryExceedsCapacity"
 
 const (
 	geminiSecretName = "gemini-api-secret"
@@ -90,6 +96,14 @@ type TaskReconciler struct {
 	// writes this value into task.Spec. AX_TASK_YAML and the task's template
 	// digest stay the same with or without this default.
 	DefaultTaskMemory string
+
+	// MaxTaskMemory is the memory limit of the largest task any worker can
+	// hold. Reconcile checks it with v1alpha1.ValidateTaskMemoryCap, using
+	// DefaultTaskMemory as the fallback for a task with no limit of its own.
+	// A task above the cap fails with reason reasonMemoryExceedsCapacity.
+	// It does not wait for Substrate capacity it can never get.
+	// A zero value, the default, turns the check off.
+	MaxTaskMemory resource.Quantity
 }
 
 // NewTaskReconciler creates a new TaskReconciler.
@@ -144,6 +158,14 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 	slog.Info("reconciling task", "name", task.Metadata.Name, "atespace", atespace, "image", task.Spec.Image)
 
 	now := time.Now()
+
+	// A task above MaxTaskMemory can never fit any worker: fail it now,
+	// before any Substrate call, instead of letting it loop in Pending.
+	if err := v1alpha1.ValidateTaskMemoryCap(task, r.DefaultTaskMemory, r.MaxTaskMemory); err != nil {
+		r.setNotReady(task, reasonMemoryExceedsCapacity, err.Error(), now)
+		task.Status.Phase = "Failed"
+		return task, err
+	}
 
 	// 1. Ensure the Atespace exists in Substrate
 	if err := r.client.EnsureAtespace(ctx, atespace); err != nil {

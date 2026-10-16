@@ -17,6 +17,8 @@ package main
 import (
 	"testing"
 	"time"
+
+	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 func TestResolveDefaultTaskMemory(t *testing.T) {
@@ -47,6 +49,69 @@ func TestResolveDefaultTaskMemory(t *testing.T) {
 			}
 			if got != tt.want {
 				t.Fatalf("resolveDefaultTaskMemory(%q) = %q, want %q", tt.value, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestResolveMaxTaskMemory(t *testing.T) {
+	cases := []struct {
+		name    string
+		value   string
+		want    string
+		wantErr bool
+	}{
+		{name: "empty disables the cap", value: "", want: "0"},
+		{name: "0 disables the cap", value: "0", want: "0"},
+		{name: "a quantity parses and passes through", value: "16Gi", want: "16Gi"},
+		{name: "a value that does not parse as a quantity is an error", value: "not-a-quantity", wantErr: true},
+		{name: "a negative quantity is an error", value: "-1Gi", wantErr: true},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := resolveMaxTaskMemory(tt.value)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("resolveMaxTaskMemory(%q) = %v, nil; want an error", tt.value, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolveMaxTaskMemory(%q) returned an unexpected error: %v", tt.value, err)
+			}
+			want := resource.MustParse(tt.want)
+			if got.Cmp(want) != 0 {
+				t.Fatalf("resolveMaxTaskMemory(%q) = %v, want %v", tt.value, got.String(), want.String())
+			}
+		})
+	}
+}
+
+func TestCheckDefaultWithinMax(t *testing.T) {
+	cases := []struct {
+		name              string
+		defaultTaskMemory string
+		max               string
+		wantErr           bool
+	}{
+		{name: "no default is always fine", defaultTaskMemory: "", max: "16Gi"},
+		{name: "no max is always fine", defaultTaskMemory: "32Gi", max: ""},
+		{name: "default equal to max passes", defaultTaskMemory: "16Gi", max: "16Gi"},
+		{name: "default under max passes", defaultTaskMemory: "4Gi", max: "16Gi"},
+		{name: "default over max is an error", defaultTaskMemory: "32Gi", max: "16Gi", wantErr: true},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			var max resource.Quantity
+			if tt.max != "" {
+				max = resource.MustParse(tt.max)
+			}
+			err := checkDefaultWithinMax(tt.defaultTaskMemory, max)
+			if tt.wantErr && err == nil {
+				t.Fatalf("checkDefaultWithinMax(%q, %v) = nil; want an error", tt.defaultTaskMemory, max)
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("checkDefaultWithinMax(%q, %v) returned an unexpected error: %v", tt.defaultTaskMemory, max, err)
 			}
 		})
 	}
