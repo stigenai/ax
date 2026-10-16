@@ -26,6 +26,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
+	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 // Server provides the gRPC API for AX.
@@ -33,6 +34,13 @@ type Server struct {
 	v1alpha1.UnimplementedAXServer
 	store      store.Store
 	grpcServer *grpc.Server
+
+	// MaxTaskMemory is the memory limit of the largest task any worker can
+	// hold. UpdateTask calls v1alpha1.ValidateTaskMemoryCap with this value
+	// and an empty default, so it checks only a task's own explicit limit:
+	// the server does not know ax-controller's AX_DEFAULT_TASK_MEMORY.
+	// A zero value, the default, turns the check off.
+	MaxTaskMemory resource.Quantity
 }
 
 // NewServer creates a new AX API server.
@@ -114,6 +122,9 @@ func (s *Server) UpdateTask(ctx context.Context, req *v1alpha1.UpdateTaskRequest
 	}
 	task := req.Task
 	if err := v1alpha1.ValidateTask(task); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	if err := v1alpha1.ValidateTaskMemoryCap(task, "", s.MaxTaskMemory); err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 	task.Metadata = defaultMetadata(task.Metadata, func(atespace, name string) *v1alpha1.ObjectMeta {
