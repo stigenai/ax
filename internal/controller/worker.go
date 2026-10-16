@@ -180,9 +180,13 @@ func (w *Worker) processEvent(ctx context.Context, ev store.TaskEvent) error {
 				return nil
 			}
 			if ev.Deletion.ActorUID == "" || ev.Deletion.CreationTimestamp == "" {
+				w.clearDeleteBackoff(ev.Atespace, ev.Name)
 				return store.ErrConflict
 			}
-			// Missing protected task state cannot authorize cleanup or prove it.
+			// Missing protected task state cannot authorize cleanup or
+			// prove it. The record is already gone either way, so any
+			// pending retry schedule for it is moot.
+			w.clearDeleteBackoff(ev.Atespace, ev.Name)
 			return nil
 		}
 		if err != nil {
@@ -199,9 +203,11 @@ func (w *Worker) processEvent(ctx context.Context, ev store.TaskEvent) error {
 		// targets a task recreated under the same name.
 		if task.GetStatus().GetPhase() != v1alpha1.PhaseTerminating {
 			slog.Info("skipping stale delete: task left Terminating", "atespace", ev.Atespace, "name", ev.Name, "retry", ev.Retry)
+			w.clearDeleteBackoff(ev.Atespace, ev.Name)
 			return nil
 		}
 		if err := ev.Deletion.Check(task); err != nil {
+			w.clearIdleDeleteAttempts(ev.Atespace, ev.Name)
 			return err
 		}
 		if err := w.reconciler.ReconcileDelete(ctx, ev.Atespace, ev.Name, ev.Deletion.ActorUID); err != nil {
@@ -465,6 +471,21 @@ func (w *Worker) clearDeleteBackoff(atespace, name string) {
 	w.deleteMu.Lock()
 	delete(w.deletePending, atespace+"/"+name)
 	delete(w.deleteAttempts, atespace+"/"+name)
+	w.deleteMu.Unlock()
+}
+
+// clearIdleDeleteAttempts resets a task's delete-attempt count, but only
+// when no retry chain is pending for it. ev.Deletion.Check can reject a
+// stale precondition for the task's current incarnation. A live chain for
+// that incarnation must keep its own schedule (the one-chain rule of
+// ax-706.6), so this never touches deletePending: clearing a live chain's
+// mark here can let a second chain start for the same incarnation.
+func (w *Worker) clearIdleDeleteAttempts(atespace, name string) {
+	key := atespace + "/" + name
+	w.deleteMu.Lock()
+	if _, pending := w.deletePending[key]; !pending {
+		delete(w.deleteAttempts, key)
+	}
 	w.deleteMu.Unlock()
 }
 
