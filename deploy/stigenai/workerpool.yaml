@@ -87,10 +87,59 @@ spec:
     # ax-controller. It must equal this limits.memory value.
     # A task that asks for more gets a clear Failed status.
     # It does not wait forever for a worker that can never fit it.
+    #
+    # ax-1iw: The cpu request of 500m and the limit of 4 throttled the workers.
+    # The workers ran 2 tasks at once.
+    #
+    # The script deploy/stigenai/measure-workerpool-cpu.sh reads each pod's CFS
+    # throttle ratio from cadvisor.
+    # The throttle ratio is the share of CPU scheduling periods that the kernel
+    # throttled.
+    # It counts since each pod's last start.
+    #
+    # On 2026-10-16, the busiest worker ran 2 booked tasks.
+    # 5 of 6 pods were at or above 5%: 3.1-21.4%.
+    # kubectl top also read one pod at 3324-3998m of its 4000m limit.
+    # The 6 samples were 15s apart.
+    # This shows sustained near-limit use, not a one-off spike.
+    #
+    # The density cap does not change here. The cap is 2 tasks/worker, from
+    # AX_DEFAULT_TASK_MEMORY on a 16Gi worker.
+    # Only the cpu request and limit change.
+    #
+    # The limit of 6 gives 3 cores per task at 2 tasks.
+    # The ax-ci8 measurement is about 2042m per task.
+    # The limit also leaves room for a burst.
+    #
+    # The request of 2 gives 1 core per booked task.
+    # This is closer to the observed sustained use (357-3998m) than the old
+    # 500m request.
+    # The old request was 6-8x under that use.
+    #
+    # Pool sums: requests go from 3 cores (6 x 500m) to 12 cores (6 x 2).
+    # Limits go from 24 cores (6 x 4) to 36 cores (6 x 6).
+    #
+    # This change adds to the cluster-wide cpu overcommit. See ax-052.
+    # This change does not close it.
+    #
+    # Each node has 2 workers. Requests rise by 3 cores per node.
+    # Limits rise by 4 cores per node.
+    #
+    # gtr-150 is the busiest node. Its requests go from 15600m to 18600m.
+    # The requested 18600m is 58% of its 32 cores.
+    #
+    # See ax-1iw for the throttle data, the rejected options and the rollout note.
+    # The rejected options are:
+    #   - no cpu limit
+    #   - request-only
+    #   - more replicas
+    #   - spread placement, filed as ax-ok6
+    #
+    # The rollout note: any resources change restarts every worker.
     resources:
       limits:
-        cpu: "4"
+        cpu: "6"
         memory: 16Gi
       requests:
-        cpu: 500m
+        cpu: "2"
         memory: 8Gi
