@@ -92,6 +92,10 @@ type Worker struct {
 	// deleteJitter overrides defaultDeleteJitter for tests. A nil value uses
 	// defaultDeleteJitter.
 	deleteJitter func(time.Duration) time.Duration
+	// deleteAfter overrides how a delete-retry goroutine waits out its
+	// backoff. A test can use it to control exactly when a chain wakes,
+	// instead of a real timer. A nil value uses time.After.
+	deleteAfter func(time.Duration) <-chan time.Time
 }
 
 // NewWorker creates a worker that joins group as consumer. An empty group uses the
@@ -410,12 +414,18 @@ func (w *Worker) scheduleDeleteRetry(ctx context.Context, atespace, name string,
 		w.deleteMu.Unlock()
 	}
 
+	afterDelay := w.deleteAfter
+	if afterDelay == nil {
+		afterDelay = func(d time.Duration) <-chan time.Time { return time.After(d) }
+	}
+	wake := afterDelay(delay)
+
 	go func() {
 		select {
 		case <-ctx.Done():
 			clearOwnMark()
 			return
-		case <-time.After(delay):
+		case <-wake:
 		}
 		// Clear the mark before republishing, not in a defer after
 		// (ax-706.10). A deferred clear lets a fast second failure see the
