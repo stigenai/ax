@@ -40,8 +40,10 @@ const (
 	requeueBackoffMax  = 2 * time.Minute
 	// deleteBackoffBase and deleteBackoffMax bound the delay before the
 	// worker retries a task delete that failed to reconcile. The delay
-	// doubles on each consecutive failure for that task. There is no limit
-	// on the number of attempts.
+	// doubles on each consecutive failure for that task, up to
+	// deleteBackoffMax. The worker's jitter hook then picks the actual
+	// sleep from [delay/2, delay], so it never exceeds deleteBackoffMax.
+	// There is no limit on the number of attempts.
 	deleteBackoffBase = 15 * time.Second
 	deleteBackoffMax  = 5 * time.Minute
 	// strandedTasksPageSize bounds one ListTasks call in the startup sweep.
