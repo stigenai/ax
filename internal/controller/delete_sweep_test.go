@@ -214,6 +214,87 @@ func TestDeleteSweepRequeuesAfterDroppedWorkerRetry(t *testing.T) {
 	}
 }
 
+// TestDeleteSweepDoesNotMultiplyRetryChainsOnRepeatedFailure covers review
+// finding ax-706.6: a Substrate failure that outlasts several sweep ticks
+// must not grow one new scheduleDeleteRetry chain per tick. Each sweep
+// republish that lands while the worker's own chain still sleeps on its
+// backoff must join that chain, not start another one of its own.
+func TestDeleteSweepDoesNotMultiplyRetryChainsOnRepeatedFailure(t *testing.T) {
+	control := &deletionControlServer{
+		deletions:      make(chan *ateapipb.DeleteActorRequest, 16),
+		templates:      make(chan *ateapipb.ListActorTemplatesRequest, 16),
+		remainingFails: 1000, // DeleteActor never succeeds during this test.
+	}
+	client := newDeletionTestClient(t, control)
+
+	ctx := context.Background()
+	s := memory.NewStore()
+	created := time.Now().UTC()
+	task := &v1alpha1.Task{Metadata: &v1alpha1.ObjectMeta{Name: "stuck", Atespace: "default", CreationTimestamp: timestamppb.New(created)}}
+	if err := s.SaveTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+
+	sub, err := s.Subscribe(ctx, "test-group", "test-consumer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	drainN(t, sub, 1) // SaveTask's own reconcile event.
+
+	deletion := store.TaskDeletePreconditions{ActorUID: "actor-1", CreationTimestamp: created.Format(time.RFC3339Nano)}
+	if err := s.MarkTaskDeleting(ctx, "default", "stuck", deletion); err != nil {
+		t.Fatal(err)
+	}
+
+	worker := NewWorker(s, NewTaskReconciler(client, "default-template", "ax-system"), "", "")
+	// A backoff far longer than this test's own run time, so the worker's
+	// first chain is still sleeping (pending) when later sweep ticks land.
+	worker.DeleteBackoffBase = time.Minute
+	worker.DeleteBackoffMax = time.Minute
+
+	readCtx, readCancel := context.WithTimeout(ctx, 2*time.Second)
+	ev, err := sub.Next(readCtx)
+	readCancel()
+	if err != nil {
+		t.Fatalf("no initial delete event: %v", err)
+	}
+	if err := worker.processEvent(context.Background(), ev); err != nil {
+		t.Fatalf("processEvent on the first delivery: %v", err)
+	}
+
+	now := time.Now()
+	sweeper := &DeletionSweeper{Store: s, MinAge: 15 * time.Minute, Now: func() time.Time { return now }}
+	sweeper.SweepOnce(ctx) // seeds tracking for "default/stuck" at age 0.
+
+	// 3 more sweep ticks, each past MinAge, each landing while the first
+	// chain still sleeps on its 1-minute backoff.
+	for i := 0; i < 3; i++ {
+		now = now.Add(16 * time.Minute)
+		sweeper.SweepOnce(ctx)
+
+		tickCtx, tickCancel := context.WithTimeout(ctx, 2*time.Second)
+		tickEv, err := sub.Next(tickCtx)
+		tickCancel()
+		if err != nil {
+			t.Fatalf("tick %d: sweep did not requeue the stuck delete: %v", i, err)
+		}
+		if err := worker.processEvent(context.Background(), tickEv); err != nil {
+			t.Fatalf("tick %d: processEvent: %v", i, err)
+		}
+	}
+
+	worker.deleteMu.Lock()
+	chains := worker.deleteAttempts["default/stuck"]
+	pending := worker.deletePending["default/stuck"]
+	worker.deleteMu.Unlock()
+	if chains != 1 {
+		t.Fatalf("want 1 retry chain total despite 3 extra sweep-driven failures, got %d (each extra failure started its own chain)", chains)
+	}
+	if !pending {
+		t.Fatal("want the one chain still marked pending (its 1-minute backoff has not fired)")
+	}
+}
+
 // TestDeleteSweepYoungTaskNotCountedOrRequeued covers AC2's first half: a
 // Terminating task younger than MinAge gets no requeue at all.
 func TestDeleteSweepYoungTaskNotCountedOrRequeued(t *testing.T) {

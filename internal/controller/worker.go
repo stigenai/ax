@@ -71,6 +71,11 @@ type Worker struct {
 
 	deleteMu       sync.Mutex
 	deleteAttempts map[string]int
+	// deletePending marks a key while its scheduleDeleteRetry goroutine still
+	// sleeps on its backoff. A second failure for that key must not start a
+	// second chain. See ax-706.6: a sweep requeue can land on top of the
+	// worker's own chain. The entry clears when the goroutine fires.
+	deletePending map[string]bool
 }
 
 // NewWorker creates a worker that joins group as consumer. An empty group uses the
@@ -300,10 +305,18 @@ func (w *Worker) clearRequeueBackoff(atespace, name string) {
 }
 
 // scheduleDeleteRetry republishes a failed task deletion after a backoff.
-// The backoff doubles on each consecutive failure for the same task, up to
-// w.DeleteBackoffMax. It never gives up. A stuck actor that holds its worker
-// assignment forever costs more than one more retry. The retry runs in its
-// own goroutine, so it never blocks the event loop.
+// The backoff doubles on each consecutive failure for the same task. It
+// stops doubling at w.DeleteBackoffMax. It never gives up: a stuck actor
+// that holds its worker assignment forever costs more than one more retry.
+// The retry runs in its own goroutine. It never blocks the event loop.
+//
+// At most one retry stays pending per atespace/name (ax-706.6). Assume a
+// goroutine still sleeps on its backoff for a key. A second call for that
+// key only logs and returns. It starts no second goroutine. It does not
+// count as a new attempt. Without this check, a periodic sweep can
+// republish the same stuck delete on every tick. Each tick would then start
+// its own chain. Each chain calls Substrate's DeleteActor on its own
+// schedule, forever, even after the sweep itself stops ticking.
 func (w *Worker) scheduleDeleteRetry(ctx context.Context, atespace, name string, deletion store.TaskDeletePreconditions, cause error) {
 	key := atespace + "/" + name
 
@@ -316,6 +329,16 @@ func (w *Worker) scheduleDeleteRetry(ctx context.Context, atespace, name string,
 	}
 
 	w.deleteMu.Lock()
+	if w.deletePending == nil {
+		w.deletePending = make(map[string]bool)
+	}
+	if w.deletePending[key] {
+		w.deleteMu.Unlock()
+		slog.Info("task delete failed, a retry chain is already pending, not starting a second one",
+			"atespace", atespace, "name", name, "error", cause)
+		return
+	}
+	w.deletePending[key] = true
 	if w.deleteAttempts == nil {
 		w.deleteAttempts = make(map[string]int)
 	}
@@ -335,6 +358,11 @@ func (w *Worker) scheduleDeleteRetry(ctx context.Context, atespace, name string,
 		"attempt", attempt+1, "next_retry", backoff, "error", cause)
 
 	go func() {
+		defer func() {
+			w.deleteMu.Lock()
+			delete(w.deletePending, key)
+			w.deleteMu.Unlock()
+		}()
 		select {
 		case <-ctx.Done():
 			return
@@ -348,9 +376,11 @@ func (w *Worker) scheduleDeleteRetry(ctx context.Context, atespace, name string,
 
 // clearDeleteBackoff resets a task's delete-retry schedule once its deletion
 // reconciles without error, so a later deletion of the same name starts its
-// own schedule at DeleteBackoffBase.
+// own schedule at DeleteBackoffBase. It also clears any pending-chain mark,
+// so a later failure for the same name can start a fresh chain right away.
 func (w *Worker) clearDeleteBackoff(atespace, name string) {
 	w.deleteMu.Lock()
+	delete(w.deletePending, atespace+"/"+name)
 	delete(w.deleteAttempts, atespace+"/"+name)
 	w.deleteMu.Unlock()
 }
