@@ -886,6 +886,67 @@ func TestTaskReconciler_NoMaxLeavesCapacityWaitUnchanged(t *testing.T) {
 	}
 }
 
+// Reconcile fails a task at once when its cpu limit exceeds MaxTaskCPU,
+// before any Substrate call (ax-6cj).
+func TestTaskReconciler_CPUAboveMaxFailsTask(t *testing.T) {
+	mockSrv := &mockControlServer{}
+	r := newTestReconciler(t, mockSrv)
+	r.MaxTaskCPU = resource.MustParse("6")
+
+	task := envTask("x")
+	task.Spec.Resources = &v1alpha1.ResourceReqs{Limits: &v1alpha1.ResourceList{Cpu: "32"}}
+	reconciled, err := r.Reconcile(context.Background(), task)
+	if err == nil || errors.Is(err, controller.ErrWaitingForCapacity) {
+		t.Fatalf("expected a plain cpu-cap failure, got %v", err)
+	}
+	if reconciled.Status.Phase != "Failed" {
+		t.Errorf("expected phase Failed, got %q", reconciled.Status.Phase)
+	}
+	var reason, message string
+	for _, c := range reconciled.Status.Conditions {
+		if c.Type == "Ready" {
+			reason, message = c.Reason, c.Message
+		}
+	}
+	if reason != "CPUExceedsCapacity" || !strings.Contains(message, "32") || !strings.Contains(message, "6") {
+		t.Errorf("expected CPUExceedsCapacity naming both sizes, got %q: %q", reason, message)
+	}
+	if len(mockSrv.createdAtespaces) != 0 || len(mockSrv.createdActors) != 0 || mockSrv.resumeAttempts.Load() != 0 {
+		t.Errorf("expected zero Substrate calls, got atespaces=%v actors=%v resumeAttempts=%d", mockSrv.createdAtespaces, mockSrv.createdActors, mockSrv.resumeAttempts.Load())
+	}
+}
+
+// A cpu limit equal to MaxTaskCPU passes Reconcile through to Substrate.
+func TestTaskReconciler_CPUAtMaxPassesToResume(t *testing.T) {
+	mockSrv := &mockControlServer{}
+	r := newTestReconciler(t, mockSrv)
+	r.MaxTaskCPU = resource.MustParse("6")
+
+	task := envTask("x")
+	task.Spec.Resources = &v1alpha1.ResourceReqs{Limits: &v1alpha1.ResourceList{Cpu: "6"}}
+	if _, err := r.Reconcile(context.Background(), task); err != nil {
+		t.Fatalf("expected a task at the cpu cap to reach Substrate, got %v", err)
+	}
+	if mockSrv.resumeAttempts.Load() == 0 {
+		t.Errorf("expected a ResumeActor attempt, got none")
+	}
+}
+
+// With no cpu cap set, Reconcile keeps the old WaitingForCapacity path.
+func TestTaskReconciler_NoMaxCPULeavesCapacityWaitUnchanged(t *testing.T) {
+	mockSrv := &mockControlServer{resumeErr: status.Error(codes.ResourceExhausted, "no free workers available")}
+	r := newTestReconciler(t, mockSrv)
+	task := envTask("x")
+	task.Spec.Resources = &v1alpha1.ResourceReqs{Limits: &v1alpha1.ResourceList{Cpu: "32"}}
+	reconciled, err := r.Reconcile(context.Background(), task)
+	if !errors.Is(err, controller.ErrWaitingForCapacity) {
+		t.Fatalf("expected ErrWaitingForCapacity, got %v", err)
+	}
+	if reconciled.Status.Phase != "Pending" {
+		t.Errorf("expected phase Pending, got %q", reconciled.Status.Phase)
+	}
+}
+
 func supervisorTask() *v1alpha1.Task {
 	return &v1alpha1.Task{Metadata: &v1alpha1.ObjectMeta{Name: "fabriek-task", Atespace: "fabriek"}, Spec: &v1alpha1.TaskSpec{
 		SupervisorProfile: v1alpha1.FabriekSupervisorProfile,

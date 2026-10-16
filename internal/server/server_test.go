@@ -437,3 +437,49 @@ func TestUpdateTask_RejectsMemoryAboveMax(t *testing.T) {
 		t.Fatalf("expected an unbounded server to accept any memory limit, got %v", err)
 	}
 }
+
+func TestUpdateTask_RejectsCPUAboveMax(t *testing.T) {
+	ctx := context.Background()
+	memStore := memory.NewStore()
+	srv := server.NewServer(memStore)
+	srv.MaxTaskCPU = resource.MustParse("6")
+
+	// UpdateTask rejects a task that asks for more cpu than any worker can
+	// hold, and the store never gets a record of it.
+	_, err := srv.UpdateTask(ctx, &v1alpha1.UpdateTaskRequest{Task: &v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{Name: "too-big"},
+		Spec:     &v1alpha1.TaskSpec{Resources: &v1alpha1.ResourceReqs{Limits: &v1alpha1.ResourceList{Cpu: "32"}}},
+	}})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("expected InvalidArgument for a task over the cpu cap, got %v", err)
+	}
+	if !strings.Contains(err.Error(), `spec.resources.limits.cpu: "32"`) || !strings.Contains(err.Error(), "6") {
+		t.Fatalf("error does not name the limit and the cap: %v", err)
+	}
+	if _, serr := memStore.GetTask(ctx, "default", "too-big"); serr == nil {
+		t.Fatalf("rejected task was saved anyway")
+	}
+
+	// A task at or under the cap still saves.
+	if _, err := srv.UpdateTask(ctx, &v1alpha1.UpdateTaskRequest{Task: &v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{Name: "at-cap"},
+		Spec:     &v1alpha1.TaskSpec{Resources: &v1alpha1.ResourceReqs{Limits: &v1alpha1.ResourceList{Cpu: "6"}}},
+	}}); err != nil {
+		t.Fatalf("expected a task at the cap to be accepted, got %v", err)
+	}
+	if _, err := srv.UpdateTask(ctx, &v1alpha1.UpdateTaskRequest{Task: &v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{Name: "under-cap"},
+		Spec:     &v1alpha1.TaskSpec{Resources: &v1alpha1.ResourceReqs{Limits: &v1alpha1.ResourceList{Cpu: "500m"}}},
+	}}); err != nil {
+		t.Fatalf("expected a task under the cap to be accepted, got %v", err)
+	}
+
+	// With no cap configured, UpdateTask keeps the old behavior: it rejects nothing.
+	unbounded := server.NewServer(memory.NewStore())
+	if _, err := unbounded.UpdateTask(ctx, &v1alpha1.UpdateTaskRequest{Task: &v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{Name: "no-cap"},
+		Spec:     &v1alpha1.TaskSpec{Resources: &v1alpha1.ResourceReqs{Limits: &v1alpha1.ResourceList{Cpu: "32"}}},
+	}}); err != nil {
+		t.Fatalf("expected an unbounded server to accept any cpu limit, got %v", err)
+	}
+}

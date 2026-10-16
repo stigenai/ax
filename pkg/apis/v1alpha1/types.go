@@ -346,6 +346,35 @@ func ValidateTaskMemoryCap(t *Task, defaultMemory string, max resource.Quantity)
 	return nil
 }
 
+// ValidateTaskCPUCap rejects a task if its cpu limit is more than max.
+// The max value is the size of the largest task that a worker can hold.
+// If max is zero, the check does not run. A deployment with no cap keeps the
+// old behavior.
+//
+// The function reads spec.resources.limits.cpu. AX_DEFAULT_TASK_CPU does not
+// exist. A task with no cpu limit passes. This is also true for a supervisor task.
+//
+// A limit equal to max passes. ValidateTask rejects a limit that does not
+// parse before this function runs. If parsing fails in this function, the
+// function treats the task as having no limit.
+func ValidateTaskCPUCap(t *Task, max resource.Quantity) error {
+	if max.IsZero() {
+		return nil
+	}
+	cpu := t.GetSpec().GetResources().GetLimits().GetCpu()
+	if cpu == "" {
+		return nil
+	}
+	q, err := resource.ParseQuantity(cpu)
+	if err != nil {
+		return nil
+	}
+	if q.Cmp(max) > 0 {
+		return fmt.Errorf("spec.resources.limits.cpu: %q exceeds the largest task a worker can hold (%s)", cpu, max.String())
+	}
+	return nil
+}
+
 func validateQuantity(field, value string) error {
 	if value == "" {
 		return nil

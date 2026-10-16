@@ -53,6 +53,10 @@ const reasonWaitingForCapacity = "WaitingForCapacity"
 // never fit any worker, so Reconcile fails it instead of asking for a retry.
 const reasonMemoryExceedsCapacity = "MemoryExceedsCapacity"
 
+// reasonCPUExceedsCapacity is the task's Ready condition reason when its
+// cpu limit exceeds TaskReconciler.MaxTaskCPU (see reasonMemoryExceedsCapacity).
+const reasonCPUExceedsCapacity = "CPUExceedsCapacity"
+
 const (
 	geminiSecretName = "gemini-api-secret"
 	geminiSecretKey  = "GEMINI_API_KEY"
@@ -103,6 +107,12 @@ type TaskReconciler struct {
 	// It does not wait for Substrate capacity it can never get.
 	// A zero value, the default, turns the check off.
 	MaxTaskMemory resource.Quantity
+
+	// MaxTaskCPU is the cpu limit of the largest task any worker can hold
+	// (see MaxTaskMemory). No AX_DEFAULT_TASK_CPU exists, so this checks
+	// only a task's own limit. A task above the cap fails with reason
+	// reasonCPUExceedsCapacity.
+	MaxTaskCPU resource.Quantity
 }
 
 // NewTaskReconciler creates a new TaskReconciler.
@@ -162,6 +172,14 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 	// before any Substrate call, instead of letting it loop in Pending.
 	if err := v1alpha1.ValidateTaskMemoryCap(task, r.DefaultTaskMemory, r.MaxTaskMemory); err != nil {
 		r.setNotReady(task, reasonMemoryExceedsCapacity, err.Error(), now)
+		task.Status.Phase = "Failed"
+		return task, err
+	}
+
+	// A task above MaxTaskCPU can never fit any worker: fail it now, before
+	// any Substrate call, instead of letting it loop in Pending.
+	if err := v1alpha1.ValidateTaskCPUCap(task, r.MaxTaskCPU); err != nil {
+		r.setNotReady(task, reasonCPUExceedsCapacity, err.Error(), now)
 		task.Status.Phase = "Failed"
 		return task, err
 	}

@@ -41,6 +41,11 @@ type Server struct {
 	// the server does not know ax-controller's AX_DEFAULT_TASK_MEMORY.
 	// A zero value, the default, turns the check off.
 	MaxTaskMemory resource.Quantity
+
+	// MaxTaskCPU is the cpu limit of the largest task any worker can hold.
+	// UpdateTask checks a task's cpu limit against this value. A zero
+	// value, the default, turns the check off.
+	MaxTaskCPU resource.Quantity
 }
 
 // NewServer creates a new AX API server.
@@ -125,6 +130,9 @@ func (s *Server) UpdateTask(ctx context.Context, req *v1alpha1.UpdateTaskRequest
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 	if err := v1alpha1.ValidateTaskMemoryCap(task, "", s.MaxTaskMemory); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	if err := v1alpha1.ValidateTaskCPUCap(task, s.MaxTaskCPU); err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 	task.Metadata = defaultMetadata(task.Metadata, func(atespace, name string) *v1alpha1.ObjectMeta {

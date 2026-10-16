@@ -402,3 +402,89 @@ func TestWorkerFailsTaskAboveMaxMemory(t *testing.T) {
 		t.Errorf("expected the task to stay Failed, got phase %q (err %v)", stillFailed.GetStatus().GetPhase(), err)
 	}
 }
+
+// A task can be stuck waiting for capacity with a cpu limit above
+// MaxTaskCPU. The worker must fail it on the next reconcile (ax-6cj).
+func TestWorkerFailsTaskAboveMaxCPU(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer lis.Close()
+
+	mockSrv := &mockControlServer{}
+	grpcServer := grpc.NewServer()
+	ateapipb.RegisterControlServer(grpcServer, mockSrv)
+	go grpcServer.Serve(lis)
+	defer grpcServer.Stop()
+
+	subClient, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("failed to create substrate client: %v", err)
+	}
+	defer subClient.Close()
+
+	reconciler := controller.NewTaskReconciler(subClient, "default-template", "ax-system")
+	reconciler.SecretResolver = noSecrets
+	reconciler.WorkspaceReadyTimeout = 200 * time.Millisecond
+	reconciler.MaxTaskCPU = resource.MustParse("6")
+
+	memStore := memory.NewStore()
+	task := &v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{Name: "too-many-cpus-task", Atespace: "default"},
+		Spec: &v1alpha1.TaskSpec{
+			Image:     "ghcr.io/test/img",
+			Resources: &v1alpha1.ResourceReqs{Limits: &v1alpha1.ResourceList{Cpu: "32"}},
+		},
+		Status: &v1alpha1.TaskStatus{
+			Phase:      "Pending",
+			Conditions: []*v1alpha1.Condition{{Type: "Ready", Status: "False", Reason: "WaitingForCapacity"}},
+		},
+	}
+	if err := memStore.SaveTask(ctx, task); err != nil {
+		t.Fatalf("failed to save task: %v", err)
+	}
+
+	worker := controller.NewWorker(memStore, reconciler, "test-group", "worker-1")
+	worker.BackoffBase = 20 * time.Millisecond
+	worker.BackoffMax = 100 * time.Millisecond
+	go func() { _ = worker.Run(ctx) }()
+
+	deadline := time.Now().Add(3 * time.Second)
+	var failed *v1alpha1.Task
+	for time.Now().Before(deadline) {
+		t2, err := memStore.GetTask(ctx, "default", "too-many-cpus-task")
+		if err == nil && t2.Status.Phase == "Failed" {
+			failed = t2
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if failed == nil {
+		t.Fatalf("task above the cpu cap never reached phase Failed")
+	}
+	var reason string
+	for _, c := range failed.Status.Conditions {
+		if c.Type == "Ready" {
+			reason = c.Reason
+		}
+	}
+	if reason != "CPUExceedsCapacity" {
+		t.Errorf("expected reason CPUExceedsCapacity, got %q", reason)
+	}
+
+	// The early cpu-cap check in Reconcile runs before any Substrate call,
+	// so ResumeActor is never invoked, and nothing schedules a requeue: the
+	// task stays Failed with no second attempt.
+	time.Sleep(200 * time.Millisecond)
+	if n := mockSrv.resumeAttempts.Load(); n != 0 {
+		t.Errorf("expected zero resume attempts, got %d", n)
+	}
+	stillFailed, err := memStore.GetTask(ctx, "default", "too-many-cpus-task")
+	if err != nil || stillFailed.Status.Phase != "Failed" {
+		t.Errorf("expected the task to stay Failed, got phase %q (err %v)", stillFailed.GetStatus().GetPhase(), err)
+	}
+}

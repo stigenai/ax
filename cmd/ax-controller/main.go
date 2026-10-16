@@ -54,14 +54,16 @@ const defaultTaskMemoryDefault = "8Gi"
 // TaskMonitor's actor-and-runner sweep).
 const sandboxCheckIntervalDefault = "30s"
 
-// resolveMaxTaskMemory parses the --max-task-memory / AX_MAX_TASK_MEMORY value.
-// The result is the cap Reconcile enforces.
+// resolveMaxQuantity parses a flag or env value for a resource cap. Two
+// callers use it: --max-task-memory / AX_MAX_TASK_MEMORY and
+// --max-task-cpu / AX_MAX_TASK_CPU. The result is the cap Reconcile
+// enforces for that resource.
 //
 // Empty or "0" disables the check and returns a zero Quantity.
 //
-// Any other value must parse as a Kubernetes resource.Quantity greater than zero.
+// Any other value must parse as a Kubernetes resource.Quantity above zero.
 // If it does not, the controller must not start.
-func resolveMaxTaskMemory(value string) (resource.Quantity, error) {
+func resolveMaxQuantity(value string) (resource.Quantity, error) {
 	if value == "0" || value == "" {
 		return resource.Quantity{}, nil
 	}
@@ -256,6 +258,7 @@ func main() {
 		defaultTemplateAtespace string
 		defaultTaskMemory       string
 		maxTaskMemory           string
+		maxTaskCPU              string
 		sandboxCheckInterval    string
 		redisAddr               string
 		redisPassword           string
@@ -283,6 +286,7 @@ func main() {
 	flag.StringVar(&defaultTemplateAtespace, "template-atespace", "ax-system", "Default Substrate ActorTemplate atespace")
 	flag.StringVar(&defaultTaskMemory, "default-task-memory", defaultTaskMemoryDefault, "Memory limit booked for a task that names none (Substrate quantity, e.g. 8Gi); 0 disables")
 	flag.StringVar(&maxTaskMemory, "max-task-memory", "", "Largest memory limit any worker can hold (Kubernetes quantity, e.g. 16Gi); Reconcile fails a task above it instead of waiting for capacity. Empty or 0 disables the check")
+	flag.StringVar(&maxTaskCPU, "max-task-cpu", "", "Largest cpu limit any worker can hold (Kubernetes quantity, e.g. 6); Reconcile fails a task above it instead of waiting for capacity. Empty or 0 disables the check")
 	flag.StringVar(&sandboxCheckInterval, "sandbox-check-interval", sandboxCheckIntervalDefault, "How often TaskMonitor checks each Running task's actor and runner (Go duration, e.g. 30s); 0 disables it (env AX_SANDBOX_CHECK_INTERVAL)")
 	flag.StringVar(&nativeTLSDestination, "native-tls-destination", "", "Private protected-actor TLS destination; install or verify exact policy before resume")
 	flag.DurationVar(&taskLivenessInterval, "task-liveness-interval", time.Minute, "How often to probe each Running task's actor through atenet-router; 0 turns off the sweep (env AX_TASK_LIVENESS_INTERVAL)")
@@ -315,13 +319,21 @@ func main() {
 	if envMax := os.Getenv("AX_MAX_TASK_MEMORY"); envMax != "" {
 		maxTaskMemory = envMax
 	}
-	maxTaskMemoryQuantity, err := resolveMaxTaskMemory(maxTaskMemory)
+	maxTaskMemoryQuantity, err := resolveMaxQuantity(maxTaskMemory)
 	if err != nil {
 		slog.Error("invalid --max-task-memory / AX_MAX_TASK_MEMORY", "error", err)
 		os.Exit(1)
 	}
 	if err := checkDefaultWithinMax(defaultTaskMemory, maxTaskMemoryQuantity); err != nil {
 		slog.Error("default task memory cannot exceed max task memory", "error", err)
+		os.Exit(1)
+	}
+	if envMaxCPU := os.Getenv("AX_MAX_TASK_CPU"); envMaxCPU != "" {
+		maxTaskCPU = envMaxCPU
+	}
+	maxTaskCPUQuantity, err := resolveMaxQuantity(maxTaskCPU)
+	if err != nil {
+		slog.Error("invalid --max-task-cpu / AX_MAX_TASK_CPU", "error", err)
 		os.Exit(1)
 	}
 	sandboxCheckIntervalDuration, err := resolveSandboxCheckInterval(sandboxCheckInterval)
@@ -362,6 +374,7 @@ func main() {
 		"template", defaultTemplate,
 		"defaultTaskMemory", defaultTaskMemory,
 		"maxTaskMemory", maxTaskMemoryQuantity.String(),
+		"maxTaskCpu", maxTaskCPUQuantity.String(),
 		"sandboxCheckInterval", sandboxCheckIntervalDuration,
 		"claimMinIdle", claimMinIdle,
 	)
@@ -383,6 +396,7 @@ func main() {
 	reconciler := controller.NewTaskReconciler(subClient, defaultTemplate, defaultTemplateAtespace)
 	reconciler.DefaultTaskMemory = defaultTaskMemory
 	reconciler.MaxTaskMemory = maxTaskMemoryQuantity
+	reconciler.MaxTaskCPU = maxTaskCPUQuantity
 	if nativeTLSDestination != "" {
 		if err := reconciler.ConfigureNativeTLS(nativeTLSDestination, os.Getenv("POD_NAMESPACE"), substrateEndpoint, substrateAuthority, substrateInsecureTLS || substratePlaintext); err != nil {
 			slog.Error("invalid native TLS configuration", "error", err)
