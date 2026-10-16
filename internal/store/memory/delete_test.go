@@ -122,3 +122,36 @@ func TestOrdinaryUpdateTaskStatusKeepsTerminating(t *testing.T) {
 		t.Fatalf("UpdateTaskStatusIf cleared Terminating for an ordinary task: %v, phase=%q", err, current.GetStatus().GetPhase())
 	}
 }
+
+// ax-bsl.9: UpdateTaskSuspend must not touch the stored status at all, so a
+// SuspendTask or ResumeTask call that read the task before a concurrent
+// MarkTaskDeleting call cannot replay a stale "Running" status over the new
+// Terminating phase.
+func TestUpdateTaskSuspendKeepsTerminatingForOrdinaryTask(t *testing.T) {
+	ctx := context.Background()
+	s := NewStore()
+	if err := s.SaveTask(ctx, &v1alpha1.Task{Metadata: &v1alpha1.ObjectMeta{Name: "ordinary"}}); err != nil {
+		t.Fatal(err)
+	}
+	<-s.events
+	if err := s.MarkTaskDeleting(ctx, "", "ordinary"); err != nil {
+		t.Fatal(err)
+	}
+	<-s.events
+
+	updated, err := s.UpdateTaskSuspend(ctx, "", "ordinary", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !updated.GetSpec().GetSuspend() {
+		t.Fatal("UpdateTaskSuspend did not set Spec.Suspend")
+	}
+	if updated.GetStatus().GetPhase() != v1alpha1.PhaseTerminating {
+		t.Fatalf("UpdateTaskSuspend cleared Terminating for an ordinary task: phase=%q", updated.GetStatus().GetPhase())
+	}
+
+	current, err := s.GetTask(ctx, "", "ordinary")
+	if err != nil || current.GetStatus().GetPhase() != v1alpha1.PhaseTerminating {
+		t.Fatalf("UpdateTaskSuspend cleared Terminating for an ordinary task: %v, phase=%q", err, current.GetStatus().GetPhase())
+	}
+}

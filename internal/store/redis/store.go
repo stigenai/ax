@@ -376,6 +376,45 @@ func (s *Store) UpdateTaskStatusIf(ctx context.Context, atespace, name string, e
 	return applied, err
 }
 
+// UpdateTaskSuspend sets task.Spec.Suspend inside a WATCH transaction on the
+// task key, and leaves the stored status untouched. See store.Store for the
+// full contract.
+func (s *Store) UpdateTaskSuspend(ctx context.Context, atespace, name string, suspend bool) (*v1alpha1.Task, error) {
+	if atespace == "" {
+		atespace = "default"
+	}
+	key := s.taskKey(atespace, name)
+	var updated *v1alpha1.Task
+	err := s.client.Watch(ctx, func(tx *redis.Tx) error {
+		task, err := taskForDelete(ctx, tx, key)
+		if err != nil {
+			return err
+		}
+		if task.Spec == nil {
+			task.Spec = &v1alpha1.TaskSpec{}
+		}
+		task.Spec.Suspend = suspend
+		data, err := protojson.Marshal(task)
+		if err != nil {
+			return err
+		}
+		_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+			pipe.Set(ctx, key, data, s.opts.TTL)
+			pipe.Publish(ctx, s.taskPubSubChannel(atespace, name), data)
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		updated = task
+		return nil
+	}, key)
+	if err != nil {
+		return nil, err
+	}
+	return updated, nil
+}
+
 // MarkTaskDeleting flips the task to the Terminating phase, notifies watchers, and
 // publishes a delete event for the controller. The record stays until DeleteTask.
 func (s *Store) MarkTaskDeleting(ctx context.Context, atespace, name string, preconditions ...store.TaskDeletePreconditions) error {

@@ -153,6 +153,49 @@ func TestOrdinaryUpdateTaskStatusKeepsTerminatingRedis(t *testing.T) {
 	}
 }
 
+// ax-bsl.9: UpdateTaskSuspend must not touch the stored status at all, so a
+// SuspendTask or ResumeTask call that read the task before a concurrent
+// MarkTaskDeleting call cannot replay a stale "Running" status over the new
+// Terminating phase.
+func TestUpdateTaskSuspendKeepsTerminatingForOrdinaryTaskRedis(t *testing.T) {
+	address := os.Getenv("AX_DELETE_TEST_REDIS_ADDRESS")
+	if address == "" {
+		t.Skip("requires explicit disposable AX_DELETE_TEST_REDIS_ADDRESS")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	client := redisclient.NewClient(&redisclient.Options{Addr: address})
+	defer client.Close()
+	if err := client.Ping(ctx).Err(); err != nil {
+		t.Fatal(err)
+	}
+	prefix := fmt.Sprintf("ax-suspend-terminating-test-%d", time.Now().UnixNano())
+	s := NewStore(client, Options{KeyPrefix: prefix, StreamName: prefix + ":events"})
+	task := &v1alpha1.Task{Metadata: &v1alpha1.ObjectMeta{Name: "job", Atespace: "private"}}
+	if err := s.SaveTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkTaskDeleting(ctx, "private", "job"); err != nil {
+		t.Fatal(err)
+	}
+
+	updated, err := s.UpdateTaskSuspend(ctx, "private", "job", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !updated.GetSpec().GetSuspend() {
+		t.Fatal("UpdateTaskSuspend did not set Spec.Suspend")
+	}
+	if updated.GetStatus().GetPhase() != v1alpha1.PhaseTerminating {
+		t.Fatalf("UpdateTaskSuspend cleared Terminating for an ordinary task: phase=%q", updated.GetStatus().GetPhase())
+	}
+
+	current, err := s.GetTask(ctx, "private", "job")
+	if err != nil || current.GetStatus().GetPhase() != v1alpha1.PhaseTerminating {
+		t.Fatalf("UpdateTaskSuspend cleared Terminating for an ordinary task: %v, phase=%q", err, current.GetStatus().GetPhase())
+	}
+}
+
 func TestProtectedDeleteRedisConcurrentReplacement(t *testing.T) {
 	address := os.Getenv("AX_DELETE_TEST_REDIS_ADDRESS")
 	if address == "" {

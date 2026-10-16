@@ -171,18 +171,15 @@ func (s *Server) SuspendTask(ctx context.Context, req *v1alpha1.SuspendTaskReque
 	if atespace == "" {
 		atespace = "default"
 	}
-	task, err := s.store.GetTask(ctx, atespace, req.Name)
+	// UpdateTaskSuspend writes Spec.Suspend by itself, in one transaction,
+	// instead of reading the task's status and writing it back. That older
+	// GetTask-then-SaveTask sequence can race a concurrent MarkTaskDeleting
+	// call and clear the Terminating phase it set (ax-bsl.9).
+	task, err := s.store.UpdateTaskSuspend(ctx, atespace, req.Name, true)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			return nil, status.Errorf(codes.NotFound, "task %q not found in atespace %q", req.Name, atespace)
 		}
-		return nil, status.Errorf(codes.Internal, "getting task: %v", err)
-	}
-	if task.Spec == nil {
-		task.Spec = &v1alpha1.TaskSpec{}
-	}
-	task.Spec.Suspend = true
-	if err := s.store.SaveTask(ctx, task); err != nil {
 		return nil, status.Errorf(codes.Internal, "suspending task: %v", err)
 	}
 	return task, nil
@@ -196,18 +193,13 @@ func (s *Server) ResumeTask(ctx context.Context, req *v1alpha1.ResumeTaskRequest
 	if atespace == "" {
 		atespace = "default"
 	}
-	task, err := s.store.GetTask(ctx, atespace, req.Name)
+	// See the matching comment in SuspendTask: UpdateTaskSuspend avoids the
+	// GetTask-then-SaveTask race with MarkTaskDeleting (ax-bsl.9).
+	task, err := s.store.UpdateTaskSuspend(ctx, atespace, req.Name, false)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			return nil, status.Errorf(codes.NotFound, "task %q not found in atespace %q", req.Name, atespace)
 		}
-		return nil, status.Errorf(codes.Internal, "getting task: %v", err)
-	}
-	if task.Spec == nil {
-		task.Spec = &v1alpha1.TaskSpec{}
-	}
-	task.Spec.Suspend = false
-	if err := s.store.SaveTask(ctx, task); err != nil {
 		return nil, status.Errorf(codes.Internal, "resuming task: %v", err)
 	}
 	return task, nil
