@@ -104,7 +104,7 @@ func (d *DeletionSweeper) SweepOnce(ctx context.Context) {
 	now := d.now()
 	minAge := d.minAge()
 
-	stuckTasks, protected, requeued, requeueFailed := d.sweepTasks(ctx, now, minAge)
+	stuckTasks, protected, requeued, requeueFailed, taskListError := d.sweepTasks(ctx, now, minAge)
 	stuckActors, actorListError := d.sweepActors(ctx, now, minAge)
 
 	stuck := stuckTasks + stuckActors
@@ -115,6 +115,7 @@ func (d *DeletionSweeper) SweepOnce(ctx context.Context) {
 		"protected", protected,
 		"requeued", requeued,
 		"requeue_failed", requeueFailed,
+		"task_list_error", taskListError,
 		"actor_list_error", actorListError,
 		"min_age", minAge,
 	}
@@ -133,13 +134,20 @@ func (d *DeletionSweeper) SweepOnce(ctx context.Context) {
 // requeue would only fail TaskDeletePreconditions.Check (store.go). Re-run
 // `ax delete` with its identity to clean it up, the same limit
 // requeueStrandedDeletions already documents.
-func (d *DeletionSweeper) sweepTasks(ctx context.Context, now time.Time, minAge time.Duration) (stuckTasks, protected, requeued, requeueFailed int) {
+//
+// A ListTasks error stops paging early and sets listError (ax-706.7). This
+// tick then skips pruneSeen, so the ages this process already tracked stay
+// in place instead of resetting to 0: a partial page must not make the
+// next tick look falsely young, and must not make this tick's own summary
+// line look falsely like an all-clear.
+func (d *DeletionSweeper) sweepTasks(ctx context.Context, now time.Time, minAge time.Duration) (stuckTasks, protected, requeued, requeueFailed int, listError bool) {
 	seenKeys := make(map[string]bool)
 	var offset int64
 	for {
 		tasks, err := d.Store.ListTasks(ctx, "*", strandedTasksPageSize, offset)
 		if err != nil {
 			slog.Warn("delete sweep: failed to list tasks", "error", err)
+			listError = true
 			break
 		}
 		for _, task := range tasks {
@@ -180,8 +188,10 @@ func (d *DeletionSweeper) sweepTasks(ctx context.Context, now time.Time, minAge 
 		}
 		offset += strandedTasksPageSize
 	}
-	d.pruneSeen(seenKeys)
-	return stuckTasks, protected, requeued, requeueFailed
+	if !listError {
+		d.pruneSeen(seenKeys)
+	}
+	return stuckTasks, protected, requeued, requeueFailed, listError
 }
 
 // touch records that this sweep saw key with creation timestamp created,
