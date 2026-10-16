@@ -138,6 +138,23 @@ const deleteSweepIntervalDefault = 5 * time.Minute
 // threshold for "stuck" (ax-706).
 const deleteSweepMinAgeDefault = 15 * time.Minute
 
+// deleteSweepTickTimeout bounds one DeletionSweeper.SweepOnce call. A hung
+// ListActors or store call must not stop every later tick (ax-706.8): the
+// ticker loop calls SweepOnce once per tick, in order, so one tick that
+// never returns would block every tick after it forever. 1 minute is well
+// under deleteSweepIntervalDefault's 5 minutes, so a sweep that is only
+// slow, not hung, still finishes inside its own tick in the normal case.
+const deleteSweepTickTimeout = time.Minute
+
+// runDeleteSweepTick runs one SweepOnce call bounded by timeout. It wraps
+// ctx so a hang inside sweeper's ListActors or ListTasks call returns at
+// timeout instead of blocking every later tick (ax-706.8).
+func runDeleteSweepTick(ctx context.Context, sweeper *controller.DeletionSweeper, timeout time.Duration) {
+	tickCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	sweeper.SweepOnce(tickCtx)
+}
+
 // resolveDeleteSweepInterval reads the AX_DELETE_SWEEP_INTERVAL override
 // for the --delete-sweep-interval flag. The caller passes the env value.
 // An empty envValue keeps flagValue. The value "0" (or env "0") turns off
@@ -411,7 +428,7 @@ func main() {
 				case <-ctx.Done():
 					return
 				case <-ticker.C:
-					sweeper.SweepOnce(ctx)
+					runDeleteSweepTick(ctx, sweeper, deleteSweepTickTimeout)
 				}
 			}
 		}()

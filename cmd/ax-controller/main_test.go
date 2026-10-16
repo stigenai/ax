@@ -15,9 +15,16 @@
 package main
 
 import (
+	"bytes"
+	"context"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"github.com/google/ax/internal/controller"
+	"github.com/google/ax/internal/store/memory"
 	"k8s.io/apimachinery/pkg/api/resource"
 )
 
@@ -318,5 +325,49 @@ func TestResolveDeleteSweepMinAge(t *testing.T) {
 				t.Fatalf("resolveDeleteSweepMinAge(%v, %q) = %v, want %v", tt.flagValue, tt.envValue, got, tt.want)
 			}
 		})
+	}
+}
+
+// blockingActorLister blocks ListActors until ctx is done, then returns
+// ctx.Err(). It stands in for a hung ListActors call (ax-706.8).
+type blockingActorLister struct{}
+
+func (blockingActorLister) ListActors(ctx context.Context, atespace string) ([]*ateapipb.Actor, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+// TestRunDeleteSweepTickBoundsAHungActorList covers ax-706.8: a hung
+// ListActors call must not stop every later tick. runDeleteSweepTick must
+// return at its own timeout, and the summary line must show
+// actor_list_error=true, instead of SweepOnce blocking the ticker loop
+// forever on the outer, long-lived ctx.
+func TestRunDeleteSweepTickBoundsAHungActorList(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	sweeper := &controller.DeletionSweeper{Store: memory.NewStore(), Actors: blockingActorLister{}}
+
+	done := make(chan struct{})
+	start := time.Now()
+	go func() {
+		runDeleteSweepTick(context.Background(), sweeper, 50*time.Millisecond)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("runDeleteSweepTick did not return: a hung ActorLister blocked the tick forever")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("runDeleteSweepTick took %v, want it bounded near its 50ms timeout", elapsed)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, "actor_list_error=true") {
+		t.Fatalf("want actor_list_error=true once the tick times out, got: %s", output)
 	}
 }
