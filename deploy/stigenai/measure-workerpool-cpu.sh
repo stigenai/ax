@@ -7,7 +7,7 @@
 # This helps you tell a sustained pod near its cpu limit (throttle risk)
 # from a single noisy sample.
 #
-# The script prints 4 sections. Each section has its own "## " heading.
+# The script prints 5 sections. Each section has its own "## " heading.
 #   1. WorkerPool cpu spec: the live cpu request and limit per worker.
 #   2. Task density now: each worker's booked actor count and memory, from
 #      `kubectl ate get workers` (the real density, not the cpu limit math).
@@ -16,6 +16,16 @@
 #   4. Flags: each pod whose CPU is at or above THROTTLE_PCT of the cpu
 #      limit in any sample. This is a throttle candidate, not proof.
 #      See the PromQL note below for a real trend.
+#   5. CFS throttle ratio: for each ax worker pod, the share of CPU
+#      periods the kernel throttled since the pod's last start.
+#      The script reads this from each node's cadvisor, through the
+#      read-only `kubectl get --raw
+#      /api/v1/nodes/<node>/proxy/metrics/cadvisor` endpoint. The two
+#      counters are container_cpu_cfs_throttled_periods_total and
+#      container_cpu_cfs_periods_total. This ratio is real proof of a
+#      throttle. A `kubectl top` sample only catches one moment.
+#      Set the env var THROTTLE_RATIO_PCT to flag a pod at or above a
+#      ratio. The default is 5.
 #
 # One `kubectl top pods` call is a read at one point in time. ax-ci8
 # learned this the hard way for memory. CPU use is burstier than memory.
@@ -41,6 +51,8 @@
 # It does not change cluster state.
 #
 # Usage: deploy/stigenai/measure-workerpool-cpu.sh [context] [samples] [interval_seconds] [throttle_pct]
+# Env var THROTTLE_RATIO_PCT sets the flag threshold for section 5, the
+# cadvisor CFS throttle ratio. Default 5 (percent).
 set -euo pipefail
 
 CTX="${1:-gtr}"
@@ -49,6 +61,7 @@ POOL="ax"
 SAMPLES="${2:-6}"
 SAMPLE_INTERVAL="${3:-20}"
 THROTTLE_PCT="${4:-90}"
+THROTTLE_RATIO_PCT="${THROTTLE_RATIO_PCT:-5}"
 
 echo "## WorkerPool ${POOL} cpu spec (context ${CTX})"
 kubectl --context "$CTX" get workerpool "$POOL" -n "$NS" -o json \
@@ -107,4 +120,78 @@ for name in "${POD_ORDER[@]}"; do
 done
 if [ "$ANY_FLAG" -eq 0 ]; then
   echo "no pod reached the threshold in this window; re-run during known load or widen SAMPLES/SAMPLE_INTERVAL"
+fi
+
+echo
+echo "## CFS throttle ratio per pod (cadvisor, since each pod's last start)"
+echo "ratio = throttled periods / total periods; flag at or above ${THROTTLE_RATIO_PCT}%"
+
+declare -A POD_NODE
+declare -A POD_START
+POD_ALL_ORDER=()
+while read -r pname pnode pstart; do
+  [ -z "$pname" ] && continue
+  POD_ALL_ORDER+=("$pname")
+  POD_NODE[$pname]="$pnode"
+  POD_START[$pname]="$pstart"
+done < <(kubectl --context "$CTX" -n "$NS" get pods -l "ate.dev/worker-pool=${POOL}" -o json \
+  | jq -r '.items[] | "\(.metadata.name) \(.spec.nodeName) \(.status.startTime)"')
+
+NODES=()
+for pname in "${POD_ALL_ORDER[@]}"; do
+  node="${POD_NODE[$pname]}"
+  case " ${NODES[*]:-} " in
+    *" ${node} "*) ;;
+    *) NODES+=("$node") ;;
+  esac
+done
+
+declare -A PERIODS
+declare -A THROTTLED
+for node in "${NODES[@]}"; do
+  RAW=$(kubectl --context "$CTX" get --raw "/api/v1/nodes/${node}/proxy/metrics/cadvisor" 2>/dev/null) || {
+    echo "warn: cadvisor fetch failed for node ${node}" >&2
+    continue
+  }
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    pod=$(echo "$line" | sed -E 's/.*pod="([^"]*)".*/\1/')
+    [ -z "${POD_NODE[$pod]+x}" ] && continue
+    val=$(echo "$line" | awk -F'} ' '{print $2}' | awk '{print $1}')
+    PERIODS[$pod]="$val"
+  done < <(echo "$RAW" | grep '^container_cpu_cfs_periods_total{' | grep "namespace=\"${NS}\"" | grep 'container=""')
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    pod=$(echo "$line" | sed -E 's/.*pod="([^"]*)".*/\1/')
+    [ -z "${POD_NODE[$pod]+x}" ] && continue
+    val=$(echo "$line" | awk -F'} ' '{print $2}' | awk '{print $1}')
+    THROTTLED[$pod]="$val"
+  done < <(echo "$RAW" | grep '^container_cpu_cfs_throttled_periods_total{' | grep "namespace=\"${NS}\"" | grep 'container=""')
+done
+
+printf '%-24s %-10s %10s %10s %8s %9s\n' "POD" "NODE" "PERIODS" "THROTTLED" "RATIO%" "AGE_MIN"
+ANY_RATIO_FLAG=0
+for pname in "${POD_ALL_ORDER[@]}"; do
+  node="${POD_NODE[$pname]}"
+  start="${POD_START[$pname]}"
+  periods="${PERIODS[$pname]:-0}"
+  throttled="${THROTTLED[$pname]:-0}"
+  ratio=$(awk -v t="$throttled" -v p="$periods" 'BEGIN { if (p > 0) { printf "%.1f", (t / p) * 100 } else { printf "0.0" } }')
+  start_epoch=$(date -u -d "$start" +%s 2>/dev/null) || start_epoch=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$start" +%s 2>/dev/null) || start_epoch=0
+  now_epoch=$(date -u +%s)
+  if [ "$start_epoch" -gt 0 ]; then
+    age_min=$(( (now_epoch - start_epoch) / 60 ))
+  else
+    age_min=-1
+  fi
+  flagged=$(awk -v r="$ratio" -v thresh="$THROTTLE_RATIO_PCT" 'BEGIN { print (r >= thresh) ? "1" : "0" }')
+  mark=""
+  if [ "$flagged" = "1" ]; then
+    mark=" <- throttled"
+    ANY_RATIO_FLAG=1
+  fi
+  printf '%-24s %-10s %10s %10s %7s%% %8s%s\n' "$pname" "$node" "$periods" "$throttled" "$ratio" "$age_min" "$mark"
+done
+if [ "$ANY_RATIO_FLAG" -eq 0 ]; then
+  echo "no pod's CFS throttle ratio reached ${THROTTLE_RATIO_PCT}% since its last start"
 fi
