@@ -947,6 +947,166 @@ func TestTaskReconciler_NoMaxCPULeavesCapacityWaitUnchanged(t *testing.T) {
 	}
 }
 
+// A Running task already has a place on a worker and a booking there.
+// A lower AX_MAX_TASK_MEMORY must not fail the task on its next reconcile.
+// That would leave its Substrate actor running while the task record says
+// Failed (ax-7ku). The cap applies again at the task's next placement.
+func TestTaskReconciler_RunningTaskSurvivesLoweredMemoryCap(t *testing.T) {
+	mockSrv := &mockControlServer{}
+	r := newTestReconciler(t, mockSrv)
+	r.MaxTaskMemory = resource.MustParse("8Gi")
+
+	task := envTask("x")
+	task.Status = &v1alpha1.TaskStatus{Phase: "Running"}
+	task.Spec.Resources = &v1alpha1.ResourceReqs{Limits: &v1alpha1.ResourceList{Memory: "16Gi"}}
+	reconciled, err := r.Reconcile(context.Background(), task)
+	if err != nil {
+		t.Fatalf("expected a Running task above a lowered memory cap to keep reconciling, got %v", err)
+	}
+	if reconciled.Status.Phase != "Running" {
+		t.Errorf("expected phase Running, got %q", reconciled.Status.Phase)
+	}
+	var reason string
+	for _, c := range reconciled.Status.Conditions {
+		if c.Type == "Ready" {
+			reason = c.Reason
+		}
+	}
+	if reason == "MemoryExceedsCapacity" {
+		t.Errorf("expected a reason other than MemoryExceedsCapacity, got %q", reason)
+	}
+	if mockSrv.resumeAttempts.Load() == 0 {
+		t.Errorf("expected a ResumeActor attempt, got none")
+	}
+	if len(mockSrv.deletedActors) != 0 {
+		t.Errorf("expected no DeleteActor call, got %v", mockSrv.deletedActors)
+	}
+}
+
+// This test checks the same rule for the cpu cap. ax-6cj has the same bug,
+// and ax-7ku fixes it too.
+func TestTaskReconciler_RunningTaskSurvivesLoweredCPUCap(t *testing.T) {
+	mockSrv := &mockControlServer{}
+	r := newTestReconciler(t, mockSrv)
+	r.MaxTaskCPU = resource.MustParse("4")
+
+	task := envTask("x")
+	task.Status = &v1alpha1.TaskStatus{Phase: "Running"}
+	task.Spec.Resources = &v1alpha1.ResourceReqs{Limits: &v1alpha1.ResourceList{Cpu: "8"}}
+	reconciled, err := r.Reconcile(context.Background(), task)
+	if err != nil {
+		t.Fatalf("expected a Running task above a lowered cpu cap to keep reconciling, got %v", err)
+	}
+	if reconciled.Status.Phase != "Running" {
+		t.Errorf("expected phase Running, got %q", reconciled.Status.Phase)
+	}
+	var reason string
+	for _, c := range reconciled.Status.Conditions {
+		if c.Type == "Ready" {
+			reason = c.Reason
+		}
+	}
+	if reason == "CPUExceedsCapacity" {
+		t.Errorf("expected a reason other than CPUExceedsCapacity, got %q", reason)
+	}
+	if mockSrv.resumeAttempts.Load() == 0 {
+		t.Errorf("expected a ResumeActor attempt, got none")
+	}
+	if len(mockSrv.deletedActors) != 0 {
+		t.Errorf("expected no DeleteActor call, got %v", mockSrv.deletedActors)
+	}
+}
+
+// A task that resumes from Suspended has no place yet. The cap must still
+// gate it, as it does today. This test locks in the kept behavior (ax-7ku
+// AC3).
+func TestTaskReconciler_SuspendedTaskAboveCapFailsOnResume(t *testing.T) {
+	mockSrv := &mockControlServer{}
+	r := newTestReconciler(t, mockSrv)
+	r.MaxTaskMemory = resource.MustParse("8Gi")
+
+	task := envTask("x")
+	task.Status = &v1alpha1.TaskStatus{Phase: "Suspended"}
+	task.Spec.Resources = &v1alpha1.ResourceReqs{Limits: &v1alpha1.ResourceList{Memory: "16Gi"}}
+	reconciled, err := r.Reconcile(context.Background(), task)
+	if err == nil || errors.Is(err, controller.ErrWaitingForCapacity) {
+		t.Fatalf("expected a plain memory-cap failure, got %v", err)
+	}
+	if reconciled.Status.Phase != "Failed" {
+		t.Errorf("expected phase Failed, got %q", reconciled.Status.Phase)
+	}
+	var reason string
+	for _, c := range reconciled.Status.Conditions {
+		if c.Type == "Ready" {
+			reason = c.Reason
+		}
+	}
+	if reason != "MemoryExceedsCapacity" {
+		t.Errorf("expected MemoryExceedsCapacity, got %q", reason)
+	}
+	if len(mockSrv.createdAtespaces) != 0 || len(mockSrv.createdActors) != 0 || mockSrv.resumeAttempts.Load() != 0 {
+		t.Errorf("expected zero Substrate calls, got atespaces=%v actors=%v resumeAttempts=%d", mockSrv.createdAtespaces, mockSrv.createdActors, mockSrv.resumeAttempts.Load())
+	}
+}
+
+// A new task, or a task with no place yet, is not Running. The cap must
+// still gate it before its first placement. This test locks in the kept
+// behavior (ax-7ku AC3).
+func TestTaskReconciler_PendingTaskAboveCapFails(t *testing.T) {
+	mockSrv := &mockControlServer{}
+	r := newTestReconciler(t, mockSrv)
+	r.MaxTaskMemory = resource.MustParse("8Gi")
+
+	task := envTask("x")
+	task.Status = &v1alpha1.TaskStatus{Phase: "Pending"}
+	task.Spec.Resources = &v1alpha1.ResourceReqs{Limits: &v1alpha1.ResourceList{Memory: "16Gi"}}
+	reconciled, err := r.Reconcile(context.Background(), task)
+	if err == nil || errors.Is(err, controller.ErrWaitingForCapacity) {
+		t.Fatalf("expected a plain memory-cap failure, got %v", err)
+	}
+	if reconciled.Status.Phase != "Failed" {
+		t.Errorf("expected phase Failed, got %q", reconciled.Status.Phase)
+	}
+	if len(mockSrv.createdAtespaces) != 0 || len(mockSrv.createdActors) != 0 || mockSrv.resumeAttempts.Load() != 0 {
+		t.Errorf("expected zero Substrate calls, got atespaces=%v actors=%v resumeAttempts=%d", mockSrv.createdAtespaces, mockSrv.createdActors, mockSrv.resumeAttempts.Load())
+	}
+}
+
+// A Running task that suspends still frees its booking in the normal way.
+// The cap must catch a Running task above a lower cap at its next resume,
+// not at this suspend (ax-7ku AC4).
+func TestTaskReconciler_RunningTaskAboveCapSuspends(t *testing.T) {
+	mockSrv := &mockControlServer{}
+	r := newTestReconciler(t, mockSrv)
+	r.MaxTaskMemory = resource.MustParse("8Gi")
+
+	task := envTask("x")
+	task.Status = &v1alpha1.TaskStatus{Phase: "Running"}
+	task.Spec.Suspend = true
+	task.Spec.Resources = &v1alpha1.ResourceReqs{Limits: &v1alpha1.ResourceList{Memory: "16Gi"}}
+	reconciled, err := r.Reconcile(context.Background(), task)
+	if err != nil {
+		t.Fatalf("expected a Running task above a lowered cap to suspend cleanly, got %v", err)
+	}
+	if reconciled.Status.Phase != "Suspended" {
+		t.Errorf("expected phase Suspended, got %q", reconciled.Status.Phase)
+	}
+	if len(mockSrv.suspendedActors) == 0 {
+		t.Errorf("expected a SuspendActor call, got none")
+	}
+
+	// The next resume is a placement: the cap must catch it there.
+	task.Status.Phase = "Suspended"
+	task.Spec.Suspend = false
+	reconciled, err = r.Reconcile(context.Background(), task)
+	if err == nil || errors.Is(err, controller.ErrWaitingForCapacity) {
+		t.Fatalf("expected the resume to fail the memory cap, got %v", err)
+	}
+	if reconciled.Status.Phase != "Failed" {
+		t.Errorf("expected phase Failed on resume, got %q", reconciled.Status.Phase)
+	}
+}
+
 func supervisorTask() *v1alpha1.Task {
 	return &v1alpha1.Task{Metadata: &v1alpha1.ObjectMeta{Name: "fabriek-task", Atespace: "fabriek"}, Spec: &v1alpha1.TaskSpec{
 		SupervisorProfile: v1alpha1.FabriekSupervisorProfile,
