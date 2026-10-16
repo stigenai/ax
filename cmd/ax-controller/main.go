@@ -214,13 +214,24 @@ const claimMinIdleDefault = 5 * time.Minute
 // --stream-claim-min-idle flag. The caller passes the env value. An empty
 // envValue keeps flagValue. A negative duration turns reclaim off. The
 // controller must not start with a value it cannot parse as a duration.
+//
+// This function rejects an explicit 0 from the flag or the env var
+// (ax-bsl.6). Without this check, the redis store's own default-if-zero
+// clamp (internal/store/redis/store.go NewStore) turns a 0 here into
+// claimMinIdleDefault. It does this without a warning. This breaks the
+// convention of its sibling AX_DELETE_SWEEP_INTERVAL, where 0 turns a sweep
+// off. Pass a negative duration to turn reclaim off instead.
 func resolveClaimMinIdle(flagValue time.Duration, envValue string) (time.Duration, error) {
-	if envValue == "" {
-		return flagValue, nil
+	d := flagValue
+	if envValue != "" {
+		parsed, err := time.ParseDuration(envValue)
+		if err != nil {
+			return 0, fmt.Errorf("invalid duration %q: %w", envValue, err)
+		}
+		d = parsed
 	}
-	d, err := time.ParseDuration(envValue)
-	if err != nil {
-		return 0, fmt.Errorf("invalid duration %q: %w", envValue, err)
+	if d == 0 {
+		return 0, fmt.Errorf("stream-claim-min-idle must not be 0: it would silently become the %s default; pass a negative duration to turn reclaim off", claimMinIdleDefault)
 	}
 	return d, nil
 }
@@ -278,7 +289,7 @@ func main() {
 	flag.IntVar(&taskLivenessThreshold, "task-liveness-threshold", controller.DefaultLivenessThreshold, "Consecutive stale probes that mark a Running task Failed")
 	flag.DurationVar(&deleteSweepInterval, "delete-sweep-interval", deleteSweepIntervalDefault, "How often DeletionSweeper checks for stuck Terminating tasks and stuck DELETING actors; 0 disables it (env AX_DELETE_SWEEP_INTERVAL)")
 	flag.DurationVar(&deleteSweepMinAge, "delete-sweep-min-age", deleteSweepMinAgeDefault, "How long a Terminating task or a DELETING actor must sit before DeletionSweeper counts and acts on it; must be greater than zero (env AX_DELETE_SWEEP_MIN_AGE)")
-	flag.DurationVar(&claimMinIdle, "stream-claim-min-idle", claimMinIdleDefault, "How long a pending task-stream entry must sit unacknowledged before another consumer may reclaim it with XAUTOCLAIM; negative disables reclaim (env AX_STREAM_CLAIM_MIN_IDLE)")
+	flag.DurationVar(&claimMinIdle, "stream-claim-min-idle", claimMinIdleDefault, "How long a pending task-stream entry must sit unacknowledged before another consumer may reclaim it with XAUTOCLAIM; negative disables reclaim; 0 is rejected, not a way to disable it (env AX_STREAM_CLAIM_MIN_IDLE)")
 	flag.Parse()
 
 	if envRedis := os.Getenv("REDIS_ADDR"); envRedis != "" {

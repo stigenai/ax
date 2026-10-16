@@ -165,18 +165,36 @@ kubectl --context gtr -n ax-system exec -it deploy/ax-redis -- \
 
 Each row lists `id`, `consumer`, `idle` (ms) and `deliveries`. After a rollout,
 wait for `--stream-claim-min-idle` (default 5 minutes) plus a little more time.
-Then read the result:
+Then read the result.
 
-- 0 entries, or only entries that belong to a consumer still in `XINFO CONSUMERS
-  ax:stream:tasks ax-controllers`: reclaim works as expected.
-- An entry is older than the threshold and still belongs to a dead consumer.
-  Reclaim is off (`AX_STREAM_CLAIM_MIN_IDLE` set to a negative value), or
-  `ax-controller` has not run long enough yet to scan it. Check the pod's
-  `starting ax-controller` startup log line for its `claimMinIdle` value.
-- A `level=error` line `dropping task event after too many deliveries`: a
-  poison event reached the retry cap (`MaxDeliveries`, default 5). The event
-  was dropped. It was not reclaimed again. The id, atespace, name and action
-  fields name the event.
+`Subscription.Close` never calls `XGROUP DELCONSUMER`, so a consumer stays
+listed forever, long after its pod is gone. Every entry's consumer name always
+matches one in `XINFO CONSUMERS`, whether that pod is live or dead. So this
+check cannot flag a dead owner.
+
+Do not use `XINFO CONSUMERS ax:stream:tasks ax-controllers` to tell if an owner
+is live or dead. Compare the consumer name with a live pod instead:
+
+```bash
+kubectl --context gtr -n ax-system get pods -l app.kubernetes.io/name=ax-controller
+```
+
+A consumer name has the form `<pod-name>-<digits>`. `NewWorker` in
+`internal/controller/worker.go` makes this form when
+`--redis-consumer`/`AX_REDIS_CONSUMER` is unset. It appends
+`-<a number up to 4 digits>` to the pod's hostname.
+
+Remove the trailing `-<digits>` from the consumer name. Then compare what
+remains with the live pod names above:
+
+- If the name without the suffix matches a live pod, that pod still owns the entry. The entry is not stuck, unless `idle` also exceeds `--stream-claim-min-idle` by a wide margin. A wide margin shows a wedged worker, not a dead one.
+
+- If the name without the suffix matches no live pod, and `idle` is past `--stream-claim-min-idle`, reclaim must have already run. Check these causes:
+  - Reclaim is off. `AX_STREAM_CLAIM_MIN_IDLE` is set to a negative value.
+  - `ax-controller` has not run long enough yet to scan the entry.
+  - Check the pod's `starting ax-controller` startup log line for its `claimMinIdle` value.
+
+- A `level=error` line says `dropping task event after too many deliveries`. This means that a poison event reached the retry cap (`MaxDeliveries`, default 5). The controller drops the event and does not reclaim it again. The id, atespace, name and action fields name the event.
 
 ## What the sweep does not do
 

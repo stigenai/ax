@@ -399,6 +399,12 @@ func TestResolveClaimMinIdle(t *testing.T) {
 		{name: "an env override parses and replaces the flag value", flagValue: 5 * time.Minute, envValue: "2m", want: 2 * time.Minute},
 		{name: "a negative env value turns reclaim off", flagValue: 5 * time.Minute, envValue: "-1s", want: -1 * time.Second},
 		{name: "an env value that does not parse as a duration is an error", flagValue: 5 * time.Minute, envValue: "not-a-duration", wantErr: true},
+		// ax-bsl.6: an explicit 0 must not silently become the default.
+		// internal/store/redis/store.go NewStore turns an Options.ClaimMinIdle
+		// of 0 into claimMinIdleDefault, unlike its sibling
+		// AX_DELETE_SWEEP_INTERVAL, where 0 turns the sweep off.
+		{name: "an env value of 0 is rejected, it would silently become the default", flagValue: 5 * time.Minute, envValue: "0", wantErr: true},
+		{name: "a flag value of 0 with no env override is rejected", flagValue: 0, envValue: "", wantErr: true},
 	}
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {

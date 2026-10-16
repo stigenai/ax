@@ -184,18 +184,21 @@ func (w *Worker) processEvent(ctx context.Context, ev store.TaskEvent) error {
 		if err != nil {
 			return err
 		}
-		// A retry delivered after the task moved on from Terminating (it was
-		// recreated, or another delivery already finished it) targets a stale
-		// deletion: skip it before any Substrate call.
-		if ev.Retry && task.GetStatus().GetPhase() != v1alpha1.PhaseTerminating {
-			slog.Info("skipping stale delete retry", "atespace", ev.Atespace, "name", ev.Name)
+		// A delivery can arrive after the task leaves Terminating. A caller
+		// can recreate the task. Or an earlier delivery can already finish
+		// the deletion. Skip this stale delivery before any Substrate call.
+		//
+		// Do not base this check on ev.Retry or ev.Deletion.ActorUID. A
+		// XAUTOCLAIM reclaim of a dead consumer's unacked event (ax-bsl.4)
+		// carries Retry=false. It can also carry no ActorUID, for a legacy
+		// delete. Either flag alone misses a stale reclaimed event that
+		// targets a task recreated under the same name.
+		if task.GetStatus().GetPhase() != v1alpha1.PhaseTerminating {
+			slog.Info("skipping stale delete: task left Terminating", "atespace", ev.Atespace, "name", ev.Name, "retry", ev.Retry)
 			return nil
 		}
 		if err := ev.Deletion.Check(task); err != nil {
 			return err
-		}
-		if ev.Deletion.ActorUID != "" && task.GetStatus().GetPhase() != v1alpha1.PhaseTerminating {
-			return store.ErrConflict
 		}
 		if err := w.reconciler.ReconcileDelete(ctx, ev.Atespace, ev.Name, ev.Deletion.ActorUID); err != nil {
 			// Retry instead of leaving the record in Terminating forever: a

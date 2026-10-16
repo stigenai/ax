@@ -249,6 +249,45 @@ func TestDeleteRetrySkipsStaleEventForRecreatedTask(t *testing.T) {
 	}
 }
 
+// ax-bsl.4: a XAUTOCLAIM reclaim of a dead consumer's unacked event replays
+// the original delete. The replayed event carries Retry=false. For a legacy
+// delete, like the one XPENDING held for ax-smoke/smoke, it also carries no
+// ActorUID. This event must make 0 Substrate calls. It must keep a
+// recreated task's record untouched, the same as a retry-flagged stale
+// delete already does.
+func TestDeleteSkipsStaleReclaimedEventWithoutRetryFlagForRecreatedTask(t *testing.T) {
+	ctx := context.Background()
+	s := memory.NewStore()
+	task := &v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{Name: "recreated-no-retry-flag", Atespace: "private"},
+		Status:   &v1alpha1.TaskStatus{Phase: "Running"},
+	}
+	if err := s.SaveTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateTaskStatus(ctx, "private", "recreated-no-retry-flag", task.Status); err != nil {
+		t.Fatal(err)
+	}
+
+	// worker.reconciler is left nil on purpose: reaching it would panic, so
+	// a pass proves the skip happens before any Substrate call. Deletion is
+	// left zero-value (no ActorUID, no CreationTimestamp) and Retry is left
+	// false, exactly as a reclaimed legacy delete event replays.
+	worker := &Worker{store: s}
+	ev := store.TaskEvent{Atespace: "private", Name: "recreated-no-retry-flag", Action: "delete"}
+	if err := worker.processEvent(ctx, ev); err != nil {
+		t.Fatal(err)
+	}
+
+	current, err := s.GetTask(ctx, "private", "recreated-no-retry-flag")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.GetStatus().GetPhase() != "Running" {
+		t.Fatalf("stale reclaimed event changed the recreated task: phase %q", current.GetStatus().GetPhase())
+	}
+}
+
 // AC1 (ax-8qz.2): a successful delete must clear the retry backoff, so a
 // later delete of a same-named task starts its own schedule at
 // DeleteBackoffBase instead of continuing a stale exponential climb.
