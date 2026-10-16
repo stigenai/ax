@@ -33,12 +33,12 @@ patches:
                   # Substrate rejects actor images not pinned by digest.
                   - name: AX_DEFAULT_TASK_IMAGE
                     value: ghcr.io/stigenai/ax/ax-task-runner:v0.3.1-stigenai.1@sha256:fdc4c5d665e3668d8d08e0ccfab620864654f2c1a9c21570f46ca97462cdac98
-                  # Books 4Gi against each worker's reported memory for any
+                  # Books 7680Mi against each worker's reported memory for any
                   # task that names no memory limit of its own, so Substrate's
                   # scheduler stops placing more tasks than a worker can hold.
                   # See deploy/stigenai/workerpool.yaml for the sizing math.
                   - name: AX_DEFAULT_TASK_MEMORY
-                    value: 4Gi
+                    value: 7680Mi
                   # ax-9gp: a task's own (or default) memory limit can
                   # exceed this value. Such a task can never fit any worker.
                   # Reconcile fails it with reason MemoryExceedsCapacity.

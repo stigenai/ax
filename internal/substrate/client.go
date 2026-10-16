@@ -194,6 +194,18 @@ func (c *Client) EnsureAtespace(ctx context.Context, atespace string) error {
 	return nil
 }
 
+// GetActor fetches the named Actor. It returns Substrate's error unchanged,
+// for example a gRPC NotFound, so a caller can classify it.
+func (c *Client) GetActor(ctx context.Context, atespace, actorName string) (*ateapipb.Actor, error) {
+	req := &ateapipb.GetActorRequest{
+		Actor: &ateapipb.ObjectRef{
+			Atespace: atespace,
+			Name:     actorName,
+		},
+	}
+	return c.control.GetActor(ctx, req)
+}
+
 // GetActorTemplate fetches an ActorTemplate by name.
 func (c *Client) GetActorTemplate(ctx context.Context, atespace, templateName string) (*ateapipb.ActorTemplate, error) {
 	req := &ateapipb.GetActorTemplateRequest{
@@ -452,19 +464,6 @@ func (c *Client) EnsureActor(ctx context.Context, atespace, actorName, templateA
 		return nil, fmt.Errorf("creating actor %s/%s: %w", atespace, actorName, err)
 	}
 	return actor, nil
-}
-
-// GetActor fetches an Actor by name. It returns the grpc error from the
-// Control API unchanged, so a caller can check status.Code(err) ==
-// codes.NotFound for an actor Substrate no longer knows about.
-func (c *Client) GetActor(ctx context.Context, atespace, actorName string) (*ateapipb.Actor, error) {
-	req := &ateapipb.GetActorRequest{
-		Actor: &ateapipb.ObjectRef{
-			Atespace: atespace,
-			Name:     actorName,
-		},
-	}
-	return c.control.GetActor(ctx, req)
 }
 
 // ResumeActor resumes the specified actor onto a worker and returns the worker details.
