@@ -626,3 +626,95 @@ func TestDeleteBackoffDoublesAndCaps(t *testing.T) {
 		}
 	}
 }
+
+// TestDefaultDeleteJitterRange covers ax-atj AC3: defaultDeleteJitter(d)
+// always returns a value in [d/2, d], and does not always return the same
+// value. It fails under a mutation that replaces the jitter with "return d"
+// (every sample would equal d, so the "at least 2 distinct values" check
+// would fail; a mutation that drops the d/2 floor can sample below d/2).
+func TestDefaultDeleteJitterRange(t *testing.T) {
+	d := 15 * time.Second
+	min, max := d/2, d
+	seen := map[time.Duration]bool{}
+	for i := 0; i < 1000; i++ {
+		got := defaultDeleteJitter(d)
+		if got < min || got > max {
+			t.Fatalf("sample %d: %v out of range [%v, %v]", i, got, min, max)
+		}
+		seen[got] = true
+	}
+	if len(seen) < 2 {
+		t.Fatalf("want at least 2 distinct jittered values across 1000 samples, got %d", len(seen))
+	}
+}
+
+// TestDefaultDeleteJitterNonPositiveReturnsUnchanged covers the d<=0 edge
+// case: a non-positive delay has nothing to spread, so it returns unchanged.
+func TestDefaultDeleteJitterNonPositiveReturnsUnchanged(t *testing.T) {
+	for _, d := range []time.Duration{0, -time.Second} {
+		if got := defaultDeleteJitter(d); got != d {
+			t.Fatalf("defaultDeleteJitter(%v) = %v, want %v unchanged", d, got, d)
+		}
+	}
+}
+
+// jitterRecorder records every delay scheduleDeleteRetry's jitter hook is
+// called with, and passes the delay through unchanged so timing-based tests
+// that set a Worker's deleteJitter stay predictable.
+type jitterRecorder struct {
+	mu    sync.Mutex
+	calls []time.Duration
+}
+
+func (r *jitterRecorder) jitter(d time.Duration) time.Duration {
+	r.mu.Lock()
+	r.calls = append(r.calls, d)
+	r.mu.Unlock()
+	return d
+}
+
+func (r *jitterRecorder) recorded() []time.Duration {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]time.Duration, len(r.calls))
+	copy(out, r.calls)
+	return out
+}
+
+// TestScheduleDeleteRetryUsesBackoffAndJitter covers ax-atj AC3: each call
+// to scheduleDeleteRetry for the same key computes the attempt's
+// deleteBackoff value and passes it through the worker's jitter hook before
+// sleeping on it. It fails under a mutation that calls deleteJitter with a
+// fixed argument instead of the computed backoff.
+func TestScheduleDeleteRetryUsesBackoffAndJitter(t *testing.T) {
+	ctx := context.Background()
+	base := 10 * time.Millisecond
+	recorder := &jitterRecorder{}
+	w := &Worker{
+		store:             memory.NewStore(),
+		DeleteBackoffBase: base,
+		DeleteBackoffMax:  time.Hour,
+		deleteJitter:      recorder.jitter,
+	}
+
+	for i := 0; i < 3; i++ {
+		w.scheduleDeleteRetry(ctx, "private", "job", store.TaskDeletePreconditions{}, errors.New("boom"))
+		// Clear the pending mark by hand, standing in for a real retry
+		// chain's own goroutine waking and republishing: this test drives 3
+		// attempts back to back without waiting out any real backoff.
+		w.deleteMu.Lock()
+		delete(w.deletePending, "private/job")
+		w.deleteMu.Unlock()
+	}
+
+	want := []time.Duration{base, 2 * base, 4 * base}
+	got := recorder.recorded()
+	if len(got) != len(want) {
+		t.Fatalf("want %d jitter calls, got %d: %v", len(want), len(got), got)
+	}
+	for i, w := range want {
+		if got[i] != w {
+			t.Fatalf("call %d: want backoff %v passed to jitter, got %v", i, w, got[i])
+		}
+	}
+}

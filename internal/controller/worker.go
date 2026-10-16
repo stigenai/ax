@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"os"
 	"sync"
 	"time"
@@ -85,6 +86,9 @@ type Worker struct {
 	// ax-706.10 (sibling case): a success can clear a key and start a new
 	// chain, while an old goroutine for the same key still sleeps.
 	deleteGen map[string]int64
+	// deleteJitter overrides defaultDeleteJitter for tests. A nil value uses
+	// defaultDeleteJitter.
+	deleteJitter func(time.Duration) time.Duration
 }
 
 // NewWorker creates a worker that joins group as consumer. An empty group uses the
@@ -364,9 +368,14 @@ func (w *Worker) scheduleDeleteRetry(ctx context.Context, atespace, name string,
 	w.deleteMu.Unlock()
 
 	backoff := deleteBackoff(attempt, base, max)
+	jitter := w.deleteJitter
+	if jitter == nil {
+		jitter = defaultDeleteJitter
+	}
+	delay := jitter(backoff)
 
 	slog.Warn("task delete failed, retrying", "atespace", atespace, "name", name,
-		"attempt", attempt+1, "next_retry", backoff, "error", cause)
+		"attempt", attempt+1, "next_retry", delay, "error", cause)
 
 	// clearOwnMark removes this chain's pending mark, but only while it
 	// still holds myGen. A clearDeleteBackoff call for this key, followed
@@ -386,7 +395,7 @@ func (w *Worker) scheduleDeleteRetry(ctx context.Context, atespace, name string,
 		case <-ctx.Done():
 			clearOwnMark()
 			return
-		case <-time.After(backoff):
+		case <-time.After(delay):
 		}
 		// Clear the mark before republishing, not in a defer after
 		// (ax-706.10): the republished event can reach processEvent and
@@ -413,6 +422,20 @@ func deleteBackoff(attempt int, base, max time.Duration) time.Duration {
 		backoff = max
 	}
 	return backoff
+}
+
+// defaultDeleteJitter spreads a delete retry's delay across a range. This
+// stops an outage that fails many deletes at once from retrying them all at
+// the same time. The return value is in the range [d/2, d]. The value is
+// never less than half of d. The value is never more than d. So the jitter
+// never makes a backoff longer than w.DeleteBackoffMax. A d value of zero or
+// less returns d unchanged.
+func defaultDeleteJitter(d time.Duration) time.Duration {
+	if d <= 0 {
+		return d
+	}
+	half := d / 2
+	return half + rand.N(half+1)
 }
 
 // clearDeleteBackoff resets a task's delete-retry schedule once its deletion
