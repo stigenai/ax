@@ -275,59 +275,41 @@ func TestTaskMonitorReadyz503WorkspaceInitializingStaysRunning(t *testing.T) {
 	}
 }
 
-// raceGetActorServer wraps mockControlServer and runs hook, with the call
-// number, immediately before every GetActor reply. A test uses it to make a
-// concurrent store write land between a sweep's GetActor call and its
-// later conditional write.
-type raceGetActorServer struct {
-	*mockControlServer
-	calls int
-	hook  func(callNum int)
-}
-
-func (m *raceGetActorServer) GetActor(ctx context.Context, req *ateapipb.GetActorRequest) (*ateapipb.Actor, error) {
-	m.calls++
-	if m.hook != nil {
-		m.hook(m.calls)
-	}
-	return m.mockControlServer.GetActor(ctx, req)
-}
-
-// TestTaskMonitorFailTaskSkipsWriteWhenStatusIDChanged covers AC6: a
-// concurrent write changes the task's status.id between the probe that
-// reaches the SandboxUnresponsive threshold and failTask's write, so the
-// write must not apply.
+// TestTaskMonitorFailTaskSkipsWriteWhenStatusIDChanged covers AC6. A
+// concurrent write changes the task's status.id. This happens between
+// failTask's re-read and its conditional write. The write must not apply.
+// raceStore (see liveness_test.go) fires its hook right before the store's
+// UpdateTaskStatusIf call. This lands the concurrent write at that exact
+// point. By then, failTask has already re-read the task and passed its own
+// id and phase check. So only the store's conditional write can still catch
+// the race.
 func TestTaskMonitorFailTaskSkipsWriteWhenStatusIDChanged(t *testing.T) {
 	ctx := context.Background()
-	s := memory.NewStore()
+	inner := memory.NewStore()
 	workerAddr := deadRunnerAddr(t)
 	task := taskWithWorker("default", "task1", "task1", workerAddr, "id-1")
-	if err := s.SaveTask(ctx, task); err != nil {
+	if err := inner.SaveTask(ctx, task); err != nil {
 		t.Fatal(err)
 	}
 
-	race := &raceGetActorServer{mockControlServer: &mockControlServer{getActorActor: runningActor()}}
-	race.hook = func(callNum int) {
-		// The 3rd GetActor call is the one that reaches the threshold: land
-		// the concurrent write right before failTask re-reads the task.
-		if callNum == 3 {
-			if err := s.UpdateTaskStatus(ctx, "default", "task1", &v1alpha1.TaskStatus{
-				Phase: "Running", Actor: "task1", WorkerIp: workerAddr, Id: "id-2",
-			}); err != nil {
-				t.Fatal(err)
-			}
+	raced := &raceStore{Store: inner, hook: func() {
+		if err := inner.UpdateTaskStatus(ctx, "default", "task1", &v1alpha1.TaskStatus{
+			Phase: "Running", Actor: "task1", WorkerIp: workerAddr, Id: "id-2",
+		}); err != nil {
+			t.Fatal(err)
 		}
-	}
+	}}
 
-	reconciler := newTestReconcilerForServer(t, race)
-	monitor := controller.NewTaskMonitor(s, reconciler, 0)
+	mockSrv := &mockControlServer{getActorActor: runningActor()}
+	reconciler := newTestReconciler(t, mockSrv)
+	monitor := controller.NewTaskMonitor(raced, reconciler, 0)
 
 	start := time.Now()
 	sweepWithClock(ctx, monitor, start)
 	sweepWithClock(ctx, monitor, start.Add(45*time.Second))
 	sweepWithClock(ctx, monitor, start.Add(95*time.Second))
 
-	got, err := s.GetTask(ctx, "default", "task1")
+	got, err := inner.GetTask(ctx, "default", "task1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -340,37 +322,35 @@ func TestTaskMonitorFailTaskSkipsWriteWhenStatusIDChanged(t *testing.T) {
 }
 
 // TestTaskMonitorFailTaskSkipsWriteWhenPhaseLeftRunning covers AC6's other
-// race: the task leaves Running (a suspend) between the probe that reaches
-// the threshold and failTask's write, so the write must not apply.
+// race: the task leaves Running (a suspend) between failTask's re-read and
+// its conditional write, so the write must not apply.
 func TestTaskMonitorFailTaskSkipsWriteWhenPhaseLeftRunning(t *testing.T) {
 	ctx := context.Background()
-	s := memory.NewStore()
+	inner := memory.NewStore()
 	workerAddr := deadRunnerAddr(t)
 	task := taskWithWorker("default", "task1", "task1", workerAddr, "id-1")
-	if err := s.SaveTask(ctx, task); err != nil {
+	if err := inner.SaveTask(ctx, task); err != nil {
 		t.Fatal(err)
 	}
 
-	race := &raceGetActorServer{mockControlServer: &mockControlServer{getActorActor: runningActor()}}
-	race.hook = func(callNum int) {
-		if callNum == 3 {
-			if err := s.UpdateTaskStatus(ctx, "default", "task1", &v1alpha1.TaskStatus{
-				Phase: "Suspended", Actor: "task1", WorkerIp: workerAddr, Id: "id-1",
-			}); err != nil {
-				t.Fatal(err)
-			}
+	raced := &raceStore{Store: inner, hook: func() {
+		if err := inner.UpdateTaskStatus(ctx, "default", "task1", &v1alpha1.TaskStatus{
+			Phase: "Suspended", Actor: "task1", WorkerIp: workerAddr, Id: "id-1",
+		}); err != nil {
+			t.Fatal(err)
 		}
-	}
+	}}
 
-	reconciler := newTestReconcilerForServer(t, race)
-	monitor := controller.NewTaskMonitor(s, reconciler, 0)
+	mockSrv := &mockControlServer{getActorActor: runningActor()}
+	reconciler := newTestReconciler(t, mockSrv)
+	monitor := controller.NewTaskMonitor(raced, reconciler, 0)
 
 	start := time.Now()
 	sweepWithClock(ctx, monitor, start)
 	sweepWithClock(ctx, monitor, start.Add(45*time.Second))
 	sweepWithClock(ctx, monitor, start.Add(95*time.Second))
 
-	got, err := s.GetTask(ctx, "default", "task1")
+	got, err := inner.GetTask(ctx, "default", "task1")
 	if err != nil {
 		t.Fatal(err)
 	}
