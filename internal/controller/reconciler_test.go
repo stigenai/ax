@@ -160,6 +160,14 @@ func (m *mockControlServer) DeleteActor(ctx context.Context, req *ateapipb.Delet
 		return nil, status.Error(codes.Aborted, "actor UID differs")
 	}
 	name := req.GetActor().GetName()
+	for _, deleted := range m.deletedActors {
+		if deleted == name {
+			// Substrate returns NotFound for an actor already gone. The ax
+			// client treats that as a successful no-op, so a retried delete
+			// stays idempotent.
+			return nil, status.Error(codes.NotFound, "actor not found")
+		}
+	}
 	m.deletedActors = append(m.deletedActors, name)
 	return &ateapipb.Actor{Metadata: &ateapipb.ResourceMetadata{Name: name}}, nil
 }

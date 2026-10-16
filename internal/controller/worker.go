@@ -37,6 +37,12 @@ const (
 	// doubles on each consecutive ErrWaitingForCapacity result for that task.
 	requeueBackoffBase = 15 * time.Second
 	requeueBackoffMax  = 2 * time.Minute
+	// deleteBackoffBase and deleteBackoffMax bound the delay before the
+	// worker retries a task delete that failed to reconcile. The delay
+	// doubles on each consecutive failure for that task. There is no limit
+	// on the number of attempts.
+	deleteBackoffBase = 15 * time.Second
+	deleteBackoffMax  = 5 * time.Minute
 	// strandedTasksPageSize bounds one ListTasks call in the startup sweep.
 	strandedTasksPageSize = 200
 )
@@ -54,9 +60,17 @@ type Worker struct {
 	// tests. Both default to the production schedule when left zero.
 	BackoffBase time.Duration
 	BackoffMax  time.Duration
+	// DeleteBackoffBase and DeleteBackoffMax override the delete-retry
+	// schedule for tests. Both default to the production schedule when left
+	// zero.
+	DeleteBackoffBase time.Duration
+	DeleteBackoffMax  time.Duration
 
 	requeueMu       sync.Mutex
 	requeueAttempts map[string]int
+
+	deleteMu       sync.Mutex
+	deleteAttempts map[string]int
 }
 
 // NewWorker creates a worker that joins group as consumer. An empty group uses the
@@ -70,13 +84,16 @@ func NewWorker(s store.Store, reconciler *TaskReconciler, group, consumer string
 		consumer = fmt.Sprintf("%s-%d", hostname, time.Now().UnixNano()%10000)
 	}
 	return &Worker{
-		store:           s,
-		reconciler:      reconciler,
-		group:           group,
-		consumer:        consumer,
-		BackoffBase:     requeueBackoffBase,
-		BackoffMax:      requeueBackoffMax,
-		requeueAttempts: make(map[string]int),
+		store:             s,
+		reconciler:        reconciler,
+		group:             group,
+		consumer:          consumer,
+		BackoffBase:       requeueBackoffBase,
+		BackoffMax:        requeueBackoffMax,
+		DeleteBackoffBase: deleteBackoffBase,
+		DeleteBackoffMax:  deleteBackoffMax,
+		requeueAttempts:   make(map[string]int),
+		deleteAttempts:    make(map[string]int),
 	}
 }
 
@@ -96,6 +113,8 @@ func (w *Worker) Run(ctx context.Context) error {
 	// crash or restart strands none. This runs after Subscribe so a brand new
 	// consumer group's start position already covers the events it publishes.
 	w.requeueStrandedTasks(ctx)
+	// Retry every delete a previous process left Terminating, for the same reason.
+	w.requeueStrandedDeletions(ctx)
 
 	for {
 		ev, err := sub.Next(ctx)
@@ -130,12 +149,17 @@ func (w *Worker) Run(ctx context.Context) error {
 
 func (w *Worker) processEvent(ctx context.Context, ev store.TaskEvent) error {
 	if ev.Action == "delete" {
-		slog.Info("handling task deletion event", "atespace", ev.Atespace, "name", ev.Name)
+		slog.Info("handling task deletion event", "atespace", ev.Atespace, "name", ev.Name, "retry", ev.Retry)
 		task, err := w.store.GetTask(ctx, ev.Atespace, ev.Name)
 		if errors.Is(err, store.ErrNotFound) {
 			if ev.Deletion.ActorUID == "" && ev.Deletion.CreationTimestamp == "" {
 				// Legacy deletion still cleans up when the task key has expired.
-				return w.reconciler.ReconcileDelete(ctx, ev.Atespace, ev.Name)
+				if err := w.reconciler.ReconcileDelete(ctx, ev.Atespace, ev.Name); err != nil {
+					w.scheduleDeleteRetry(ctx, ev.Atespace, ev.Name, ev.Deletion, err)
+					return nil
+				}
+				w.clearDeleteBackoff(ev.Atespace, ev.Name)
+				return nil
 			}
 			if ev.Deletion.ActorUID == "" || ev.Deletion.CreationTimestamp == "" {
 				return store.ErrConflict
@@ -146,6 +170,13 @@ func (w *Worker) processEvent(ctx context.Context, ev store.TaskEvent) error {
 		if err != nil {
 			return err
 		}
+		// A retry delivered after the task moved on from Terminating (it was
+		// recreated, or another delivery already finished it) targets a stale
+		// deletion: skip it before any Substrate call.
+		if ev.Retry && task.GetStatus().GetPhase() != v1alpha1.PhaseTerminating {
+			slog.Info("skipping stale delete retry", "atespace", ev.Atespace, "name", ev.Name)
+			return nil
+		}
 		if err := ev.Deletion.Check(task); err != nil {
 			return err
 		}
@@ -153,10 +184,13 @@ func (w *Worker) processEvent(ctx context.Context, ev store.TaskEvent) error {
 			return store.ErrConflict
 		}
 		if err := w.reconciler.ReconcileDelete(ctx, ev.Atespace, ev.Name, ev.Deletion.ActorUID); err != nil {
-			// Leave the record in Terminating so the failure is visible; re-running
-			// `ax delete` republishes the event and retries the cleanup.
-			return fmt.Errorf("cleaning up task %s/%s: %w", ev.Atespace, ev.Name, err)
+			// Retry instead of leaving the record in Terminating forever: a
+			// transient Substrate failure (for example, a worker pod OOMKill
+			// mid-delete) must not strand the actor holding its worker slot.
+			w.scheduleDeleteRetry(ctx, ev.Atespace, ev.Name, ev.Deletion, err)
+			return nil
 		}
+		w.clearDeleteBackoff(ev.Atespace, ev.Name)
 		if err := w.store.DeleteTask(ctx, ev.Atespace, ev.Name, ev.Deletion); err != nil {
 			return fmt.Errorf("removing task record %s/%s: %w", ev.Atespace, ev.Name, err)
 		}
@@ -263,6 +297,105 @@ func (w *Worker) clearRequeueBackoff(atespace, name string) {
 	w.requeueMu.Lock()
 	delete(w.requeueAttempts, atespace+"/"+name)
 	w.requeueMu.Unlock()
+}
+
+// scheduleDeleteRetry republishes a failed task deletion after a backoff.
+// The backoff doubles on each consecutive failure for the same task, up to
+// w.DeleteBackoffMax. It never gives up. A stuck actor that holds its worker
+// assignment forever costs more than one more retry. The retry runs in its
+// own goroutine, so it never blocks the event loop.
+func (w *Worker) scheduleDeleteRetry(ctx context.Context, atespace, name string, deletion store.TaskDeletePreconditions, cause error) {
+	key := atespace + "/" + name
+
+	base, max := w.DeleteBackoffBase, w.DeleteBackoffMax
+	if base <= 0 {
+		base = deleteBackoffBase
+	}
+	if max <= 0 {
+		max = deleteBackoffMax
+	}
+
+	w.deleteMu.Lock()
+	if w.deleteAttempts == nil {
+		w.deleteAttempts = make(map[string]int)
+	}
+	attempt := w.deleteAttempts[key]
+	w.deleteAttempts[key] = attempt + 1
+	w.deleteMu.Unlock()
+
+	backoff := base
+	for i := 0; i < attempt && backoff < max; i++ {
+		backoff *= 2
+	}
+	if backoff > max {
+		backoff = max
+	}
+
+	slog.Warn("task delete failed, retrying", "atespace", atespace, "name", name,
+		"attempt", attempt+1, "next_retry", backoff, "error", cause)
+
+	go func() {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+		if err := w.store.RequeueTaskDeletion(context.Background(), atespace, name, deletion); err != nil {
+			slog.Warn("failed to requeue task deletion", "atespace", atespace, "name", name, "error", err)
+		}
+	}()
+}
+
+// clearDeleteBackoff resets a task's delete-retry schedule once its deletion
+// reconciles without error, so a later deletion of the same name starts its
+// own schedule at DeleteBackoffBase.
+func (w *Worker) clearDeleteBackoff(atespace, name string) {
+	w.deleteMu.Lock()
+	delete(w.deleteAttempts, atespace+"/"+name)
+	w.deleteMu.Unlock()
+}
+
+// requeueStrandedDeletions retries every task a previous controller process
+// left Terminating, with no backoff: a restart is not a new delete failure.
+// A supervisor-profile task's ActorUID and CreationTimestamp preconditions
+// are not stored on the record, so this function skips it. Re-run `ax
+// delete` with its identity to clean it up. This logs and continues past a
+// listing or requeue error, so one bad page or task cannot stop the worker
+// from starting.
+func (w *Worker) requeueStrandedDeletions(ctx context.Context) {
+	var offset int64
+	var requeued, skipped int
+	for {
+		tasks, err := w.store.ListTasks(ctx, "*", strandedTasksPageSize, offset)
+		if err != nil {
+			slog.Warn("delete sweep: failed to list tasks", "error", err)
+			return
+		}
+		for _, task := range tasks {
+			if task.GetStatus().GetPhase() != v1alpha1.PhaseTerminating {
+				continue
+			}
+			atespace := task.GetMetadata().GetAtespace()
+			name := task.GetMetadata().GetName()
+			if task.GetSpec().GetSupervisorProfile() != "" {
+				slog.Warn("delete sweep: skipping protected task, re-run ax delete with its identity",
+					"atespace", atespace, "name", name)
+				skipped++
+				continue
+			}
+			if err := w.store.RequeueTaskDeletion(ctx, atespace, name, store.TaskDeletePreconditions{}); err != nil {
+				slog.Warn("delete sweep: failed to requeue task deletion", "atespace", atespace, "name", name, "error", err)
+				continue
+			}
+			slog.Info("delete sweep: requeued a terminating task", "atespace", atespace, "name", name)
+			requeued++
+		}
+		if int64(len(tasks)) < strandedTasksPageSize {
+			break
+		}
+		offset += strandedTasksPageSize
+	}
+	slog.Info(fmt.Sprintf("delete sweep: requeued %d terminating tasks, skipped %d protected", requeued, skipped))
 }
 
 // requeueStrandedTasks retries every task left waiting for Substrate capacity
