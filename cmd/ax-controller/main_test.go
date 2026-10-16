@@ -76,7 +76,7 @@ func TestResolveDefaultTaskMemory(t *testing.T) {
 	}
 }
 
-func TestResolveMaxTaskMemory(t *testing.T) {
+func TestResolveMaxQuantity(t *testing.T) {
 	cases := []struct {
 		name    string
 		value   string
@@ -88,22 +88,26 @@ func TestResolveMaxTaskMemory(t *testing.T) {
 		{name: "a quantity parses and passes through", value: "16Gi", want: "16Gi"},
 		{name: "a value that does not parse as a quantity is an error", value: "not-a-quantity", wantErr: true},
 		{name: "a negative quantity is an error", value: "-1Gi", wantErr: true},
+		{name: "a cpu quantity parses and passes through", value: "6", want: "6"},
+		{name: "a cpu quantity in millicores parses and passes through", value: "6000m", want: "6000m"},
+		{name: "a negative cpu quantity is an error", value: "-1", wantErr: true},
+		{name: "a cpu value abc does not parse as a quantity", value: "abc", wantErr: true},
 	}
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := resolveMaxTaskMemory(tt.value)
+			got, err := resolveMaxQuantity(tt.value)
 			if tt.wantErr {
 				if err == nil {
-					t.Fatalf("resolveMaxTaskMemory(%q) = %v, nil; want an error", tt.value, got)
+					t.Fatalf("resolveMaxQuantity(%q) = %v, nil; want an error", tt.value, got)
 				}
 				return
 			}
 			if err != nil {
-				t.Fatalf("resolveMaxTaskMemory(%q) returned an unexpected error: %v", tt.value, err)
+				t.Fatalf("resolveMaxQuantity(%q) returned an unexpected error: %v", tt.value, err)
 			}
 			want := resource.MustParse(tt.want)
 			if got.Cmp(want) != 0 {
-				t.Fatalf("resolveMaxTaskMemory(%q) = %v, want %v", tt.value, got.String(), want.String())
+				t.Fatalf("resolveMaxQuantity(%q) = %v, want %v", tt.value, got.String(), want.String())
 			}
 		})
 	}
