@@ -20,19 +20,41 @@ spec:
     # between all tasks placed on it. One OOM kills every task on that
     # worker.
     #
-    # Tests on 2026-10-15 measured the memory each task needs. Each task
-    # needs about 2200Mi. An idle worker needs about 400Mi.
+    # A single kubectl top sample on 2026-10-15 measured one task's memory
+    # at about 2200Mi. This is a point-in-time delta. It is not a peak or a
+    # load test. An idle worker used about 400Mi.
     #
-    # Six workers at 16Gi (16384Mi) hold 7 tasks per worker: math is
-    # 7*2200+400=15800Mi. A test with 200,000 trials placed 20 tasks at
-    # random across 6 workers. The test shows a 16Gi worker goes over its
-    # limit in about 7 of 100 trials. This is the lowest risk among the
-    # options sized for 20 tasks.
+    # Six workers at 16Gi (16384Mi) hold 7 tasks per worker. The calculation
+    # is 7*2200+400=15800Mi. The simulation places 20 tasks at random across
+    # the workers. It runs 200,000 trials. Each worker's capacity is set by
+    # floor((limit-400Mi)/2200Mi).
+    #
+    # The simulation gives this probability, P(at least one of the N workers
+    # exceeds its limit), for each option:
+    #   - 4 workers at 20Gi: 5.55%
+    #   - 8 workers at 14Gi: 6.67%
+    #   - 6 workers at 16Gi: 6.74%
+    #   - 5 workers at 16Gi: 16.0%
+    #   - 8 workers at 12Gi: 24.2%
+    #   - 6 workers at 12Gi: 55.4%
+    #
+    # 6 workers at 16Gi is not the lowest-risk option. It accepts a little
+    # more risk. The risk is 6.74% here, vs 5.55% for 4x20Gi and 6.67% for
+    # 8x14Gi.
+    #
+    # In return, it gives three benefits:
+    #   - A smaller blast radius per OOM: 1/6 of total capacity is lost,
+    #     vs 1/4 for 4x20Gi.
+    #   - A smaller per-pod memory request: 8Gi. The scheduler fits it more
+    #     easily than the bigger 4x20Gi pods.
+    #   - A smaller total limit across all workers: 96Gi, vs 112Gi for 8x14Gi.
+    #
+    # See ax-ci8 for the full placement model, the node headroom check and
+    # the rejected options.
     #
     # The 8Gi (8192Mi) request equals the average load per worker at 20
-    # tasks: math is 20/6*2200+400=7733Mi. This lets the scheduler place
-    # workers by their real need. See ax-ci8 for the full placement model,
-    # the node headroom check and the rejected options.
+    # tasks. The calculation is 20/6*2200+400=7733Mi. This lets the scheduler
+    # place workers by their real need.
     resources:
       limits:
         cpu: "4"

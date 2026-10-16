@@ -1,16 +1,23 @@
 #!/usr/bin/env bash
 # Read-only measurement recipe for sizing the ax WorkerPool (ax-ci8).
 #
-# This script reads the live gtr cluster. It prints 4 reports.
-# Report 1 is the WorkerPool's live spec: replicas, requests, limits.
-# Report 2 is each worker pod's node, restart count and top usage now.
-# Report 3 is each worker pod's last OOMKilled event. It gives the reason,
-# the exit code, and the start and finish time of the killed instance.
-# Use these times to date the known OOM incidents. Do not guess the times.
-# Report 4 covers every node with the pool's nodeSelector. It gives the
-# allocatable memory, the top usage now, and the scheduler's view
-# (Allocated resources: Requests and Limits). Use it to check a resize
-# still fits a node with room to spare.
+# This script reads the live gtr cluster. It prints 7 sections under
+# their own "## " headings:
+#   1. WorkerPool spec: the live replicas, requests and limits.
+#   2. Worker pods: each pod's node, restart count and age.
+#   3. Current top: each pod's memory and CPU use now.
+#   4. Last OOMKilled instance per pod: the reason, the exit code, and
+#      the start and finish time of the killed instance.
+#   5. Nodes carrying the pool's nodeSelector: the allocatable memory of
+#      each node.
+#   6. Node top: each node's memory and CPU use now.
+#   7. Node allocated resources: the scheduler's view of each node
+#      (Requests and Limits).
+#
+# Use section 4's times to date the known OOM incidents. Do not guess
+# the times.
+#
+# Use section 7 to check a resize still fits a node with room to spare.
 #
 # Every command is read-only: get, top, or describe. Run the script again
 # at any time to refresh the numbers. It does not change cluster state.
