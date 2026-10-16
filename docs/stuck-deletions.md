@@ -35,8 +35,11 @@ Read the `stuck` field in each line:
   - If `AxStuckDeletions` still fires, check the alert's query and time
     range in Grafana.
 - `stuck>0`: the line also has these fields: `stuck_tasks`, `stuck_actors`,
-  `protected`, `requeued`, `requeue_failed`, `actor_list_error`, and
-  `min_age`.
+  `protected`, `requeued`, `requeue_failed`, `task_list_error`,
+  `actor_list_error`, and `min_age`.
+  - `task_list_error=true` means the sweep did not list tasks this tick.
+    `stuck_tasks` is 0 on that line, but this is not an all-clear: the
+    sweep did not check tasks at all that tick.
   - `requeued` counts tasks for which the sweep already sent a delete.
   - Wait one more tick (the sweep's interval). Then check again before you
     act further.
@@ -99,8 +102,10 @@ The PR #9 retry in `ax-controller`
 `DeleteActor` with backoff.
 
 The periodic `DeletionSweeper` (this runbook's feature, ax-706) publishes the
-delete again for any `Terminating` task or `DELETING` actor. It does this for
-each task or actor that the retry still misses.
+delete again for a stuck `Terminating` task that the retry still misses. For
+a stuck `DELETING` actor, the sweep only counts and logs it (see "What the
+sweep does not do" below); step 2 and step 3 cover what to do about one by
+hand.
 
 Follow these steps if one of these conditions is true:
 
@@ -108,10 +113,15 @@ Follow these steps if one of these conditions is true:
   not drop after a few ticks.
 - `AxDeleteSweepMissing` fires.
 
-1. Restart `ax-controller`. Its startup path
-   (`Worker.requeueStrandedDeletions`, `internal/controller/worker.go:115-117`)
-   runs the same requeue sweep once at boot, before the ticker starts. A restart
-   alone often clears a backlog that the ticker cannot.
+1. Restart `ax-controller`. Its startup path calls the
+   `Worker.requeueStrandedDeletions` function (`internal/controller/worker.go`,
+   called from `Worker.Run`). This runs the same requeue sweep once at boot,
+   before the ticker starts.
+   - `requeueStrandedDeletions` sends the same empty-precondition requeue the
+     ticker sweep does. A restart does not publish a different delete.
+   - A restart drops every in-memory retry chain (`scheduleDeleteRetry`) and
+     starts a fresh Redis stream consumer. This also redelivers a stuck
+     delivery that no worker has acknowledged (tracked as ax-bsl).
 2. If actors are still `DELETING` after a restart, check whether the
    underlying Substrate actor is dead.
    - Substrate never marks a crashed sandbox on its own. The actor stays
