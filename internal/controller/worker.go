@@ -405,6 +405,11 @@ func (w *Worker) scheduleDeleteRetry(ctx context.Context, atespace, name string,
 		clearOwnMark()
 		if err := w.store.RequeueTaskDeletion(context.Background(), atespace, name, deletion); err != nil {
 			slog.Warn("failed to requeue task deletion", "atespace", atespace, "name", name, "error", err)
+			// clearOwnMark already ran, so this call starts the next chain
+			// at attempt+1 (a longer backoff). If another chain is already
+			// pending for this key, it only logs and returns, which is
+			// correct: that chain's own retry still covers this failure.
+			w.scheduleDeleteRetry(ctx, atespace, name, deletion, fmt.Errorf("requeue task deletion: %w", err))
 		}
 	}()
 }

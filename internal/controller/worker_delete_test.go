@@ -718,3 +718,47 @@ func TestScheduleDeleteRetryUsesBackoffAndJitter(t *testing.T) {
 		}
 	}
 }
+
+// TestDeleteRetrySurvivesFailedRequeue covers ax-atj AC4: when the
+// delete-retry goroutine's own RequeueTaskDeletion call fails, it must
+// start a new retry chain (attempt+1) instead of dropping the retry until
+// the next restart or sweep tick. It fails on the pre-fix code: the first
+// requeue failure only logs a warning and no event, and no second chain,
+// ever follows.
+func TestDeleteRetrySurvivesFailedRequeue(t *testing.T) {
+	ctx := context.Background()
+	base := memory.NewStore()
+	task := &v1alpha1.Task{Metadata: &v1alpha1.ObjectMeta{Name: "job", Atespace: "private"}}
+	if err := base.SaveTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	sub, err := base.Subscribe(ctx, "g", "c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	drainN(t, sub, 1) // SaveTask's own reconcile event.
+
+	wrapped := &failNRequeueStore{Store: base, remainingFails: 1}
+	w := NewWorker(wrapped, nil, "", "")
+	w.DeleteBackoffBase = 10 * time.Millisecond
+	w.DeleteBackoffMax = 10 * time.Millisecond
+
+	w.scheduleDeleteRetry(ctx, "private", "job", store.TaskDeletePreconditions{}, errors.New("boom"))
+
+	readCtx, readCancel := context.WithTimeout(ctx, 2*time.Second)
+	ev, err := sub.Next(readCtx)
+	readCancel()
+	if err != nil {
+		t.Fatalf("want a delete event after the requeue retries past the dropped call: %v", err)
+	}
+	if !ev.Retry || ev.Action != "delete" {
+		t.Fatalf("unexpected event: %+v", ev)
+	}
+
+	w.deleteMu.Lock()
+	attempt := w.deleteAttempts["private/job"]
+	w.deleteMu.Unlock()
+	if attempt != 2 {
+		t.Fatalf("want deleteAttempts 2 (the original failure plus the dropped requeue's own retry), got %d", attempt)
+	}
+}

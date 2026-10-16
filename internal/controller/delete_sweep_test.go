@@ -150,10 +150,15 @@ func newDeletionTestClient(t *testing.T, control *deletionControlServer) *substr
 }
 
 // TestDeleteSweepRequeuesAfterDroppedWorkerRetry covers AC1: DeleteActor
-// fails once, the worker's own scheduleDeleteRetry then also fails to
-// requeue once, so the task sits Terminating with no pending retry at all.
-// One DeletionSweeper.SweepOnce after MinAge requeues the delete, and
-// processEvent on that requeued event finally removes the task.
+// fails once, and the worker process then exits before its own
+// scheduleDeleteRetry chain fires (ax-atj.4 made a requeue failure retry
+// itself, so a store or Substrate hiccup alone no longer drops the chain;
+// only a process exit mid-backoff now loses it, exactly as
+// requeueStrandedDeletions already assumes on restart). Simulate the exit
+// by cancelling the context the chain's goroutine sleeps on: the task sits
+// Terminating with no pending retry at all. One DeletionSweeper.SweepOnce
+// after MinAge requeues the delete, and processEvent on that requeued
+// event finally removes the task.
 func TestDeleteSweepRequeuesAfterDroppedWorkerRetry(t *testing.T) {
 	control := &deletionControlServer{
 		deletions:      make(chan *ateapipb.DeleteActorRequest, 4),
@@ -164,7 +169,6 @@ func TestDeleteSweepRequeuesAfterDroppedWorkerRetry(t *testing.T) {
 
 	ctx := context.Background()
 	base := memory.NewStore()
-	wrapped := &failNRequeueStore{Store: base, remainingFails: 1}
 
 	created := time.Now().UTC()
 	task := &v1alpha1.Task{Metadata: &v1alpha1.ObjectMeta{Name: "stuck", Atespace: "default", CreationTimestamp: timestamppb.New(created)}}
@@ -183,9 +187,12 @@ func TestDeleteSweepRequeuesAfterDroppedWorkerRetry(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	worker := NewWorker(wrapped, NewTaskReconciler(client, "default-template", "ax-system"), "", "")
-	worker.DeleteBackoffBase = 10 * time.Millisecond
-	worker.DeleteBackoffMax = 20 * time.Millisecond
+	worker := NewWorker(base, NewTaskReconciler(client, "default-template", "ax-system"), "", "")
+	// A backoff far longer than this test's own run time, so cancelling
+	// workerCtx below reliably beats the timer (ctx.Done() wins the
+	// select), the same technique TestDeleteSweepDoesNotMultiplyRetryChainsOnRepeatedFailure uses.
+	worker.DeleteBackoffBase = time.Minute
+	worker.DeleteBackoffMax = time.Minute
 
 	readCtx, readCancel := context.WithTimeout(ctx, 2*time.Second)
 	ev, err := sub.Next(readCtx)
@@ -193,19 +200,20 @@ func TestDeleteSweepRequeuesAfterDroppedWorkerRetry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("no initial delete event: %v", err)
 	}
-	if err := worker.processEvent(context.Background(), ev); err != nil {
+	workerCtx, cancelWorker := context.WithCancel(ctx)
+	if err := worker.processEvent(workerCtx, ev); err != nil {
 		t.Fatalf("processEvent on the first delivery: %v", err)
 	}
-
-	// scheduleDeleteRetry's goroutine fires after DeleteBackoffBase and
-	// calls wrapped.RequeueTaskDeletion, which fails once: the worker's own
-	// retry drops here, with no event published for it.
-	time.Sleep(60 * time.Millisecond)
+	// The process exits right after scheduling the retry: its goroutine
+	// is still asleep on the 1-minute backoff above, so it wakes on
+	// ctx.Done() instead, clears its own mark, and never requeues.
+	cancelWorker()
+	time.Sleep(50 * time.Millisecond)
 	assertNoEvent(t, sub)
 
 	now := time.Now()
 	sweeper := &DeletionSweeper{
-		Store:  wrapped,
+		Store:  base,
 		MinAge: 15 * time.Minute,
 		Now:    func() time.Time { return now },
 	}
@@ -224,7 +232,7 @@ func TestDeleteSweepRequeuesAfterDroppedWorkerRetry(t *testing.T) {
 		t.Fatalf("unexpected requeued event: %+v", retryEv)
 	}
 
-	if err := worker.processEvent(context.Background(), retryEv); err != nil {
+	if err := worker.processEvent(ctx, retryEv); err != nil {
 		t.Fatalf("processEvent on the sweep's retry: %v", err)
 	}
 
