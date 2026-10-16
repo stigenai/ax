@@ -526,3 +526,69 @@ func TestRequeueStrandedDeletionsOnStart(t *testing.T) {
 		t.Fatal("running task record lost")
 	}
 }
+
+// ax-bsl.7: a Reconcile can read a task, then write its result after
+// MarkTaskDeleting sets Terminating. That write must not clear Terminating.
+// A clear leaves the delete event skipped as stale (the ax-bsl.4 guard),
+// and the task is never deleted. This task has no SupervisorProfile: an
+// earlier store guard protected only a supervisor task, so this case was
+// red before the fix.
+func TestDeleteSurvivesStatusWriteRacingMarkTaskDeletingForOrdinaryTask(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	control := &deletionControlServer{deletions: make(chan *ateapipb.DeleteActorRequest, 4), templates: make(chan *ateapipb.ListActorTemplatesRequest, 4)}
+	server := grpc.NewServer()
+	ateapipb.RegisterControlServer(server, control)
+	go server.Serve(listener)
+	t.Cleanup(server.Stop)
+	client, err := substrate.NewClient(listener.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+
+	ctx := context.Background()
+	s := memory.NewStore()
+	task := &v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{Name: "raced", Atespace: "private"},
+		Status:   &v1alpha1.TaskStatus{Phase: "Pending"},
+	}
+	if err := s.SaveTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+
+	// MarkTaskDeleting flips the task to Terminating and queues the delete
+	// event, exactly as a bare "ax delete" (no actor_uid) does.
+	if err := s.MarkTaskDeleting(ctx, "private", "raced"); err != nil {
+		t.Fatal(err)
+	}
+
+	// A Reconcile started before the mark above lands its write here: the
+	// worker observed "Running" before MarkTaskDeleting ran.
+	if err := s.UpdateTaskStatus(ctx, "private", "raced", &v1alpha1.TaskStatus{Phase: "Running"}); err != nil {
+		t.Fatal(err)
+	}
+
+	current, err := s.GetTask(ctx, "private", "raced")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.GetStatus().GetPhase() != v1alpha1.PhaseTerminating {
+		t.Fatalf("UpdateTaskStatus cleared Terminating: phase %q", current.GetStatus().GetPhase())
+	}
+
+	worker := NewWorker(s, NewTaskReconciler(client, "default-template", "ax-system"), "", "")
+	ev := store.TaskEvent{Atespace: "private", Name: "raced", Action: "delete"}
+	if err := worker.processEvent(ctx, ev); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.GetTask(ctx, "private", "raced"); err == nil {
+		t.Fatal("delete event skipped as stale: the race left the task Running forever")
+	}
+	if control.Attempts() != 1 {
+		t.Fatalf("want 1 DeleteActor attempt, got %d", control.Attempts())
+	}
+}

@@ -104,6 +104,55 @@ func TestProtectedDeleteRedisRetention(t *testing.T) {
 	}
 }
 
+// ax-bsl.7: UpdateTaskStatus must keep Terminating for an ordinary task
+// too, not only a supervisor task. A stale write that still thinks the
+// task is Running must not clear Terminating.
+func TestOrdinaryUpdateTaskStatusKeepsTerminatingRedis(t *testing.T) {
+	address := os.Getenv("AX_DELETE_TEST_REDIS_ADDRESS")
+	if address == "" {
+		t.Skip("requires explicit disposable AX_DELETE_TEST_REDIS_ADDRESS")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	client := redisclient.NewClient(&redisclient.Options{Addr: address})
+	defer client.Close()
+	if err := client.Ping(ctx).Err(); err != nil {
+		t.Fatal(err)
+	}
+	prefix := fmt.Sprintf("ax-ordinary-terminating-test-%d", time.Now().UnixNano())
+	s := NewStore(client, Options{KeyPrefix: prefix, StreamName: prefix + ":events"})
+	task := &v1alpha1.Task{Metadata: &v1alpha1.ObjectMeta{Name: "job", Atespace: "private"}}
+	if err := s.SaveTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkTaskDeleting(ctx, "private", "job"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.UpdateTaskStatus(ctx, "private", "job", &v1alpha1.TaskStatus{Phase: "Running"}); err != nil {
+		t.Fatal(err)
+	}
+	current, err := s.GetTask(ctx, "private", "job")
+	if err != nil || current.GetStatus().GetPhase() != v1alpha1.PhaseTerminating {
+		t.Fatalf("UpdateTaskStatus cleared Terminating for an ordinary task: %v, phase=%q", err, current.GetStatus().GetPhase())
+	}
+
+	applied, err := s.UpdateTaskStatusIf(ctx, "private", "job",
+		func(*v1alpha1.TaskStatus) bool { return true },
+		&v1alpha1.TaskStatus{Phase: "Running"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if applied {
+		t.Fatal("UpdateTaskStatusIf cleared Terminating for an ordinary task")
+	}
+	current, err = s.GetTask(ctx, "private", "job")
+	if err != nil || current.GetStatus().GetPhase() != v1alpha1.PhaseTerminating {
+		t.Fatalf("UpdateTaskStatusIf cleared Terminating for an ordinary task: %v, phase=%q", err, current.GetStatus().GetPhase())
+	}
+}
+
 func TestProtectedDeleteRedisConcurrentReplacement(t *testing.T) {
 	address := os.Getenv("AX_DELETE_TEST_REDIS_ADDRESS")
 	if address == "" {
