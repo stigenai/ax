@@ -66,8 +66,6 @@ spec:
     #
     # ax-9qu increased this quantity from 4Gi to 8Gi. A Claude Code session
     # needs more than 4Gi. A Go or Node build also needs more than 4Gi.
-    # The person set this value by hand, live, at 8Gi on 2026-10-16 03:20Z.
-    # This repo now matches that live value.
     #
     # At this time, a 16Gi (16384Mi) worker accepts at most 2 tasks.
     # 2*8192Mi=16384Mi equals the worker limit exactly. 3*8192Mi=24576Mi is
