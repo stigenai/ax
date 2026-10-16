@@ -222,7 +222,11 @@ func (w *Worker) processEvent(ctx context.Context, ev store.TaskEvent) error {
 		if err := w.store.DeleteTask(ctx, ev.Atespace, ev.Name, ev.Deletion); err != nil {
 			if errors.Is(err, store.ErrConflict) {
 				// The record changed incarnation under the worker: no
-				// retry is safe or correct for this event anymore.
+				// retry is safe or correct for this event anymore. Clear
+				// any stale deleteAttempts count for this key so a later
+				// real failure for the new incarnation starts counting
+				// from zero, not from this event's count.
+				w.clearIdleDeleteAttempts(ev.Atespace, ev.Name)
 				return err
 			}
 			// Retry the whole delete event instead of leaving the record

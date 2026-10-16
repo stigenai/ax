@@ -849,9 +849,13 @@ func TestDeleteRetriesWhenTaskRecordRemovalFails(t *testing.T) {
 }
 
 // TestDeleteTaskConflictReturnsErrorWithNoRetry covers ax-atj AC1's second
-// half: a DeleteTask ErrConflict means the record changed incarnation
-// under the worker, so processEvent must return the conflict with no retry
-// chain started.
+// half. A DeleteTask ErrConflict means the record changed incarnation
+// under the worker. processEvent must return the conflict and start no
+// retry chain. processEvent must also clear any stale deleteAttempts
+// count for this key, so the next real failure starts a fresh count
+// (ax-atj.7). The test fails on pre-ax-atj.7 code. There, the ErrConflict
+// branch returns err and skips the clearIdleDeleteAttempts call. The
+// deleteAttempts count still reads 3 after the call.
 func TestDeleteTaskConflictReturnsErrorWithNoRetry(t *testing.T) {
 	control := &deletionControlServer{deletions: make(chan *ateapipb.DeleteActorRequest, 4), templates: make(chan *ateapipb.ListActorTemplatesRequest, 4)}
 	client := newDeletionTestClient(t, control)
@@ -875,10 +879,12 @@ func TestDeleteTaskConflictReturnsErrorWithNoRetry(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	wrapped := &failNDeleteTaskStore{Store: base}
-	wrapped.remainingFails = 0
-	conflictStore := &conflictDeleteTaskStore{Store: wrapped}
+	conflictStore := &conflictDeleteTaskStore{Store: base}
 	worker := NewWorker(conflictStore, NewTaskReconciler(client, "default-template", "ax-system"), "", "")
+
+	worker.deleteMu.Lock()
+	worker.deleteAttempts["private/conflicted"] = 3
+	worker.deleteMu.Unlock()
 
 	readCtx, readCancel := context.WithTimeout(ctx, 2*time.Second)
 	ev, err := sub.Next(readCtx)
@@ -892,9 +898,13 @@ func TestDeleteTaskConflictReturnsErrorWithNoRetry(t *testing.T) {
 
 	worker.deleteMu.Lock()
 	_, pending := worker.deletePending["private/conflicted"]
+	attempt, attempted := worker.deleteAttempts["private/conflicted"]
 	worker.deleteMu.Unlock()
 	if pending {
 		t.Fatal("a DeleteTask conflict must not start a retry chain")
+	}
+	if attempted {
+		t.Fatalf("a DeleteTask conflict must clear the stale deleteAttempts count, still got %d", attempt)
 	}
 }
 
