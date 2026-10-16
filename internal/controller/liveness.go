@@ -16,338 +16,319 @@ package controller
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"io"
 	"log/slog"
-	"net"
 	"net/http"
-	"os"
-	"regexp"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"github.com/google/ax/internal/store"
+	"github.com/google/ax/internal/substrate"
 	"github.com/google/ax/pkg/apis/v1alpha1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
-// maxCrashMessageBytes bounds how much of Substrate's crash message, or a
-// liveness probe's own failure message, reaches a task's status. This keeps
-// an oversized message from growing the stored record without limit.
-const maxCrashMessageBytes = 512
+// DefaultLivenessThreshold is how many consecutive stale misses a Running
+// task tolerates before SweepOnce marks it Failed.
+const DefaultLivenessThreshold = 3
 
-// oomPattern matches a crash message that names an out-of-memory kill.
-// Substrate's crash message is the only OOM signal ax has today: nothing
-// reads the sandbox's cgroup memory.events (ax-j8u asks Substrate to add a
-// direct signal).
-var oomPattern = regexp.MustCompile(`(?i)\boom\b|out of memory`)
-
-// classifyActorLoss decides whether a Running task's actor is lost, given a
-// Client.GetActor result. It is pure. The same actor and error always give
-// the same verdict. So a test can check it with no call to Substrate.
-//
-// A gRPC NotFound error means the actor record itself is gone. The reason is
-// ActorLost. State ACTOR_STATE_CRASHED means the sandbox died. The reason is
-// OOMKilled when the crash message matches oomPattern, and ActorCrashed
-// otherwise. Any other state, or any other error, is not loss. A RUNNING
-// actor instead goes to a liveness probe. A transient Substrate error must
-// not fail a live task.
-func classifyActorLoss(actor *ateapipb.Actor, getErr error) (reason, message string, lost bool) {
-	if getErr != nil {
-		if status.Code(getErr) == codes.NotFound {
-			return "ActorLost", truncateMessage(getErr.Error()), true
-		}
-		return "", "", false
-	}
-	if actor.GetStatus().GetState() != ateapipb.ActorState_ACTOR_STATE_CRASHED {
-		return "", "", false
-	}
-	msg := truncateMessage(actor.GetStatus().GetCrash().GetMessage())
-	if oomPattern.MatchString(msg) {
-		return "OOMKilled", msg, true
-	}
-	return "ActorCrashed", msg, true
-}
-
-// truncateMessage bounds msg to maxCrashMessageBytes, so a status field
-// never grows without limit.
-func truncateMessage(msg string) string {
-	if len(msg) > maxCrashMessageBytes {
-		return msg[:maxCrashMessageBytes]
-	}
-	return msg
-}
-
-// readyzProbe is one /readyz response: the HTTP status code and the body.
-type readyzProbe struct {
-	statusCode int
-	body       string
-}
-
-// readyzStatusOK is the alive predicate Reconcile's workspace-ready poll
-// uses: only a 200 counts, matching its behavior before probeReadyz existed.
-func readyzStatusOK(p readyzProbe) bool {
-	return p.statusCode == http.StatusOK
-}
-
-// readyzAlive is the alive predicate the liveness monitor uses: a 200, or a
-// 503 that names workspace setup as the cause, both mean the runner itself
-// is alive even though workspace setup has not finished. The 503 body comes
-// from internal/metadata/server.go's handleReadyz.
-func readyzAlive(p readyzProbe) bool {
-	if p.statusCode == http.StatusOK {
-		return true
-	}
-	return p.statusCode == http.StatusServiceUnavailable && strings.Contains(p.body, "workspace initializing")
-}
-
-// probeReadyz checks a runner's /readyz endpoint for workerIP: first a
-// direct connection, then, if that attempt does not satisfy alive, the
-// in-cluster atenet-router with an ate-target-actor header. It stops at the
-// first attempt alive accepts, and returns that probe with ok true. When no
-// attempt satisfies alive (including when every attempt fails outright, a
-// network error), it returns the last probe it got a response for, if any,
-// and ok false.
-func (r *TaskReconciler) probeReadyz(ctx context.Context, workerIP, atespace, actorName string, alive func(readyzProbe) bool) (readyzProbe, bool) {
-	host := workerIP
-	port := "80"
-	if h, p, err := net.SplitHostPort(workerIP); err == nil {
-		host = h
-		port = p
-	}
-
-	type attempt struct {
-		url    string
-		header string
-	}
-	attempts := []attempt{{url: fmt.Sprintf("http://%s:%s/readyz?check=workspace", host, port)}}
-	if routerAddr := os.Getenv("ATENET_ROUTER_ADDR"); routerAddr != "" {
-		attempts = append(attempts, attempt{
-			url:    fmt.Sprintf("http://%s/readyz?check=workspace", routerAddr),
-			header: fmt.Sprintf("%s/%s", atespace, actorName),
-		})
-	}
-
-	var last readyzProbe
-	for _, a := range attempts {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.url, nil)
-		if err != nil {
-			continue
-		}
-		if a.header != "" {
-			req.Header.Set("ate-target-actor", a.header)
-		}
-		resp, err := r.httpClient.Do(req)
-		if err != nil {
-			continue
-		}
-		body, _ := io.ReadAll(resp.Body)
-		_ = resp.Body.Close()
-		last = readyzProbe{statusCode: resp.StatusCode, body: string(body)}
-		if alive(last) {
-			return last, true
-		}
-	}
-	return last, false
-}
-
-// monitorPageSize bounds one ListTasks call in a liveness sweep.
-const monitorPageSize = 200
-
-// sandboxUnresponsiveMisses and sandboxUnresponsiveWindow bound when the
-// monitor fails a RUNNING actor whose runner stops answering /readyz. It
-// takes this many consecutive dead probes, spanning at least this long, so
-// one slow sweep or a single blip does not fail a live task.
+// reasonActorLost and reasonActorMissing are the Ready condition reasons
+// SweepOnce sets on a task it fails. reasonActorMissing applies when
+// Substrate no longer knows the actor at all; reasonActorLost applies when
+// Substrate still reports it RUNNING on the same worker that rejected it.
 const (
-	sandboxUnresponsiveMisses = 3
-	sandboxUnresponsiveWindow = 90 * time.Second
+	reasonActorLost    = "ActorLost"
+	reasonActorMissing = "ActorMissing"
 )
 
-// livenessMiss tracks one task's run of consecutive dead /readyz probes.
-type livenessMiss struct {
-	count int
-	first time.Time
-}
-
-// TaskMonitor watches every Running task's actor and runner, and fails a
-// task whose sandbox is gone instead of leaving it Running forever with a
-// dead actor underneath it.
-type TaskMonitor struct {
-	store      store.Store
-	reconciler *TaskReconciler
-
-	// Interval is how often Run sweeps every Running task. Interval <= 0
-	// disables the monitor: Run returns at once and does nothing.
-	Interval time.Duration
-
-	// Now returns the current time. Tests replace it so the
-	// sandboxUnresponsiveWindow check needs no real sleep.
-	Now func() time.Time
+// LivenessChecker probes every Running task's actor through atenet-router.
+// A worker that restarts its container in place keeps the same pod IP but
+// loses its activation map, so atenet-router answers every request for an
+// actor it held with a 421 forever (ax-lox). SweepOnce finds this case and
+// moves the task to Failed with a reason, instead of leaving it Running
+// with a route that can never succeed.
+type LivenessChecker struct {
+	Store     store.Store
+	Substrate *substrate.Client
+	// RouterAddr is atenet-router's host:port. An empty value means the
+	// sweep is disabled: SweepOnce probes nothing.
+	RouterAddr string
+	// HTTPClient probes atenet-router's /readyz. The default has a 5s
+	// timeout; tests override it to run fast.
+	HTTPClient *http.Client
+	// Threshold is how many consecutive stale misses mark a task Failed.
+	// Zero means DefaultLivenessThreshold.
+	Threshold int
 
 	mu     sync.Mutex
-	misses map[string]*livenessMiss
+	misses map[string]int // "atespace/name" -> consecutive stale-miss count
 }
 
-// NewTaskMonitor creates a TaskMonitor that reads and writes tasks through s,
-// and uses reconciler's Substrate client and HTTP client for its checks.
-func NewTaskMonitor(s store.Store, reconciler *TaskReconciler, interval time.Duration) *TaskMonitor {
-	return &TaskMonitor{
-		store:      s,
-		reconciler: reconciler,
-		Interval:   interval,
-		Now:        time.Now,
-		misses:     make(map[string]*livenessMiss),
+// NewLivenessChecker builds a LivenessChecker with the default HTTP timeout
+// and threshold.
+func NewLivenessChecker(s store.Store, sc *substrate.Client, routerAddr string) *LivenessChecker {
+	return &LivenessChecker{
+		Store:      s,
+		Substrate:  sc,
+		RouterAddr: routerAddr,
+		HTTPClient: &http.Client{Timeout: 5 * time.Second},
+		Threshold:  DefaultLivenessThreshold,
+		misses:     make(map[string]int),
 	}
 }
 
-func (m *TaskMonitor) now() time.Time {
-	if m.Now != nil {
-		return m.Now()
+// SweepOnce probes every Running task once. It pages ListTasks the same way
+// requeueStrandedTasks does (worker.go), so one call bounds memory even
+// with many tasks. It logs and continues past a listing error.
+func (l *LivenessChecker) SweepOnce(ctx context.Context) {
+	threshold := l.Threshold
+	if threshold <= 0 {
+		threshold = DefaultLivenessThreshold
 	}
-	return time.Now()
-}
-
-// Run sweeps every Running task once per Interval, until ctx is done.
-// Interval <= 0 disables the monitor: Run returns at once.
-func (m *TaskMonitor) Run(ctx context.Context) {
-	if m.Interval <= 0 {
-		return
-	}
-	ticker := time.NewTicker(m.Interval)
-	defer ticker.Stop()
-	for {
-		m.Sweep(ctx)
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
-	}
-}
-
-// Sweep checks every Running task once. It logs and goes on past a listing
-// or per-task error, so one bad page or task cannot stop the sweep.
-func (m *TaskMonitor) Sweep(ctx context.Context) {
+	// seenRunning holds the key of every Running task this sweep probes.
+	// pruneMisses drops a miss count for any key not in this set below. A
+	// key falls out of the set when its task leaves Running, or when
+	// someone deletes the task so ListTasks no longer lists it. This stops
+	// a re-created same-name task from inheriting old misses (ax-lox.8).
+	seenRunning := make(map[string]bool)
 	var offset int64
 	for {
-		tasks, err := m.store.ListTasks(ctx, "*", monitorPageSize, offset)
+		tasks, err := l.Store.ListTasks(ctx, "*", strandedTasksPageSize, offset)
 		if err != nil {
-			slog.Warn("liveness monitor: failed to list tasks", "error", err)
+			slog.Warn("task liveness sweep: failed to list tasks", "error", err)
 			return
 		}
 		for _, task := range tasks {
-			if task.GetStatus().GetPhase() != "Running" {
-				continue
+			if task.GetStatus().GetPhase() == "Running" {
+				seenRunning[fmt.Sprintf("%s/%s", task.GetMetadata().GetAtespace(), task.GetMetadata().GetName())] = true
 			}
-			m.checkTask(ctx, task)
+			l.probeOne(ctx, task, threshold)
 		}
-		if int64(len(tasks)) < monitorPageSize {
-			return
+		if int64(len(tasks)) < strandedTasksPageSize {
+			break
 		}
-		offset += monitorPageSize
+		offset += strandedTasksPageSize
+	}
+	l.pruneMisses(seenRunning)
+}
+
+// pruneMisses drops every miss count whose key is not in seenRunning: a task
+// this sweep did not see as Running, whether it moved to another phase or
+// was deleted and no longer appears in ListTasks at all.
+func (l *LivenessChecker) pruneMisses(seenRunning map[string]bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for key := range l.misses {
+		if !seenRunning[key] {
+			delete(l.misses, key)
+		}
 	}
 }
 
-// missKey identifies one task incarnation's run of dead probes. Including
-// status.id means a deleted and recreated task, or a suspended and resumed
-// one, starts its count over rather than inheriting a stale one.
-func missKey(atespace, name, statusID string) string {
-	return atespace + "/" + name + "/" + statusID
-}
+// probeResult classifies one atenet-router response.
+type probeResult int
 
-func (m *TaskMonitor) clearMiss(key string) {
-	m.mu.Lock()
-	delete(m.misses, key)
-	m.mu.Unlock()
-}
+const (
+	// probeInconclusive covers a 502, a timeout, a connection error, and a
+	// 421 with no X-Ate-Assignment-Stale header: none of these prove the
+	// actor's worker lost it, so they never count toward the threshold.
+	probeInconclusive probeResult = iota
+	probeHealthy
+	probeStale
+)
 
-// recordMiss adds one dead probe for key and returns the resulting count and
-// the time of the first dead probe in the current run.
-func (m *TaskMonitor) recordMiss(key string, at time.Time) (count int, first time.Time) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	rec := m.misses[key]
-	if rec == nil {
-		rec = &livenessMiss{first: at}
-		m.misses[key] = rec
+func (l *LivenessChecker) probeRouter(ctx context.Context, atespace, actor string) probeResult {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("http://%s/readyz", l.RouterAddr), nil)
+	if err != nil {
+		return probeInconclusive
 	}
-	rec.count++
-	return rec.count, rec.first
+	req.Header.Set("ate-target-actor", fmt.Sprintf("%s/%s", atespace, actor))
+	resp, err := l.HTTPClient.Do(req)
+	if err != nil {
+		return probeInconclusive
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusOK {
+		return probeHealthy
+	}
+	if resp.StatusCode == http.StatusMisdirectedRequest && resp.Header.Get("X-Ate-Assignment-Stale") == "true" {
+		return probeStale
+	}
+	return probeInconclusive
 }
 
-// checkTask decides whether task's actor is lost or its runner has stopped
-// answering, and fails the task when either is true.
-func (m *TaskMonitor) checkTask(ctx context.Context, task *v1alpha1.Task) {
+// probeOne probes one task's actor and updates its miss count and, when
+// warranted, its stored status. It never probes a task outside phase
+// Running.
+func (l *LivenessChecker) probeOne(ctx context.Context, task *v1alpha1.Task, threshold int) {
+	if task.GetStatus().GetPhase() != "Running" {
+		return
+	}
 	atespace := task.GetMetadata().GetAtespace()
 	name := task.GetMetadata().GetName()
-	actorName := task.GetStatus().GetActor()
-	if actorName == "" {
-		actorName = name
-	}
-	statusID := task.GetStatus().GetId()
-	key := missKey(atespace, name, statusID)
-
-	actor, getErr := m.reconciler.client.GetActor(ctx, atespace, actorName)
-	if reason, message, lost := classifyActorLoss(actor, getErr); lost {
-		m.clearMiss(key)
-		m.failTask(ctx, atespace, name, statusID, reason, message)
-		return
-	}
-	if getErr != nil {
-		// A transient Substrate error. Leave the task alone; the next sweep
-		// tries again.
-		return
-	}
-	if actor.GetStatus().GetState() != ateapipb.ActorState_ACTOR_STATE_RUNNING {
-		// Only a RUNNING actor gets probed: the router resumes a suspended
-		// one, which would make it look alive, or resume it as a side effect.
-		m.clearMiss(key)
-		return
-	}
-
+	actor := task.GetStatus().GetActor()
 	workerIP := task.GetStatus().GetWorkerIp()
-	if workerIP == "" {
-		return
-	}
-	if _, alive := m.reconciler.probeReadyz(ctx, workerIP, atespace, actorName, readyzAlive); alive {
-		m.clearMiss(key)
+	key := fmt.Sprintf("%s/%s", atespace, name)
+
+	if actor == "" || l.RouterAddr == "" {
 		return
 	}
 
-	count, first := m.recordMiss(key, m.now())
-	if count >= sandboxUnresponsiveMisses && m.now().Sub(first) >= sandboxUnresponsiveWindow {
-		m.failTask(ctx, atespace, name, statusID, "SandboxUnresponsive", "the task's runner did not answer /readyz")
+	result := l.probeRouter(ctx, atespace, actor)
+	if result == probeInconclusive {
+		// Cannot tell the actor's fate from this response: reset, so a
+		// transient blip never adds to a run of real stale misses.
+		l.resetMiss(key)
+		return
 	}
-}
 
-// failTask re-reads the task and, only if it is still the same incarnation
-// and still Running, marks it Failed with reason. A task whose status.id
-// changed, or that left Running, moved on since the check started: writing
-// over that change would race it, so failTask leaves it alone.
-func (m *TaskMonitor) failTask(ctx context.Context, atespace, name, statusID, reason, message string) {
-	task, err := m.store.GetTask(ctx, atespace, name)
-	if err != nil {
-		if !errors.Is(err, store.ErrNotFound) {
-			slog.Warn("liveness monitor: failed to re-read task before failing it", "atespace", atespace, "name", name, "error", err)
+	// Both a healthy and a stale result confirm against Substrate: the
+	// miss path needs it to rule out a router hiccup, and the healthy path
+	// uses it to notice the actor already moved worker so WorkerIp can
+	// catch up. See docs/networking.md.
+	getCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	actorStatus, err := l.Substrate.GetActor(getCtx, atespace, actor)
+	cancel()
+	notFound := status.Code(err) == codes.NotFound
+	if err != nil && !notFound {
+		slog.Warn("task liveness sweep: GetActor failed", "atespace", atespace, "name", name, "actor", actor, "error", err)
+		l.resetMiss(key)
+		return
+	}
+	running := actorStatus.GetStatus().GetState() == ateapipb.ActorState_ACTOR_STATE_RUNNING
+	currentWorkerIP := actorStatus.GetStatus().GetWorkerAssignment().GetWorkerPodIp()
+
+	if result == probeHealthy {
+		l.resetMiss(key)
+		if running && currentWorkerIP != "" && currentWorkerIP != workerIP {
+			l.refreshWorkerIP(ctx, task, currentWorkerIP)
 		}
 		return
 	}
-	if task.GetStatus().GetId() != statusID || task.GetStatus().GetPhase() != "Running" {
+
+	// result == probeStale: a miss only when Substrate still shows the
+	// actor RUNNING on the same worker that just rejected it, or gone
+	// entirely. Any other Substrate state (CRASHED, a different worker, a
+	// non-RUNNING state) means Substrate already moved on, so this stale
+	// reply is stale information on ax's side, not a lost actor.
+	switch {
+	case notFound:
+		l.countMissAndMaybeFail(ctx, task, key, reasonActorMissing,
+			fmt.Sprintf("actor %s is no longer known to Substrate (last worker %s)", actor, workerIP), threshold)
+	case running && currentWorkerIP == workerIP:
+		l.countMissAndMaybeFail(ctx, task, key, reasonActorLost,
+			fmt.Sprintf("actor %s lost its worker %s; the worker container likely restarted", actor, workerIP), threshold)
+	default:
+		l.resetMiss(key)
+		if running && currentWorkerIP != "" && currentWorkerIP != workerIP {
+			l.refreshWorkerIP(ctx, task, currentWorkerIP)
+		}
+	}
+}
+
+func (l *LivenessChecker) resetMiss(key string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	delete(l.misses, key)
+}
+
+// countMissAndMaybeFail records one more stale miss for key and, once it
+// reaches threshold, tries to move the task to Failed. The write is
+// conditional on the task still being Running with the same actor and
+// WorkerIp this probe observed, so a task that changed in between (a new
+// reconcile, a suspend, a delete) is never overwritten with stale
+// information.
+func (l *LivenessChecker) countMissAndMaybeFail(ctx context.Context, task *v1alpha1.Task, key, reason, message string, threshold int) {
+	l.mu.Lock()
+	l.misses[key]++
+	count := l.misses[key]
+	l.mu.Unlock()
+
+	atespace := task.GetMetadata().GetAtespace()
+	name := task.GetMetadata().GetName()
+	actor := task.GetStatus().GetActor()
+	workerIP := task.GetStatus().GetWorkerIp()
+
+	slog.Warn("task actor probe stale", "atespace", atespace, "name", name, "actor", actor, "workerIP", workerIP, "misses", count)
+
+	if count < threshold {
 		return
 	}
 
-	taskStatus := task.Status
-	taskStatus.Phase = "Failed"
-	taskStatus.WorkerIp = ""
-	m.reconciler.setCondition(task, condReady, "False", reason, truncateMessage(message), m.now())
+	expect := func(cur *v1alpha1.TaskStatus) bool {
+		return cur.GetPhase() == "Running" && cur.GetActor() == actor && cur.GetWorkerIp() == workerIP
+	}
+	failed := proto.Clone(task.Status).(*v1alpha1.TaskStatus)
+	failed.Phase = "Failed"
+	failed.WorkerIp = ""
+	setStatusCondition(failed, condReady, "False", reason,
+		fmt.Sprintf("%s (misses=%d)", message, count), time.Now())
 
-	if err := m.store.UpdateTaskStatus(ctx, atespace, name, taskStatus); err != nil {
-		slog.Warn("liveness monitor: failed to update task status", "atespace", atespace, "name", name, "error", err)
+	applied, err := l.Store.UpdateTaskStatusIf(ctx, atespace, name, expect, failed)
+	if err != nil {
+		slog.Warn("task liveness sweep: failed to mark task Failed", "atespace", atespace, "name", name, "error", err)
 		return
 	}
-	slog.Warn("task failed by liveness monitor", "atespace", atespace, "name", name, "reason", reason)
+	if !applied {
+		// The task changed between this probe and the write: a fresh
+		// reconcile, suspend or delete already moved it on. Leave the miss
+		// count as is; the next sweep re-probes the task's current state.
+		return
+	}
+	slog.Error("marking task Failed: actor lost", "atespace", atespace, "name", name, "actor", actor, "workerIP", workerIP, "reason", reason, "misses", count)
+	l.resetMiss(key)
+}
+
+// refreshWorkerIP updates a Running task's WorkerIp after Substrate reports
+// the actor running on a different worker than the task's stored status
+// shows. ax ssh never reads WorkerIp for routing, but other readers (ax get
+// task, the factory's poll) do, so a stale value is still worth correcting
+// when a healthy probe gives the chance.
+func (l *LivenessChecker) refreshWorkerIP(ctx context.Context, task *v1alpha1.Task, newWorkerIP string) {
+	atespace := task.GetMetadata().GetAtespace()
+	name := task.GetMetadata().GetName()
+	actor := task.GetStatus().GetActor()
+	oldWorkerIP := task.GetStatus().GetWorkerIp()
+
+	updated := proto.Clone(task.Status).(*v1alpha1.TaskStatus)
+	updated.WorkerIp = newWorkerIP
+
+	expect := func(cur *v1alpha1.TaskStatus) bool {
+		return cur.GetPhase() == "Running" && cur.GetActor() == actor && cur.GetWorkerIp() == oldWorkerIP
+	}
+	applied, err := l.Store.UpdateTaskStatusIf(ctx, atespace, name, expect, updated)
+	if err != nil {
+		slog.Warn("task liveness sweep: failed to refresh WorkerIp", "atespace", atespace, "name", name, "error", err)
+		return
+	}
+	if applied {
+		slog.Info("task liveness sweep: refreshed WorkerIp", "atespace", atespace, "name", name, "actor", actor, "oldWorkerIP", oldWorkerIP, "newWorkerIP", newWorkerIP)
+	}
+}
+
+// setStatusCondition sets or replaces the condition of type condType on
+// status. It mirrors TaskReconciler.setCondition, which operates on a Task
+// rather than a bare TaskStatus.
+func setStatusCondition(taskStatus *v1alpha1.TaskStatus, condType, condStatus, reason, message string, t time.Time) {
+	ts := timestamppb.New(t)
+	for i, c := range taskStatus.Conditions {
+		if c.Type == condType {
+			taskStatus.Conditions[i].Status = condStatus
+			taskStatus.Conditions[i].Reason = reason
+			taskStatus.Conditions[i].Message = message
+			taskStatus.Conditions[i].LastTransitionTime = ts
+			return
+		}
+	}
+	taskStatus.Conditions = append(taskStatus.Conditions, &v1alpha1.Condition{
+		Type:               condType,
+		Status:             condStatus,
+		Reason:             reason,
+		Message:            message,
+		LastTransitionTime: ts,
+	})
 }

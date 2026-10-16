@@ -181,6 +181,38 @@ func (s *MemoryStore) UpdateTaskStatus(ctx context.Context, atespace, name strin
 	return nil
 }
 
+// UpdateTaskStatusIf writes status only when expect reports true for the
+// task's current status. See store.Store for the full contract.
+func (s *MemoryStore) UpdateTaskStatusIf(ctx context.Context, atespace, name string, expect func(*v1alpha1.TaskStatus) bool, status *v1alpha1.TaskStatus) (bool, error) {
+	key := taskKey(atespace, name)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	t, ok := s.tasks[key]
+	if !ok {
+		return false, store.ErrNotFound
+	}
+	if !expect(t.Status) {
+		return false, nil
+	}
+	if t.GetSpec().GetSupervisorProfile() != "" && t.GetStatus().GetPhase() == v1alpha1.PhaseTerminating {
+		return false, nil
+	}
+	t.Status = status
+	cp := clone(t)
+
+	if chs, ok := s.watchers[key]; ok {
+		for _, ch := range chs {
+			select {
+			case ch <- cp:
+			default:
+			}
+		}
+	}
+	return true, nil
+}
+
 func (s *MemoryStore) MarkTaskDeleting(ctx context.Context, atespace, name string, preconditions ...store.TaskDeletePreconditions) error {
 	precondition, err := store.DeletePreconditions(preconditions)
 	if err != nil {

@@ -12,186 +12,525 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package controller
+package controller_test
 
 import (
 	"context"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"github.com/google/ax/internal/controller"
+	"github.com/google/ax/internal/store"
+	"github.com/google/ax/internal/store/memory"
+	"github.com/google/ax/internal/substrate"
+	"github.com/google/ax/pkg/apis/v1alpha1"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 )
 
-// startReadyzServer runs an HTTP server whose only route, /readyz, always
-// answers with statusCode and body. It returns the server's address, in the
-// workerIP shape probeReadyz expects. The server stops when the test ends.
-func startReadyzServer(t *testing.T, statusCode int, body string) string {
+// livenessRouter is a fake atenet-router. Each probe carries the header
+// ate-target-actor: <atespace>/<actor>; set() picks that exact value's
+// reply mode for the next probes, until changed again.
+type livenessRouter struct {
+	mu    sync.Mutex
+	mode  map[string]string // "ok" | "stale" | "stale-no-header" | "502" | "hang"; default "ok"
+	calls int
+	srv   *httptest.Server
+}
+
+func newLivenessRouter(t *testing.T) *livenessRouter {
+	t.Helper()
+	r := &livenessRouter{mode: map[string]string{}}
+	r.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		actor := req.Header.Get("ate-target-actor")
+		r.mu.Lock()
+		r.calls++
+		mode := r.mode[actor]
+		r.mu.Unlock()
+		switch mode {
+		case "stale":
+			w.Header().Set("X-Ate-Assignment-Stale", "true")
+			w.WriteHeader(http.StatusMisdirectedRequest)
+		case "stale-no-header":
+			w.WriteHeader(http.StatusMisdirectedRequest)
+		case "502":
+			w.WriteHeader(http.StatusBadGateway)
+		case "hang":
+			<-req.Context().Done()
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	t.Cleanup(r.srv.Close)
+	return r
+}
+
+func (r *livenessRouter) set(atespace, actor, mode string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.mode[atespace+"/"+actor] = mode
+}
+
+func (r *livenessRouter) callCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.calls
+}
+
+func (r *livenessRouter) addr() string {
+	return strings.TrimPrefix(r.srv.URL, "http://")
+}
+
+// newLivenessSubstrateClient serves mockSrv over gRPC and returns a client
+// bound to it, the same pattern newTestReconciler uses.
+func newLivenessSubstrateClient(t *testing.T, mockSrv *mockControlServer) *substrate.Client {
 	t.Helper()
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	mux := http.NewServeMux()
-	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(statusCode)
-		_, _ = w.Write([]byte(body))
-	})
-	srv := &http.Server{Handler: mux}
-	go srv.Serve(lis)
-	t.Cleanup(func() { _ = srv.Close() })
-	return lis.Addr().String()
+	grpcServer := grpc.NewServer()
+	ateapipb.RegisterControlServer(grpcServer, mockSrv)
+	go grpcServer.Serve(lis)
+	t.Cleanup(grpcServer.Stop)
+	client, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { client.Close() })
+	return client
 }
 
-func TestClassifyActorLoss(t *testing.T) {
-	crashed := func(msg string) *ateapipb.Actor {
-		return &ateapipb.Actor{
-			Status: &ateapipb.ActorStatus{
-				State: ateapipb.ActorState_ACTOR_STATE_CRASHED,
-				Crash: &ateapipb.ActorCrash{Message: msg},
-			},
+func newLivenessChecker(t *testing.T, s store.Store, mockSrv *mockControlServer, router *livenessRouter) *controller.LivenessChecker {
+	t.Helper()
+	client := newLivenessSubstrateClient(t, mockSrv)
+	checker := controller.NewLivenessChecker(s, client, router.addr())
+	checker.HTTPClient = &http.Client{Timeout: 500 * time.Millisecond}
+	return checker
+}
+
+func runningTaskWithActor(atespace, name, actor, workerIP string) *v1alpha1.Task {
+	return &v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{Name: name, Atespace: atespace},
+		Status:   &v1alpha1.TaskStatus{Phase: "Running", Actor: actor, WorkerIp: workerIP},
+	}
+}
+
+func readyReason(task *v1alpha1.Task) string {
+	for _, c := range task.GetStatus().GetConditions() {
+		if c.GetType() == "Ready" {
+			return c.GetReason()
 		}
 	}
-	running := &ateapipb.Actor{Status: &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_RUNNING}}
+	return ""
+}
 
-	cases := []struct {
-		name       string
-		actor      *ateapipb.Actor
-		err        error
-		wantLost   bool
-		wantReason string
-	}{
-		{
-			name:       "a NotFound error means the actor record is gone",
-			err:        status.Error(codes.NotFound, "actor not found"),
-			wantLost:   true,
-			wantReason: "ActorLost",
-		},
-		{
-			name:       "a crash message naming OOM is OOMKilled",
-			actor:      crashed("sandbox killed: Out of Memory"),
-			wantLost:   true,
-			wantReason: "OOMKilled",
-		},
-		{
-			name:       "a crash message naming oom as a whole word is OOMKilled",
-			actor:      crashed("container exited: oom-kill"),
-			wantLost:   true,
-			wantReason: "OOMKilled",
-		},
-		{
-			name:       "a crash message that does not name OOM is ActorCrashed",
-			actor:      crashed("worker pod evicted"),
-			wantLost:   true,
-			wantReason: "ActorCrashed",
-		},
-		{
-			name:     "a crash message naming a word that merely contains oom is not OOMKilled",
-			actor:    crashed("workroom unavailable"),
-			wantLost: true,
-			// "workroom" contains "oom" but not as a whole word, so this must
-			// not match oomPattern.
-			wantReason: "ActorCrashed",
-		},
-		{
-			name:     "a RUNNING actor is not lost",
-			actor:    running,
-			wantLost: false,
-		},
-		{
-			name:     "a transient non-NotFound error is not lost",
-			err:      status.Error(codes.Unavailable, "substrate unreachable"),
-			wantLost: false,
-		},
+// TestLivenessSweepFailsTaskAtThresholdNotBefore covers AC4: a Running task
+// whose actor Substrate still reports RUNNING on the same worker that just
+// answered 421 stale fails only once the sweep sees that threshold times in
+// a row, never before.
+func TestLivenessSweepFailsTaskAtThresholdNotBefore(t *testing.T) {
+	ctx := context.Background()
+	s := memory.NewStore()
+	task := runningTaskWithActor("default", "task1", "task1", "10.244.3.47")
+	if err := s.SaveTask(ctx, task); err != nil {
+		t.Fatal(err)
 	}
 
-	for _, tt := range cases {
-		t.Run(tt.name, func(t *testing.T) {
-			reason, message, lost := classifyActorLoss(tt.actor, tt.err)
-			if lost != tt.wantLost {
-				t.Fatalf("classifyActorLoss() lost = %v, want %v", lost, tt.wantLost)
+	mockSrv := &mockControlServer{existingActor: &ateapipb.Actor{
+		Status: &ateapipb.ActorStatus{
+			State:            ateapipb.ActorState_ACTOR_STATE_RUNNING,
+			WorkerAssignment: &ateapipb.WorkerAssignment{WorkerPodIp: "10.244.3.47"},
+		},
+	}}
+	router := newLivenessRouter(t)
+	router.set("default", "task1", "stale")
+	checker := newLivenessChecker(t, s, mockSrv, router)
+
+	for i := 1; i < controller.DefaultLivenessThreshold; i++ {
+		checker.SweepOnce(ctx)
+		got, err := s.GetTask(ctx, "default", "task1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.GetStatus().GetPhase() != "Running" {
+			t.Fatalf("sweep %d: phase is %q, want Running (threshold is %d)", i, got.GetStatus().GetPhase(), controller.DefaultLivenessThreshold)
+		}
+	}
+
+	checker.SweepOnce(ctx)
+	got, err := s.GetTask(ctx, "default", "task1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.GetStatus().GetPhase() != "Failed" {
+		t.Fatalf("phase is %q, want Failed at the threshold sweep", got.GetStatus().GetPhase())
+	}
+	if got.GetStatus().GetWorkerIp() != "" {
+		t.Fatalf("WorkerIp is %q, want cleared", got.GetStatus().GetWorkerIp())
+	}
+	if reason := readyReason(got); reason != "ActorLost" {
+		t.Fatalf("Ready reason is %q, want ActorLost", reason)
+	}
+}
+
+// TestLivenessSweepActorMissingGetsActorMissingReason covers AC4's NotFound
+// branch: a stale probe plus a Substrate GetActor NotFound fails the task
+// with reason ActorMissing, not ActorLost.
+func TestLivenessSweepActorMissingGetsActorMissingReason(t *testing.T) {
+	ctx := context.Background()
+	s := memory.NewStore()
+	task := runningTaskWithActor("default", "task1", "task1", "10.244.3.47")
+	if err := s.SaveTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+
+	mockSrv := &mockControlServer{getActorErr: status.Error(codes.NotFound, "actor not found")}
+	router := newLivenessRouter(t)
+	router.set("default", "task1", "stale")
+	checker := newLivenessChecker(t, s, mockSrv, router)
+
+	for i := 0; i < controller.DefaultLivenessThreshold; i++ {
+		checker.SweepOnce(ctx)
+	}
+
+	got, err := s.GetTask(ctx, "default", "task1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.GetStatus().GetPhase() != "Failed" {
+		t.Fatalf("phase is %q, want Failed", got.GetStatus().GetPhase())
+	}
+	if reason := readyReason(got); reason != "ActorMissing" {
+		t.Fatalf("Ready reason is %q, want ActorMissing", reason)
+	}
+}
+
+// TestLivenessSweepIgnoresInconclusiveResults covers AC5: a 421 without the
+// stale header, a 502, and a probe that never answers (a timeout) never
+// fail a task, no matter how many sweeps see them.
+func TestLivenessSweepIgnoresInconclusiveResults(t *testing.T) {
+	for _, mode := range []string{"stale-no-header", "502", "hang"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx := context.Background()
+			s := memory.NewStore()
+			task := runningTaskWithActor("default", "task1", "task1", "10.244.3.47")
+			if err := s.SaveTask(ctx, task); err != nil {
+				t.Fatal(err)
 			}
-			if !tt.wantLost {
-				return
+
+			mockSrv := &mockControlServer{existingActor: &ateapipb.Actor{
+				Status: &ateapipb.ActorStatus{
+					State:            ateapipb.ActorState_ACTOR_STATE_RUNNING,
+					WorkerAssignment: &ateapipb.WorkerAssignment{WorkerPodIp: "10.244.3.47"},
+				},
+			}}
+			router := newLivenessRouter(t)
+			router.set("default", "task1", mode)
+			checker := newLivenessChecker(t, s, mockSrv, router)
+
+			for i := 0; i < controller.DefaultLivenessThreshold+2; i++ {
+				checker.SweepOnce(ctx)
 			}
-			if reason != tt.wantReason {
-				t.Fatalf("classifyActorLoss() reason = %q, want %q", reason, tt.wantReason)
+
+			got, err := s.GetTask(ctx, "default", "task1")
+			if err != nil {
+				t.Fatal(err)
 			}
-			if message == "" {
-				t.Fatalf("classifyActorLoss() message is empty, want the crash or error text")
+			if got.GetStatus().GetPhase() != "Running" {
+				t.Fatalf("mode %q: phase is %q after %d sweeps, want Running (never fails on an inconclusive result)",
+					mode, got.GetStatus().GetPhase(), controller.DefaultLivenessThreshold+2)
 			}
 		})
 	}
 }
 
-// TestClassifyActorLossTruncatesMessage proves the 512-byte bound: an
-// oversized crash message must not reach the task's status whole.
-func TestClassifyActorLossTruncatesMessage(t *testing.T) {
-	huge := strings.Repeat("a", maxCrashMessageBytes*2)
-	actor := &ateapipb.Actor{
+// TestLivenessSweepStaleOkStaleDoesNotFail covers AC5's reset case: a
+// healthy probe in between two stale ones restarts the miss count, so the
+// task never reaches the threshold.
+func TestLivenessSweepStaleOkStaleDoesNotFail(t *testing.T) {
+	ctx := context.Background()
+	s := memory.NewStore()
+	task := runningTaskWithActor("default", "task1", "task1", "10.244.3.47")
+	if err := s.SaveTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+
+	mockSrv := &mockControlServer{existingActor: &ateapipb.Actor{
 		Status: &ateapipb.ActorStatus{
-			State: ateapipb.ActorState_ACTOR_STATE_CRASHED,
-			Crash: &ateapipb.ActorCrash{Message: huge},
+			State:            ateapipb.ActorState_ACTOR_STATE_RUNNING,
+			WorkerAssignment: &ateapipb.WorkerAssignment{WorkerPodIp: "10.244.3.47"},
 		},
+	}}
+	router := newLivenessRouter(t)
+	checker := newLivenessChecker(t, s, mockSrv, router)
+
+	// stale, ok, stale, ok, ... never 2 stale results in a row for longer
+	// than the threshold allows.
+	for i := 0; i < controller.DefaultLivenessThreshold*2; i++ {
+		if i%2 == 0 {
+			router.set("default", "task1", "stale")
+		} else {
+			router.set("default", "task1", "ok")
+		}
+		checker.SweepOnce(ctx)
 	}
-	_, message, lost := classifyActorLoss(actor, nil)
-	if !lost {
-		t.Fatal("want lost=true for a crashed actor")
+
+	got, err := s.GetTask(ctx, "default", "task1")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if len(message) != maxCrashMessageBytes {
-		t.Fatalf("message length = %d, want %d", len(message), maxCrashMessageBytes)
+	if got.GetStatus().GetPhase() != "Running" {
+		t.Fatalf("phase is %q, want Running (a healthy probe must reset the miss count)", got.GetStatus().GetPhase())
 	}
 }
 
-func TestProbeReadyz(t *testing.T) {
-	r := &TaskReconciler{httpClient: &http.Client{Timeout: 2 * time.Second}}
-
-	t.Run("a 200 is alive under either predicate", func(t *testing.T) {
-		lis := startReadyzServer(t, http.StatusOK, "ok")
-		_, ok := r.probeReadyz(context.Background(), lis, "default", "actor", readyzStatusOK)
-		if !ok {
-			t.Fatal("want ok=true for a 200 response")
-		}
-		_, ok = r.probeReadyz(context.Background(), lis, "default", "actor", readyzAlive)
-		if !ok {
-			t.Fatal("want ok=true for a 200 response under readyzAlive")
-		}
-	})
-
-	t.Run("a 503 workspace initializing is alive only under readyzAlive", func(t *testing.T) {
-		lis := startReadyzServer(t, http.StatusServiceUnavailable, "workspace initializing")
-		_, ok := r.probeReadyz(context.Background(), lis, "default", "actor", readyzStatusOK)
-		if ok {
-			t.Fatal("want ok=false for a 503 under readyzStatusOK")
-		}
-		_, ok = r.probeReadyz(context.Background(), lis, "default", "actor", readyzAlive)
-		if !ok {
-			t.Fatal("want ok=true for a 503 workspace-initializing response under readyzAlive")
-		}
-	})
-
-	t.Run("a 503 with another body is dead under readyzAlive", func(t *testing.T) {
-		lis := startReadyzServer(t, http.StatusServiceUnavailable, "some other failure")
-		_, ok := r.probeReadyz(context.Background(), lis, "default", "actor", readyzAlive)
-		if ok {
-			t.Fatal("want ok=false for a 503 that does not name workspace setup")
-		}
-	})
-
-	t.Run("a closed connection is dead", func(t *testing.T) {
-		lis, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
+// TestLivenessSweepSkipsNonRunningTasks covers AC5's probe-count rule:
+// Pending, Suspended, Terminating and Failed tasks get 0 probes.
+func TestLivenessSweepSkipsNonRunningTasks(t *testing.T) {
+	ctx := context.Background()
+	s := memory.NewStore()
+	for _, phase := range []string{"Pending", "Suspended", "Terminating", "Failed"} {
+		task := runningTaskWithActor("default", "task-"+phase, "task-"+phase, "10.244.3.47")
+		task.Status.Phase = phase
+		if err := s.SaveTask(ctx, task); err != nil {
 			t.Fatal(err)
 		}
-		addr := lis.Addr().String()
-		lis.Close()
-		_, ok := r.probeReadyz(context.Background(), addr, "default", "actor", readyzAlive)
-		if ok {
-			t.Fatal("want ok=false when the runner is unreachable")
+	}
+
+	mockSrv := &mockControlServer{}
+	router := newLivenessRouter(t)
+	for _, phase := range []string{"Pending", "Suspended", "Terminating", "Failed"} {
+		router.set("default", "task-"+phase, "stale")
+	}
+	checker := newLivenessChecker(t, s, mockSrv, router)
+
+	checker.SweepOnce(ctx)
+
+	if n := router.callCount(); n != 0 {
+		t.Fatalf("router got %d probes, want 0 for non-Running tasks", n)
+	}
+}
+
+// TestLivenessSweepPrunesMissesOnDeleteAndRecreate covers ax-lox.8. A
+// person deletes a task, then creates a new task with the same name. The
+// new task must not inherit the old task's miss count. Without the fix,
+// the new task fails after 1 more stale sweep, not after
+// DefaultLivenessThreshold sweeps.
+func TestLivenessSweepPrunesMissesOnDeleteAndRecreate(t *testing.T) {
+	ctx := context.Background()
+	s := memory.NewStore()
+	task := runningTaskWithActor("default", "task1", "task1", "10.244.3.47")
+	if err := s.SaveTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+
+	mockSrv := &mockControlServer{existingActor: &ateapipb.Actor{
+		Status: &ateapipb.ActorStatus{
+			State:            ateapipb.ActorState_ACTOR_STATE_RUNNING,
+			WorkerAssignment: &ateapipb.WorkerAssignment{WorkerPodIp: "10.244.3.47"},
+		},
+	}}
+	router := newLivenessRouter(t)
+	router.set("default", "task1", "stale")
+	checker := newLivenessChecker(t, s, mockSrv, router)
+
+	// 2 stale sweeps: 1 short of DefaultLivenessThreshold (3).
+	checker.SweepOnce(ctx)
+	checker.SweepOnce(ctx)
+	got, err := s.GetTask(ctx, "default", "task1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.GetStatus().GetPhase() != "Running" {
+		t.Fatalf("phase is %q after 2 misses, want Running", got.GetStatus().GetPhase())
+	}
+
+	// Delete the task, then re-create a same-name task fresh. A sweep with
+	// nothing listed must drop the old task's miss count.
+	if err := s.DeleteTask(ctx, "default", "task1"); err != nil {
+		t.Fatal(err)
+	}
+	checker.SweepOnce(ctx)
+
+	fresh := runningTaskWithActor("default", "task1", "task1", "10.244.3.47")
+	if err := s.SaveTask(ctx, fresh); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1 stale sweep on the re-created task: it must stay Running. Before
+	// the fix, it inherits the old task's 2 misses and fails on this sweep.
+	checker.SweepOnce(ctx)
+	got, err = s.GetTask(ctx, "default", "task1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.GetStatus().GetPhase() != "Running" {
+		t.Fatalf("phase is %q after 1 miss on the re-created task, want Running: it must not inherit the deleted task's miss count", got.GetStatus().GetPhase())
+	}
+}
+
+// TestLivenessSweepHealthyProbeRefreshesMovedActor covers ax-lox.10's
+// healthy branch. A healthy probe plus Substrate showing the actor on a
+// new worker must update Task.Status.WorkerIp and keep the task Running.
+func TestLivenessSweepHealthyProbeRefreshesMovedActor(t *testing.T) {
+	ctx := context.Background()
+	s := memory.NewStore()
+	task := runningTaskWithActor("default", "task1", "task1", "10.244.3.47")
+	if err := s.SaveTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+
+	mockSrv := &mockControlServer{existingActor: &ateapipb.Actor{
+		Status: &ateapipb.ActorStatus{
+			State:            ateapipb.ActorState_ACTOR_STATE_RUNNING,
+			WorkerAssignment: &ateapipb.WorkerAssignment{WorkerPodIp: "10.244.9.9"},
+		},
+	}}
+	router := newLivenessRouter(t)
+	router.set("default", "task1", "ok")
+	checker := newLivenessChecker(t, s, mockSrv, router)
+
+	checker.SweepOnce(ctx)
+
+	got, err := s.GetTask(ctx, "default", "task1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.GetStatus().GetPhase() != "Running" {
+		t.Fatalf("phase is %q, want Running", got.GetStatus().GetPhase())
+	}
+	if got.GetStatus().GetWorkerIp() != "10.244.9.9" {
+		t.Fatalf("WorkerIp is %q, want the moved actor's new worker %q", got.GetStatus().GetWorkerIp(), "10.244.9.9")
+	}
+}
+
+// TestLivenessSweepStaleProbeWithMovedActorRefreshesAndResets covers
+// ax-lox.10's default branch for a stale probe. Substrate shows the actor
+// RUNNING on a worker other than the one that answered stale. This is a
+// moved actor, not a lost one. The sweep must update WorkerIp, keep the
+// task Running, and reset the miss count instead of adding to it.
+func TestLivenessSweepStaleProbeWithMovedActorRefreshesAndResets(t *testing.T) {
+	ctx := context.Background()
+	s := memory.NewStore()
+	task := runningTaskWithActor("default", "task1", "task1", "10.244.3.47")
+	if err := s.SaveTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+
+	mockSrv := &mockControlServer{existingActor: &ateapipb.Actor{
+		Status: &ateapipb.ActorStatus{
+			State:            ateapipb.ActorState_ACTOR_STATE_RUNNING,
+			WorkerAssignment: &ateapipb.WorkerAssignment{WorkerPodIp: "10.244.3.47"},
+		},
+	}}
+	router := newLivenessRouter(t)
+	router.set("default", "task1", "stale")
+	checker := newLivenessChecker(t, s, mockSrv, router)
+
+	// 2 stale misses against the old worker: 1 short of the threshold.
+	checker.SweepOnce(ctx)
+	checker.SweepOnce(ctx)
+
+	// Substrate now shows the actor moved to a new worker. The stale
+	// result against the old worker is stale information on ax's side:
+	// the sweep must refresh WorkerIp, not count this as a miss.
+	mockSrv.existingActor.Status.WorkerAssignment.WorkerPodIp = "10.244.9.9"
+	checker.SweepOnce(ctx)
+
+	got, err := s.GetTask(ctx, "default", "task1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.GetStatus().GetPhase() != "Running" {
+		t.Fatalf("phase is %q, want Running", got.GetStatus().GetPhase())
+	}
+	if got.GetStatus().GetWorkerIp() != "10.244.9.9" {
+		t.Fatalf("WorkerIp is %q, want the moved actor's new worker %q", got.GetStatus().GetWorkerIp(), "10.244.9.9")
+	}
+
+	// The miss count must have reset to 0. 2 more stale probes, now
+	// against the current worker, must not reach DefaultLivenessThreshold
+	// (3).
+	router.set("default", "task1", "stale")
+	checker.SweepOnce(ctx)
+	checker.SweepOnce(ctx)
+
+	got, err = s.GetTask(ctx, "default", "task1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.GetStatus().GetPhase() != "Running" {
+		t.Fatalf("phase is %q after 2 more misses, want Running: the moved-actor refresh must reset the miss count", got.GetStatus().GetPhase())
+	}
+}
+
+// raceStore wraps a store.Store and runs hook immediately before every
+// UpdateTaskStatusIf call, so a test can simulate a concurrent write that
+// lands between a liveness probe and its conditional write.
+type raceStore struct {
+	store.Store
+	hook func()
+}
+
+func (s *raceStore) UpdateTaskStatusIf(ctx context.Context, atespace, name string, expect func(*v1alpha1.TaskStatus) bool, status *v1alpha1.TaskStatus) (bool, error) {
+	if s.hook != nil {
+		s.hook()
+		s.hook = nil // fire once: only the write that reaches the threshold races
+	}
+	return s.Store.UpdateTaskStatusIf(ctx, atespace, name, expect, status)
+}
+
+// TestLivenessSweepNoWriteWhenTaskChangedBeforeWrite covers AC5's
+// conditional-write case: a concurrent write (a fresh reconcile) changes
+// the task's WorkerIp between this probe and the threshold write, so the
+// write must not apply and the task must not fail on stale information.
+func TestLivenessSweepNoWriteWhenTaskChangedBeforeWrite(t *testing.T) {
+	ctx := context.Background()
+	inner := memory.NewStore()
+	task := runningTaskWithActor("default", "task1", "task1", "10.244.3.47")
+	if err := inner.SaveTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+
+	raced := &raceStore{Store: inner, hook: func() {
+		if err := inner.UpdateTaskStatus(ctx, "default", "task1", &v1alpha1.TaskStatus{
+			Phase: "Running", Actor: "task1", WorkerIp: "10.244.9.9",
+		}); err != nil {
+			t.Fatal(err)
 		}
-	})
+	}}
+
+	mockSrv := &mockControlServer{existingActor: &ateapipb.Actor{
+		Status: &ateapipb.ActorStatus{
+			State:            ateapipb.ActorState_ACTOR_STATE_RUNNING,
+			WorkerAssignment: &ateapipb.WorkerAssignment{WorkerPodIp: "10.244.3.47"},
+		},
+	}}
+	router := newLivenessRouter(t)
+	router.set("default", "task1", "stale")
+	checker := newLivenessChecker(t, raced, mockSrv, router)
+
+	for i := 0; i < controller.DefaultLivenessThreshold; i++ {
+		checker.SweepOnce(ctx)
+	}
+
+	got, err := inner.GetTask(ctx, "default", "task1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.GetStatus().GetPhase() != "Running" {
+		t.Fatalf("phase is %q, want Running: the conditional write must not apply once WorkerIp changed underneath it", got.GetStatus().GetPhase())
+	}
+	if got.GetStatus().GetWorkerIp() != "10.244.9.9" {
+		t.Fatalf("WorkerIp is %q, want the concurrent write's %q preserved", got.GetStatus().GetWorkerIp(), "10.244.9.9")
+	}
 }

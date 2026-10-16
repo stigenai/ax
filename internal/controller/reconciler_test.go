@@ -55,6 +55,12 @@ type mockControlServer struct {
 	// worker (codes.ResourceExhausted) or for any other reason.
 	resumeErr      error
 	resumeAttempts atomic.Int32
+	// getActorActor and getActorErr, when set, override GetActor's reply.
+	// getActorErr takes priority; getActorActor is checked next; with
+	// neither set, GetActor falls back to existingActor, so every test
+	// written before these fields existed keeps its original behavior.
+	getActorActor *ateapipb.Actor
+	getActorErr   error
 }
 
 // noSecrets is a SecretResolver for tests: it never finds a key and never touches a cluster.
@@ -96,6 +102,12 @@ func (m *mockControlServer) CreateAtespace(ctx context.Context, req *ateapipb.Cr
 }
 
 func (m *mockControlServer) GetActor(context.Context, *ateapipb.GetActorRequest) (*ateapipb.Actor, error) {
+	if m.getActorErr != nil {
+		return nil, m.getActorErr
+	}
+	if m.getActorActor != nil {
+		return m.getActorActor, nil
+	}
 	return m.existingActor, nil
 }
 

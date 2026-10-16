@@ -74,6 +74,28 @@ func resolveLivenessInterval(value string) (time.Duration, error) {
 	return time.ParseDuration(value)
 }
 
+// resolveTaskLivenessInterval reads the AX_TASK_LIVENESS_INTERVAL override
+// for the --task-liveness-interval flag. The caller passes the env value.
+// An empty envValue keeps flagValue. The value "0" turns off the sweep.
+func resolveTaskLivenessInterval(flagValue time.Duration, envValue string) (time.Duration, error) {
+	if envValue == "" {
+		return flagValue, nil
+	}
+	d, err := time.ParseDuration(envValue)
+	if err != nil {
+		return 0, fmt.Errorf("invalid duration %q: %w", envValue, err)
+	}
+	return d, nil
+}
+
+// taskLivenessSweepEnabled reports whether main must start the LivenessChecker
+// sweep goroutine. The sweep needs a router address to probe through
+// (atenet-router, read from ATENET_ROUTER_ADDR) and an interval greater than
+// zero. If either is missing, the sweep stays off.
+func taskLivenessSweepEnabled(routerAddr string, interval time.Duration) bool {
+	return routerAddr != "" && interval > 0
+}
+
 func main() {
 	var (
 		substrateEndpoint       string
@@ -91,6 +113,8 @@ func main() {
 		redisGroup              string
 		redisConsumer           string
 		nativeTLSDestination    string
+		taskLivenessInterval    time.Duration
+		taskLivenessThreshold   int
 	)
 
 	flag.StringVar(&redisAddr, "redis-addr", "localhost:6379", "Redis server address (e.g. localhost:6379)")
@@ -108,6 +132,8 @@ func main() {
 	flag.StringVar(&defaultTaskMemory, "default-task-memory", defaultTaskMemoryDefault, "Memory limit booked for a task that names none (Substrate quantity, e.g. 7680Mi); 0 disables")
 	flag.StringVar(&livenessInterval, "liveness-interval", livenessIntervalDefault, "How often the liveness monitor checks each Running task's actor and runner (Go duration, e.g. 30s); 0 disables it")
 	flag.StringVar(&nativeTLSDestination, "native-tls-destination", "", "Private protected-actor TLS destination; install or verify exact policy before resume")
+	flag.DurationVar(&taskLivenessInterval, "task-liveness-interval", time.Minute, "How often to probe each Running task's actor through atenet-router; 0 turns off the sweep (env AX_TASK_LIVENESS_INTERVAL)")
+	flag.IntVar(&taskLivenessThreshold, "task-liveness-threshold", controller.DefaultLivenessThreshold, "Consecutive stale probes that mark a Running task Failed")
 	flag.Parse()
 
 	if envRedis := os.Getenv("REDIS_ADDR"); envRedis != "" {
@@ -133,6 +159,11 @@ func main() {
 	livenessIntervalDuration, err := resolveLivenessInterval(livenessInterval)
 	if err != nil {
 		slog.Error("invalid --liveness-interval / AX_LIVENESS_INTERVAL", "error", err)
+		os.Exit(1)
+	}
+	taskLivenessInterval, err = resolveTaskLivenessInterval(taskLivenessInterval, os.Getenv("AX_TASK_LIVENESS_INTERVAL"))
+	if err != nil {
+		slog.Error("invalid --task-liveness-interval / AX_TASK_LIVENESS_INTERVAL", "error", err)
 		os.Exit(1)
 	}
 
@@ -186,6 +217,31 @@ func main() {
 
 	monitor := controller.NewTaskMonitor(rStore, reconciler, livenessIntervalDuration)
 	go monitor.Run(ctx)
+
+	routerAddr := os.Getenv("ATENET_ROUTER_ADDR")
+	if taskLivenessSweepEnabled(routerAddr, taskLivenessInterval) {
+		checker := controller.NewLivenessChecker(rStore, subClient, routerAddr)
+		checker.Threshold = taskLivenessThreshold
+		slog.Info("task liveness sweep",
+			"interval", taskLivenessInterval,
+			"threshold", taskLivenessThreshold,
+			"routerAddr", routerAddr,
+		)
+		go func() {
+			ticker := time.NewTicker(taskLivenessInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					checker.SweepOnce(ctx)
+				}
+			}
+		}()
+	} else {
+		slog.Info("task liveness sweep disabled", "routerAddr", routerAddr, "interval", taskLivenessInterval)
+	}
 
 	worker := controller.NewWorker(rStore, reconciler, redisGroup, redisConsumer)
 	if err := worker.Run(ctx); err != nil && err != context.Canceled {
