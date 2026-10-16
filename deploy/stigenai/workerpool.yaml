@@ -64,12 +64,14 @@ spec:
     # The env var AX_DEFAULT_TASK_MEMORY, in deploy/stigenai/kustomization.yaml,
     # sets this quantity.
     #
-    # ax-9qu increased this quantity from 4Gi to 7680Mi. A Claude Code session
-    # plus a Go or Node build must have more than 4Gi.
+    # ax-9qu increased this quantity from 4Gi to 8Gi. A Claude Code session
+    # needs more than 4Gi. A Go or Node build also needs more than 4Gi.
+    # The person set this value by hand, live, at 8Gi on 2026-10-16 03:20Z.
+    # This repo now matches that live value.
     #
     # At this time, a 16Gi (16384Mi) worker accepts at most 2 tasks.
-    # 2*7680Mi=15360Mi is less than 16384Mi. 3*7680Mi=23040Mi is more than
-    # 16384Mi.
+    # 2*8192Mi=16384Mi equals the worker limit exactly. 3*8192Mi=24576Mi is
+    # more than 16384Mi.
     #
     # 6 workers accept 12 tasks in total. A 13th task on a full pool waits.
     # Its phase is Pending, with reason WaitingForCapacity. It is not put
@@ -78,9 +80,11 @@ spec:
     # This same booked quantity is also the hard cgroup memory cap of the task
     # (ax-768). ax-j8u tells Substrate to divide booking from cap.
     #
-    # 2*7680Mi plus about 400Mi for ateom itself is 15760Mi. That is less than
-    # the 16384Mi pod limit. So 2 tasks at their own cap do not also cause an
-    # OOM in the pod around them.
+    # 2*8192Mi leaves no margin inside the 16384Mi pod limit for ateom's own
+    # overhead (about 400Mi). The earlier 7680Mi default left that margin;
+    # 8Gi does not. So 2 tasks, each already at its own 8Gi cap, can still
+    # push the pod itself to its limit. The person accepted this risk when
+    # setting the live value. This change does not fix it.
     #
     # ax-9gp: AX_MAX_TASK_MEMORY is set in
     # deploy/stigenai/kustomization.yaml, on both ax-server and

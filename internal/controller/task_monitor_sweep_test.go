@@ -139,11 +139,11 @@ func (r *sandboxRouter) addr() string {
 	return strings.TrimPrefix(r.srv.URL, "http://")
 }
 
-// setRouterEnv points ATENET_ROUTER_ADDR at router for the life of the
-// test, mirroring the only path that reaches it in production (main.go).
-func setRouterEnv(t *testing.T, router *sandboxRouter) {
-	t.Helper()
-	t.Setenv("ATENET_ROUTER_ADDR", router.addr())
+// setRouterAddr points monitor.RouterAddr at router. main.go sets this
+// field the same way, once, from ATENET_ROUTER_ADDR (ax-9qu.16). A test
+// sets the field directly instead of the environment variable.
+func setRouterAddr(monitor *controller.TaskMonitor, router *sandboxRouter) {
+	monitor.RouterAddr = router.addr()
 }
 
 // TestTaskMonitorSweepCrashedActorFailsWithActorCrashed covers AC4's crashed
@@ -314,10 +314,10 @@ func TestTaskMonitorSandboxUnresponsiveNeedsThresholdAndWindow(t *testing.T) {
 			}
 			router := newSandboxRouter(t)
 			router.set("default", "task1", "dead")
-			setRouterEnv(t, router)
 			mockSrv := &mockControlServer{getActorActor: runningActor()}
 			reconciler := newTestReconciler(t, mockSrv)
 			monitor := controller.NewTaskMonitor(s, reconciler, 0)
+			setRouterAddr(monitor, router)
 
 			start := time.Now()
 			for _, d := range tt.clocks {
@@ -340,6 +340,46 @@ func TestTaskMonitorSandboxUnresponsiveNeedsThresholdAndWindow(t *testing.T) {
 	}
 }
 
+// TestTaskMonitorRouterTransportErrorStaysInconclusive covers ax-9qu.15.
+//
+// A closed listener refuses every dial. This is a transport-level failure
+// to reach atenet-router itself. It is not proof the sandbox died. The
+// probe must not count it as a miss.
+//
+// Without this fix, a router outage of 90s or more fails every RUNNING
+// task with SandboxUnresponsive. This is PR #14 review finding 1.
+//
+// This test runs 4 sweeps spanning well over 90s. The task must still be
+// Running at the end.
+func TestTaskMonitorRouterTransportErrorStaysInconclusive(t *testing.T) {
+	ctx := context.Background()
+	s := memory.NewStore()
+	task := taskWithWorker("default", "task1", "task1", deadRunnerAddr(t), "id-1")
+	if err := s.SaveTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	mockSrv := &mockControlServer{getActorActor: runningActor()}
+	reconciler := newTestReconciler(t, mockSrv)
+	monitor := controller.NewTaskMonitor(s, reconciler, 0)
+	// A closed listener refuses every dial: a transport error, not an
+	// HTTP response. This differs from a dead sandboxRouter reply (tested
+	// above), which is a real response and must count as a miss.
+	monitor.RouterAddr = deadRunnerAddr(t)
+
+	start := time.Now()
+	for _, d := range []time.Duration{0, 45 * time.Second, 95 * time.Second, 200 * time.Second} {
+		sweepWithClock(ctx, monitor, start.Add(d))
+	}
+
+	got, err := s.GetTask(ctx, "default", "task1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.GetStatus().GetPhase() != "Running" {
+		t.Fatalf("phase = %q, want Running: a router transport error must stay inconclusive, not a miss", got.GetStatus().GetPhase())
+	}
+}
+
 // TestTaskMonitorReadyz503WorkspaceInitializingStaysRunning covers AC5's
 // alive predicate: a 503 naming workspace setup counts as alive, so the task
 // stays Running even after many sweeps.
@@ -353,10 +393,10 @@ func TestTaskMonitorReadyz503WorkspaceInitializingStaysRunning(t *testing.T) {
 	}
 	router := newSandboxRouter(t)
 	router.set("default", "task1", "initializing")
-	setRouterEnv(t, router)
 	mockSrv := &mockControlServer{getActorActor: runningActor()}
 	reconciler := newTestReconciler(t, mockSrv)
 	monitor := controller.NewTaskMonitor(s, reconciler, 0)
+	setRouterAddr(monitor, router)
 
 	start := time.Now()
 	for i := 0; i < 5; i++ {
@@ -390,7 +430,6 @@ func TestTaskMonitorFailTaskSkipsWriteWhenStatusIDChanged(t *testing.T) {
 	}
 	router := newSandboxRouter(t)
 	router.set("default", "task1", "dead")
-	setRouterEnv(t, router)
 
 	raced := &raceStore{Store: inner, hook: func() {
 		if err := inner.UpdateTaskStatus(ctx, "default", "task1", &v1alpha1.TaskStatus{
@@ -403,6 +442,7 @@ func TestTaskMonitorFailTaskSkipsWriteWhenStatusIDChanged(t *testing.T) {
 	mockSrv := &mockControlServer{getActorActor: runningActor()}
 	reconciler := newTestReconciler(t, mockSrv)
 	monitor := controller.NewTaskMonitor(raced, reconciler, 0)
+	setRouterAddr(monitor, router)
 
 	start := time.Now()
 	sweepWithClock(ctx, monitor, start)
@@ -434,7 +474,6 @@ func TestTaskMonitorFailTaskSkipsWriteWhenPhaseLeftRunning(t *testing.T) {
 	}
 	router := newSandboxRouter(t)
 	router.set("default", "task1", "dead")
-	setRouterEnv(t, router)
 
 	raced := &raceStore{Store: inner, hook: func() {
 		if err := inner.UpdateTaskStatus(ctx, "default", "task1", &v1alpha1.TaskStatus{
@@ -447,6 +486,7 @@ func TestTaskMonitorFailTaskSkipsWriteWhenPhaseLeftRunning(t *testing.T) {
 	mockSrv := &mockControlServer{getActorActor: runningActor()}
 	reconciler := newTestReconciler(t, mockSrv)
 	monitor := controller.NewTaskMonitor(raced, reconciler, 0)
+	setRouterAddr(monitor, router)
 
 	start := time.Now()
 	sweepWithClock(ctx, monitor, start)
@@ -503,11 +543,11 @@ func TestTaskMonitorRunDisabledNeverListsTasks(t *testing.T) {
 }
 
 // TestTaskMonitorNoRouterAddrDisablesSandboxCheck covers ax-9qu.10: with no
-// ATENET_ROUTER_ADDR, the SandboxUnresponsive check must stay off, not fail
-// a task from a direct dial that would 421 for lack of the
-// ate-target-actor header atunnel's ingress requires on every request.
+// RouterAddr (the ax-9qu.16 field, unset here), the SandboxUnresponsive
+// check must stay off, not fail a task from a direct dial that would 421
+// for lack of the ate-target-actor header atunnel's ingress requires on
+// every request.
 func TestTaskMonitorNoRouterAddrDisablesSandboxCheck(t *testing.T) {
-	t.Setenv("ATENET_ROUTER_ADDR", "")
 	ctx := context.Background()
 	s := memory.NewStore()
 	task := taskWithWorker("default", "task1", "task1", deadRunnerAddr(t), "id-1")
@@ -517,6 +557,7 @@ func TestTaskMonitorNoRouterAddrDisablesSandboxCheck(t *testing.T) {
 	mockSrv := &mockControlServer{getActorActor: runningActor()}
 	reconciler := newTestReconciler(t, mockSrv)
 	monitor := controller.NewTaskMonitor(s, reconciler, 0)
+	// monitor.RouterAddr is left at its zero value ("") on purpose.
 
 	start := time.Now()
 	for _, d := range []time.Duration{0, 45 * time.Second, 95 * time.Second, 200 * time.Second} {
@@ -534,9 +575,10 @@ func TestTaskMonitorNoRouterAddrDisablesSandboxCheck(t *testing.T) {
 
 // TestTaskMonitorStaleAssignmentDefersToLivenessChecker covers ax-9qu.8: a
 // 421 with X-Ate-Assignment-Stale is LivenessChecker's signal, on its own
-// threshold and timeline (docs/networking.md). TaskMonitor must not count
-// it toward SandboxUnresponsive: that would fail the same task for the
-// same symptom on a shorter timeline than the documented one.
+// threshold and timeline (docs/networking.md), when LivenessChecker will
+// run (DeferStaleAssignment true, ax-9qu.17). TaskMonitor must not count it
+// toward SandboxUnresponsive: that would fail the same task for the same
+// symptom on a shorter timeline than the documented one.
 func TestTaskMonitorStaleAssignmentDefersToLivenessChecker(t *testing.T) {
 	ctx := context.Background()
 	s := memory.NewStore()
@@ -546,10 +588,11 @@ func TestTaskMonitorStaleAssignmentDefersToLivenessChecker(t *testing.T) {
 	}
 	router := newSandboxRouter(t)
 	router.set("default", "task1", "stale")
-	setRouterEnv(t, router)
 	mockSrv := &mockControlServer{getActorActor: runningActor()}
 	reconciler := newTestReconciler(t, mockSrv)
 	monitor := controller.NewTaskMonitor(s, reconciler, 0)
+	setRouterAddr(monitor, router)
+	monitor.DeferStaleAssignment = true
 
 	start := time.Now()
 	for _, d := range []time.Duration{0, 45 * time.Second, 95 * time.Second} {
@@ -562,6 +605,43 @@ func TestTaskMonitorStaleAssignmentDefersToLivenessChecker(t *testing.T) {
 	}
 	if got.GetStatus().GetPhase() != "Running" {
 		t.Fatalf("phase = %q, want Running: a stale-assignment 421 is LivenessChecker's signal, not TaskMonitor's", got.GetStatus().GetPhase())
+	}
+}
+
+// TestTaskMonitorStaleAssignmentFailsWhenLivenessCheckerIsOff covers
+// ax-9qu.17: with DeferStaleAssignment false (LivenessChecker's sweep is
+// off, for example --task-liveness-interval=0), nothing else catches a
+// stale-routed task. TaskMonitor must count the 421 like any other dead
+// probe, instead of silently leaving the task Running forever.
+func TestTaskMonitorStaleAssignmentFailsWhenLivenessCheckerIsOff(t *testing.T) {
+	ctx := context.Background()
+	s := memory.NewStore()
+	task := taskWithWorker("default", "task1", "task1", deadRunnerAddr(t), "id-1")
+	if err := s.SaveTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	router := newSandboxRouter(t)
+	router.set("default", "task1", "stale")
+	mockSrv := &mockControlServer{getActorActor: runningActor()}
+	reconciler := newTestReconciler(t, mockSrv)
+	monitor := controller.NewTaskMonitor(s, reconciler, 0)
+	setRouterAddr(monitor, router)
+	// monitor.DeferStaleAssignment is left at its zero value (false).
+
+	start := time.Now()
+	for _, d := range []time.Duration{0, 45 * time.Second, 95 * time.Second} {
+		sweepWithClock(ctx, monitor, start.Add(d))
+	}
+
+	got, err := s.GetTask(ctx, "default", "task1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.GetStatus().GetPhase() != "Failed" {
+		t.Fatalf("phase = %q, want Failed: with LivenessChecker off, TaskMonitor must catch a stale-routed task itself", got.GetStatus().GetPhase())
+	}
+	if reason := readyReason(got); reason != "SandboxUnresponsive" {
+		t.Fatalf("Ready reason = %q, want SandboxUnresponsive", reason)
 	}
 }
 
@@ -578,10 +658,10 @@ func TestTaskMonitorProbeUsesAteTargetActorHeaderAndRouterAlive(t *testing.T) {
 	}
 	router := newSandboxRouter(t)
 	router.set("default", "task1", "alive")
-	setRouterEnv(t, router)
 	mockSrv := &mockControlServer{getActorActor: runningActor()}
 	reconciler := newTestReconciler(t, mockSrv)
 	monitor := controller.NewTaskMonitor(s, reconciler, 0)
+	setRouterAddr(monitor, router)
 
 	monitor.Sweep(ctx)
 
@@ -617,10 +697,10 @@ func TestTaskMonitorMissStreakResetsOnAliveProbe(t *testing.T) {
 		t.Fatal(err)
 	}
 	router := newSandboxRouter(t)
-	setRouterEnv(t, router)
 	mockSrv := &mockControlServer{getActorActor: runningActor()}
 	reconciler := newTestReconciler(t, mockSrv)
 	monitor := controller.NewTaskMonitor(s, reconciler, 0)
+	setRouterAddr(monitor, router)
 
 	start := time.Now()
 	router.set("default", "task1", "dead")
@@ -658,10 +738,10 @@ func TestTaskMonitorPruneMissesAcrossNonRunningGap(t *testing.T) {
 	}
 	router := newSandboxRouter(t)
 	router.set("default", "task1", "dead")
-	setRouterEnv(t, router)
 	mockSrv := &mockControlServer{getActorActor: runningActor()}
 	reconciler := newTestReconciler(t, mockSrv)
 	monitor := controller.NewTaskMonitor(s, reconciler, 0)
+	setRouterAddr(monitor, router)
 
 	start := time.Now()
 	// Two dead probes, still short of the 3-miss threshold.

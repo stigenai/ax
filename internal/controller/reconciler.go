@@ -88,7 +88,7 @@ type TaskReconciler struct {
 	// to report ready before recording it as still initializing.
 	WorkspaceReadyTimeout time.Duration
 
-	// DefaultTaskMemory is a Substrate quantity, for example "7680Mi". Reconcile
+	// DefaultTaskMemory is a Substrate quantity, for example "8Gi". Reconcile
 	// books it as the memory limit for a non-supervisor task that sets no
 	// spec.resources.limits.memory. An empty value disables the default: the
 	// task's actor then gets no top-level memory booking. Reconcile never

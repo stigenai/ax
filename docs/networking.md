@@ -117,7 +117,11 @@ For each task, TaskMonitor calls Substrate's `GetActor`, with a 5s timeout. It t
 
 TaskMonitor probes the runner's `/readyz` only when Substrate still reports the actor `RUNNING`, through atenet-router with the `ate-target-actor` header. Do not dial the runner directly. A direct dial has no such header, and Substrate's atunnel ingress returns 421 for every request without one. The probe needs `ATENET_ROUTER_ADDR`. If `ATENET_ROUTER_ADDR` is unset, this check stays off and the miss count resets.
 
-A 200 response means the runner is alive. A 503 that names workspace setup as the cause also means alive. Both results reset the miss count. Any other result is a miss, except a 421 with `X-Ate-Assignment-Stale: true`. That 421 is neither alive nor a miss (see "Which sweep fails a task first" below). After 3 consecutive misses that span at least 90s, the task fails with reason `SandboxUnresponsive`.
+A 200 response means the runner is alive. A 503 that names workspace setup as the cause also means alive. Both results reset the miss count.
+
+Some failures do not reach atenet-router. Examples are a refused dial, a timeout, and a router that is down. The check can also fail to build or send the request. These are transport failures, not responses from the router. TaskMonitor treats a transport failure as inconclusive and does not change the miss count. A router outage must not count as proof that every RUNNING task's sandbox died.
+
+Any other result is a real HTTP response from the router. Each such response counts as a miss. The only exception is a 421 with `X-Ate-Assignment-Stale: true`. That 421 is neither alive nor a miss (see "Which sweep fails a task first" below). After 3 consecutive misses that span at least 90s, the task fails with reason `SandboxUnresponsive`.
 
 When TaskMonitor fails a task, it sets the phase to `Failed`. It clears `Status.WorkerIp`. It sets condition `Ready=False` with the reason and a message, in the same format as the LivenessChecker message. TaskMonitor writes only if the task still has the same `status.id` and is still `Running`. A task that changed in between is never overwritten with stale information.
 
@@ -130,7 +134,9 @@ LivenessChecker and TaskMonitor both probe atenet-router. They answer different 
 - LivenessChecker asks whether routing is stale, because a worker restarted in place and the router still sends it requests. Its threshold is 3 consecutive stale misses over `--task-liveness-interval` (default `1m`), about 3 minutes end to end.
 - TaskMonitor asks whether the actor is gone, or whether the runner inside it has stopped answering at all. Its threshold is 3 consecutive misses that span at least 90s, checked every `--sandbox-check-interval` (default `30s`).
 
-LivenessChecker alone handles a router response of 421 with `X-Ate-Assignment-Stale: true`. TaskMonitor sees the same response during its own `/readyz` probe. It treats the response as neither alive nor a miss. It resets its own miss count and leaves the task to LivenessChecker. Without this rule, the shorter TaskMonitor window fails the task for the same stale-routing symptom before LivenessChecker's 3-minute check runs. The task would then get the wrong reason: `SandboxUnresponsive`, not `ActorLost` or `ActorMissing`.
+LivenessChecker's sweep is active when `ATENET_ROUTER_ADDR` is set and `--task-liveness-interval` is above `0`. When it is active, LivenessChecker alone handles a router response of 421 with `X-Ate-Assignment-Stale: true`. TaskMonitor sees the same response during its own `/readyz` probe. TaskMonitor does not count that response as alive or as a miss. It resets its own miss count instead. It lets LivenessChecker decide the outcome. Without this deferral, TaskMonitor's shorter window would fail the task first, for the same stale-routing cause. The task would then get the wrong reason: `SandboxUnresponsive`, not `ActorLost` or `ActorMissing`.
+
+LivenessChecker's sweep does not run when `ATENET_ROUTER_ADDR` is unset, or when `--task-liveness-interval` is `0`. In that case, no other sweep catches a task with stale routing. TaskMonitor must count the 421 as a miss, like any other dead probe. It uses its own `SandboxUnresponsive` threshold. Otherwise, the task stays `Running` forever (ax-9qu.17).
 
 ## Manual check on gtr
 

@@ -659,12 +659,12 @@ func TestTaskReconciler_DefaultTaskMemory(t *testing.T) {
 	t.Run("no task limit gets the controller default", func(t *testing.T) {
 		mockSrv := &mockControlServer{}
 		r := newTestReconciler(t, mockSrv)
-		r.DefaultTaskMemory = "7680Mi"
+		r.DefaultTaskMemory = "8Gi"
 		if _, err := r.Reconcile(context.Background(), envTask("x")); err != nil {
 			t.Fatalf("Reconcile failed: %v", err)
 		}
-		if got := taskTopLevelMemory(mockSrv.lastTemplate); got != "7680Mi" {
-			t.Errorf("top-level memory = %q, want 7680Mi", got)
+		if got := taskTopLevelMemory(mockSrv.lastTemplate); got != "8Gi" {
+			t.Errorf("top-level memory = %q, want 8Gi", got)
 		}
 	})
 
@@ -704,7 +704,7 @@ func TestTaskReconciler_DefaultTaskMemory(t *testing.T) {
 
 		withDefault := &mockControlServer{}
 		r2 := newTestReconciler(t, withDefault)
-		r2.DefaultTaskMemory = "7680Mi"
+		r2.DefaultTaskMemory = "8Gi"
 		if _, err := r2.Reconcile(context.Background(), envTask("x")); err != nil {
 			t.Fatalf("Reconcile failed: %v", err)
 		}
