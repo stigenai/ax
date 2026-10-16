@@ -37,8 +37,6 @@ patches:
                   # task that names no memory limit of its own, so Substrate's
                   # scheduler stops placing more tasks than a worker can hold.
                   # See deploy/stigenai/workerpool.yaml for the sizing math.
-                  # The person set this value live by hand at 8Gi on
-                  # 2026-10-16 03:20Z; this commit makes the repo match it.
                   - name: AX_DEFAULT_TASK_MEMORY
                     value: 8Gi
                   # ax-9gp: a task's own (or default) memory limit can
