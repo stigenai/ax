@@ -21,6 +21,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"google.golang.org/grpc/codes"
@@ -66,10 +67,10 @@ func TestClassifyActorLoss(t *testing.T) {
 		wantReason string
 	}{
 		{
-			name:       "a NotFound error means the actor record is gone",
+			name:       "a NotFound error means Substrate no longer knows the actor",
 			err:        status.Error(codes.NotFound, "actor not found"),
 			wantLost:   true,
-			wantReason: "ActorLost",
+			wantReason: "ActorMissing",
 		},
 		{
 			name:       "a crash message naming OOM is OOMKilled",
@@ -111,7 +112,7 @@ func TestClassifyActorLoss(t *testing.T) {
 
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
-			reason, message, lost := classifyActorLoss(tt.actor, tt.err)
+			reason, message, lost := classifyActorLoss("task1", tt.actor, tt.err)
 			if lost != tt.wantLost {
 				t.Fatalf("classifyActorLoss() lost = %v, want %v", lost, tt.wantLost)
 			}
@@ -138,12 +139,34 @@ func TestClassifyActorLossTruncatesMessage(t *testing.T) {
 			Crash: &ateapipb.ActorCrash{Message: huge},
 		},
 	}
-	_, message, lost := classifyActorLoss(actor, nil)
+	_, message, lost := classifyActorLoss("task1", actor, nil)
 	if !lost {
 		t.Fatal("want lost=true for a crashed actor")
 	}
 	if len(message) != maxCrashMessageBytes {
 		t.Fatalf("message length = %d, want %d", len(message), maxCrashMessageBytes)
+	}
+}
+
+// TestTruncateMessageCutsOnRuneBoundary covers ax-9qu.12: a naive byte slice
+// at maxCrashMessageBytes can land inside a multi-byte UTF-8 rune.
+// truncateMessage must back up to a whole rune instead, so the result stays
+// valid UTF-8. An invalid result fails protojson's write of the Condition
+// (reproduced: "Condition.message contains invalid UTF-8"), which would
+// leave the task stuck Running instead of moving to Failed.
+func TestTruncateMessageCutsOnRuneBoundary(t *testing.T) {
+	// "世" is a 3-byte rune. maxCrashMessageBytes (512) is not a multiple of
+	// 3, so a naive msg[:512] on a long run of this rune cuts mid-rune.
+	huge := strings.Repeat("世", maxCrashMessageBytes)
+	got := truncateMessage(huge)
+	if !utf8.ValidString(got) {
+		t.Fatalf("truncateMessage returned invalid UTF-8: %q", got)
+	}
+	if len(got) > maxCrashMessageBytes {
+		t.Fatalf("truncateMessage length = %d, want <= %d", len(got), maxCrashMessageBytes)
+	}
+	if len(got) == 0 {
+		t.Fatal("truncateMessage returned empty for a huge input")
 	}
 }
 

@@ -132,21 +132,22 @@ func TestCheckDefaultWithinMax(t *testing.T) {
 	}
 }
 
-// TestLivenessIntervalFlagDefault pins --liveness-interval's default at 30s.
-func TestLivenessIntervalFlagDefault(t *testing.T) {
-	if livenessIntervalDefault != "30s" {
-		t.Fatalf("livenessIntervalDefault = %q, want 30s", livenessIntervalDefault)
+// TestSandboxCheckIntervalFlagDefault pins --sandbox-check-interval's
+// default at 30s.
+func TestSandboxCheckIntervalFlagDefault(t *testing.T) {
+	if sandboxCheckIntervalDefault != "30s" {
+		t.Fatalf("sandboxCheckIntervalDefault = %q, want 30s", sandboxCheckIntervalDefault)
 	}
-	got, err := resolveLivenessInterval(livenessIntervalDefault)
+	got, err := resolveSandboxCheckInterval(sandboxCheckIntervalDefault)
 	if err != nil {
-		t.Fatalf("resolveLivenessInterval(%q) returned an unexpected error: %v", livenessIntervalDefault, err)
+		t.Fatalf("resolveSandboxCheckInterval(%q) returned an unexpected error: %v", sandboxCheckIntervalDefault, err)
 	}
 	if got != 30*time.Second {
-		t.Fatalf("resolveLivenessInterval(%q) = %v, want 30s", livenessIntervalDefault, got)
+		t.Fatalf("resolveSandboxCheckInterval(%q) = %v, want 30s", sandboxCheckIntervalDefault, got)
 	}
 }
 
-func TestResolveLivenessInterval(t *testing.T) {
+func TestResolveSandboxCheckInterval(t *testing.T) {
 	cases := []struct {
 		name    string
 		value   string
@@ -161,18 +162,18 @@ func TestResolveLivenessInterval(t *testing.T) {
 	}
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := resolveLivenessInterval(tt.value)
+			got, err := resolveSandboxCheckInterval(tt.value)
 			if tt.wantErr {
 				if err == nil {
-					t.Fatalf("resolveLivenessInterval(%q) = %v, nil; want an error", tt.value, got)
+					t.Fatalf("resolveSandboxCheckInterval(%q) = %v, nil; want an error", tt.value, got)
 				}
 				return
 			}
 			if err != nil {
-				t.Fatalf("resolveLivenessInterval(%q) returned an unexpected error: %v", tt.value, err)
+				t.Fatalf("resolveSandboxCheckInterval(%q) returned an unexpected error: %v", tt.value, err)
 			}
 			if got != tt.want {
-				t.Fatalf("resolveLivenessInterval(%q) = %v, want %v", tt.value, got, tt.want)
+				t.Fatalf("resolveSandboxCheckInterval(%q) = %v, want %v", tt.value, got, tt.want)
 			}
 		})
 	}
