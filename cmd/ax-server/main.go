@@ -31,15 +31,16 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 )
 
-// resolveMaxTaskMemory parses the --max-task-memory / AX_MAX_TASK_MEMORY value.
-// The result is the cap UpdateTask enforces.
+// resolveMaxQuantity parses a flag or env value for a resource cap. Two
+// callers use it: --max-task-memory / AX_MAX_TASK_MEMORY and
+// --max-task-cpu / AX_MAX_TASK_CPU. The result is the cap UpdateTask
+// enforces for that resource.
 //
 // Empty or "0" disables the check and returns a zero Quantity.
-// This matches resolveDefaultTaskMemory, its ax-controller counterpart.
 //
-// Any other value must parse as a Kubernetes resource.Quantity greater than zero.
+// Any other value must parse as a Kubernetes resource.Quantity above zero.
 // If it does not, the server must not start.
-func resolveMaxTaskMemory(value string) (resource.Quantity, error) {
+func resolveMaxQuantity(value string) (resource.Quantity, error) {
 	if value == "0" || value == "" {
 		return resource.Quantity{}, nil
 	}
@@ -59,12 +60,14 @@ func main() {
 		redisAddr     string
 		redisPassword string
 		maxTaskMemory string
+		maxTaskCPU    string
 	)
 
 	flag.StringVar(&listenAddr, "addr", ":8080", "HTTP listen address")
 	flag.StringVar(&redisAddr, "redis-addr", "localhost:6379", "Redis server address")
 	flag.StringVar(&redisPassword, "redis-password", "", "Redis password")
 	flag.StringVar(&maxTaskMemory, "max-task-memory", "", "Largest memory limit any worker can hold (Kubernetes quantity, e.g. 16Gi); UpdateTask rejects a task above it. Empty or 0 disables the check")
+	flag.StringVar(&maxTaskCPU, "max-task-cpu", "", "Largest cpu limit any worker can hold (Kubernetes quantity, e.g. 6); UpdateTask rejects a task above it. Empty or 0 disables the check")
 	flag.Parse()
 
 	if envAddr := os.Getenv("ADDR"); envAddr != "" {
@@ -79,16 +82,24 @@ func main() {
 	if envMax := os.Getenv("AX_MAX_TASK_MEMORY"); envMax != "" {
 		maxTaskMemory = envMax
 	}
-	maxTaskMemoryQuantity, err := resolveMaxTaskMemory(maxTaskMemory)
+	if envMaxCPU := os.Getenv("AX_MAX_TASK_CPU"); envMaxCPU != "" {
+		maxTaskCPU = envMaxCPU
+	}
+	maxTaskMemoryQuantity, err := resolveMaxQuantity(maxTaskMemory)
 	if err != nil {
 		slog.Error("invalid --max-task-memory / AX_MAX_TASK_MEMORY", "error", err)
+		os.Exit(1)
+	}
+	maxTaskCPUQuantity, err := resolveMaxQuantity(maxTaskCPU)
+	if err != nil {
+		slog.Error("invalid --max-task-cpu / AX_MAX_TASK_CPU", "error", err)
 		os.Exit(1)
 	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
 
-	slog.Info("starting ax-server", "listenAddr", listenAddr, "redisAddr", redisAddr, "maxTaskMemory", maxTaskMemoryQuantity.String())
+	slog.Info("starting ax-server", "listenAddr", listenAddr, "redisAddr", redisAddr, "maxTaskMemory", maxTaskMemoryQuantity.String(), "maxTaskCpu", maxTaskCPUQuantity.String())
 
 	rClient := goredis.NewClient(&goredis.Options{
 		Addr:     redisAddr,
@@ -99,6 +110,7 @@ func main() {
 	rStore := redis.NewStore(rClient, redis.Options{})
 	srv := server.NewServer(rStore)
 	srv.MaxTaskMemory = maxTaskMemoryQuantity
+	srv.MaxTaskCPU = maxTaskCPUQuantity
 
 	httpServer := &http.Server{
 		Addr:    listenAddr,
