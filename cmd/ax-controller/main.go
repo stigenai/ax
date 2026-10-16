@@ -122,6 +122,57 @@ func resolveSandboxCheckInterval(value string) (time.Duration, error) {
 	return time.ParseDuration(value)
 }
 
+// deleteSweepIntervalDefault is the --delete-sweep-interval /
+// AX_DELETE_SWEEP_INTERVAL value used when neither is set.
+//
+// The ax-8qz postmortem (ax-706) found actors stuck in
+// ACTOR_STATE_DELETING for about 8.5 hours. No alert or sweep caught
+// them. 5 minutes bounds how long a dropped retry can go unnoticed
+// before DeletionSweeper republishes it.
+const deleteSweepIntervalDefault = 5 * time.Minute
+
+// deleteSweepMinAgeDefault is the --delete-sweep-min-age /
+// AX_DELETE_SWEEP_MIN_AGE value used when neither is set: how long a
+// Terminating task or a DELETING actor must sit before DeletionSweeper
+// counts and acts on it. 15 minutes matches the postmortem's own
+// threshold for "stuck" (ax-706).
+const deleteSweepMinAgeDefault = 15 * time.Minute
+
+// resolveDeleteSweepInterval reads the AX_DELETE_SWEEP_INTERVAL override
+// for the --delete-sweep-interval flag. The caller passes the env value.
+// An empty envValue keeps flagValue. The value "0" (or env "0") turns off
+// the sweep.
+func resolveDeleteSweepInterval(flagValue time.Duration, envValue string) (time.Duration, error) {
+	if envValue == "" {
+		return flagValue, nil
+	}
+	d, err := time.ParseDuration(envValue)
+	if err != nil {
+		return 0, fmt.Errorf("invalid duration %q: %w", envValue, err)
+	}
+	return d, nil
+}
+
+// resolveDeleteSweepMinAge reads the AX_DELETE_SWEEP_MIN_AGE override for
+// the --delete-sweep-min-age flag. The caller passes the env value. An
+// empty envValue keeps flagValue. Unlike the sweep interval, a 0 or
+// negative result is always an error, never a way to turn the age check
+// off: the controller must not start with a bad value here.
+func resolveDeleteSweepMinAge(flagValue time.Duration, envValue string) (time.Duration, error) {
+	d := flagValue
+	if envValue != "" {
+		parsed, err := time.ParseDuration(envValue)
+		if err != nil {
+			return 0, fmt.Errorf("invalid duration %q: %w", envValue, err)
+		}
+		d = parsed
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("must be greater than zero, got %v", d)
+	}
+	return d, nil
+}
+
 // resolveTaskLivenessInterval reads the AX_TASK_LIVENESS_INTERVAL override
 // for the --task-liveness-interval flag. The caller passes the env value.
 // An empty envValue keeps flagValue. The value "0" turns off the sweep.
@@ -164,6 +215,8 @@ func main() {
 		nativeTLSDestination    string
 		taskLivenessInterval    time.Duration
 		taskLivenessThreshold   int
+		deleteSweepInterval     time.Duration
+		deleteSweepMinAge       time.Duration
 	)
 
 	flag.StringVar(&redisAddr, "redis-addr", "localhost:6379", "Redis server address (e.g. localhost:6379)")
@@ -184,6 +237,8 @@ func main() {
 	flag.StringVar(&nativeTLSDestination, "native-tls-destination", "", "Private protected-actor TLS destination; install or verify exact policy before resume")
 	flag.DurationVar(&taskLivenessInterval, "task-liveness-interval", time.Minute, "How often to probe each Running task's actor through atenet-router; 0 turns off the sweep (env AX_TASK_LIVENESS_INTERVAL)")
 	flag.IntVar(&taskLivenessThreshold, "task-liveness-threshold", controller.DefaultLivenessThreshold, "Consecutive stale probes that mark a Running task Failed")
+	flag.DurationVar(&deleteSweepInterval, "delete-sweep-interval", deleteSweepIntervalDefault, "How often DeletionSweeper checks for stuck Terminating tasks and stuck DELETING actors; 0 disables it (env AX_DELETE_SWEEP_INTERVAL)")
+	flag.DurationVar(&deleteSweepMinAge, "delete-sweep-min-age", deleteSweepMinAgeDefault, "How long a Terminating task or a DELETING actor must sit before DeletionSweeper counts and acts on it; must be greater than zero (env AX_DELETE_SWEEP_MIN_AGE)")
 	flag.Parse()
 
 	if envRedis := os.Getenv("REDIS_ADDR"); envRedis != "" {
@@ -226,6 +281,16 @@ func main() {
 	taskLivenessInterval, err = resolveTaskLivenessInterval(taskLivenessInterval, os.Getenv("AX_TASK_LIVENESS_INTERVAL"))
 	if err != nil {
 		slog.Error("invalid --task-liveness-interval / AX_TASK_LIVENESS_INTERVAL", "error", err)
+		os.Exit(1)
+	}
+	deleteSweepInterval, err = resolveDeleteSweepInterval(deleteSweepInterval, os.Getenv("AX_DELETE_SWEEP_INTERVAL"))
+	if err != nil {
+		slog.Error("invalid --delete-sweep-interval / AX_DELETE_SWEEP_INTERVAL", "error", err)
+		os.Exit(1)
+	}
+	deleteSweepMinAge, err = resolveDeleteSweepMinAge(deleteSweepMinAge, os.Getenv("AX_DELETE_SWEEP_MIN_AGE"))
+	if err != nil {
+		slog.Error("invalid --delete-sweep-min-age / AX_DELETE_SWEEP_MIN_AGE", "error", err)
 		os.Exit(1)
 	}
 
@@ -326,6 +391,32 @@ func main() {
 		}()
 	} else {
 		slog.Info("task liveness sweep disabled", "routerAddr", routerAddr, "interval", taskLivenessInterval)
+	}
+
+	if deleteSweepInterval > 0 {
+		sweeper := &controller.DeletionSweeper{
+			Store:  rStore,
+			Actors: subClient,
+			MinAge: deleteSweepMinAge,
+		}
+		slog.Info("delete sweep",
+			"interval", deleteSweepInterval,
+			"minAge", deleteSweepMinAge,
+		)
+		go func() {
+			ticker := time.NewTicker(deleteSweepInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					sweeper.SweepOnce(ctx)
+				}
+			}
+		}()
+	} else {
+		slog.Info("delete sweep disabled", "interval", deleteSweepInterval)
 	}
 
 	worker := controller.NewWorker(rStore, reconciler, redisGroup, redisConsumer)

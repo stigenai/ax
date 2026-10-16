@@ -65,6 +65,8 @@ connection but does not answer, `StartProcess` fails within 30 seconds
 
 `ax-controller` runs two sweeps over every `Running` task: LivenessChecker and TaskMonitor. Each sweep can fail the same task, for a different reason and on a different timeline. See "Which sweep fails a task first" below.
 
+A third sweep, DeletionSweeper, checks `Terminating` tasks and `DELETING` Substrate actors. It does not check `Running` tasks. See [docs/stuck-deletions.md](stuck-deletions.md) for its runbook.
+
 ## LivenessChecker: stale routing after a worker restarts in place
 
 `ax-controller` probes the actor of each `Running` task through atenet-router's

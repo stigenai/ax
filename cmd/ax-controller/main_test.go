@@ -231,3 +231,92 @@ func TestTaskLivenessSweepEnabled(t *testing.T) {
 		})
 	}
 }
+
+// TestDeleteSweepIntervalFlagDefault pins --delete-sweep-interval's default
+// at 5 minutes (ax-706 AC7).
+func TestDeleteSweepIntervalFlagDefault(t *testing.T) {
+	if deleteSweepIntervalDefault != 5*time.Minute {
+		t.Fatalf("deleteSweepIntervalDefault = %v, want 5m", deleteSweepIntervalDefault)
+	}
+}
+
+func TestResolveDeleteSweepInterval(t *testing.T) {
+	cases := []struct {
+		name      string
+		flagValue time.Duration
+		envValue  string
+		want      time.Duration
+		wantErr   bool
+	}{
+		{name: "no env keeps the flag default", flagValue: 5 * time.Minute, envValue: "", want: 5 * time.Minute},
+		{name: "an env override parses and replaces the flag value", flagValue: 5 * time.Minute, envValue: "1m", want: time.Minute},
+		{name: "env 0 disables the sweep", flagValue: 5 * time.Minute, envValue: "0", want: 0},
+		{name: "an env value that does not parse as a duration is an error", flagValue: 5 * time.Minute, envValue: "not-a-duration", wantErr: true},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := resolveDeleteSweepInterval(tt.flagValue, tt.envValue)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("resolveDeleteSweepInterval(%v, %q) = %v, nil; want an error", tt.flagValue, tt.envValue, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolveDeleteSweepInterval(%v, %q) returned an unexpected error: %v", tt.flagValue, tt.envValue, err)
+			}
+			if got != tt.want {
+				t.Fatalf("resolveDeleteSweepInterval(%v, %q) = %v, want %v", tt.flagValue, tt.envValue, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestDeleteSweepMinAgeFlagDefault pins --delete-sweep-min-age's default at
+// 15 minutes (ax-706 AC7).
+func TestDeleteSweepMinAgeFlagDefault(t *testing.T) {
+	if deleteSweepMinAgeDefault != 15*time.Minute {
+		t.Fatalf("deleteSweepMinAgeDefault = %v, want 15m", deleteSweepMinAgeDefault)
+	}
+	got, err := resolveDeleteSweepMinAge(deleteSweepMinAgeDefault, "")
+	if err != nil {
+		t.Fatalf("resolveDeleteSweepMinAge(%v, \"\") returned an unexpected error: %v", deleteSweepMinAgeDefault, err)
+	}
+	if got != 15*time.Minute {
+		t.Fatalf("resolveDeleteSweepMinAge(%v, \"\") = %v, want 15m", deleteSweepMinAgeDefault, got)
+	}
+}
+
+func TestResolveDeleteSweepMinAge(t *testing.T) {
+	cases := []struct {
+		name      string
+		flagValue time.Duration
+		envValue  string
+		want      time.Duration
+		wantErr   bool
+	}{
+		{name: "no env keeps the flag default", flagValue: 15 * time.Minute, envValue: "", want: 15 * time.Minute},
+		{name: "an env override parses and replaces the flag value", flagValue: 15 * time.Minute, envValue: "10m", want: 10 * time.Minute},
+		{name: "env 0 is an error: min age must stay greater than zero", flagValue: 15 * time.Minute, envValue: "0", wantErr: true},
+		{name: "a negative env value is an error", flagValue: 15 * time.Minute, envValue: "-1m", wantErr: true},
+		{name: "a flag value of 0 with no env override is an error", flagValue: 0, envValue: "", wantErr: true},
+		{name: "an env value that does not parse as a duration is an error", flagValue: 15 * time.Minute, envValue: "not-a-duration", wantErr: true},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := resolveDeleteSweepMinAge(tt.flagValue, tt.envValue)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("resolveDeleteSweepMinAge(%v, %q) = %v, nil; want an error", tt.flagValue, tt.envValue, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolveDeleteSweepMinAge(%v, %q) returned an unexpected error: %v", tt.flagValue, tt.envValue, err)
+			}
+			if got != tt.want {
+				t.Fatalf("resolveDeleteSweepMinAge(%v, %q) = %v, want %v", tt.flagValue, tt.envValue, got, tt.want)
+			}
+		})
+	}
+}
