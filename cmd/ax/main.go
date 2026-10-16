@@ -21,10 +21,8 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"sort"
-	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -1105,51 +1103,27 @@ func runSSHExec(taskName string, cmdToRun []string, getTask taskGetter, dialRout
 		return fmt.Errorf("task %q does not expose guest services; set spec.debug: true and re-apply to enable ax ssh", taskName)
 	}
 
-	workerIP := task.Status.WorkerIp
-	if workerIP == "" {
-		return fmt.Errorf("task %q has no worker IP assigned", taskName)
+	if task.Status.Actor == "" {
+		return fmt.Errorf("task %q has no actor assigned", taskName)
 	}
 
-	// The runner serves guest services on port 80 unless the worker IP says otherwise.
-	host := workerIP
-	port := 80
-	if h, p, err := net.SplitHostPort(workerIP); err == nil {
-		host = h
-		if parsedPort, err := strconv.Atoi(p); err == nil {
-			port = parsedPort
-		}
-	}
-
+	// Routing never reads task.Status.WorkerIp: a worker can restart its
+	// container in place, keeping the same pod IP but losing every actor it
+	// held, so a cached IP cannot prove the actor still lives there.
+	// atenet-router resolves the actor's current worker on every request
+	// instead.
 	targetActor := fmt.Sprintf("%s/%s", task.Metadata.Atespace, task.Status.Actor)
-	var (
-		guestClient *guest.Client
-		cleanup     func()
-	)
 
-	// 1. First, check if worker IP is directly reachable (e.g. within cluster or local mesh)
-	d := net.Dialer{Timeout: 500 * time.Millisecond}
-	guestEndpoint := net.JoinHostPort(host, fmt.Sprint(port))
-	if testConn, dialErr := d.Dial("tcp", guestEndpoint); dialErr == nil {
-		_ = testConn.Close()
-		guestClient, err = guest.Dial(guestEndpoint)
-		if err != nil {
-			return fmt.Errorf("connecting to guest at %s: %w", guestEndpoint, err)
-		}
-	} else {
-		// 2. Connect via the Substrate atenet-router service in ate-system (port 80)
-		routerEndpoint, pfCleanup, err := dialRouter()
-		if err != nil {
-			return fmt.Errorf("establishing port-forward to atenet-router: %w", err)
-		}
-		cleanup = pfCleanup
-		guestClient, err = guest.DialTarget(routerEndpoint, targetActor)
-		if err != nil {
-			return fmt.Errorf("connecting to guest via atenet-router at %s: %w", routerEndpoint, err)
-		}
+	routerEndpoint, cleanup, err := dialRouter()
+	if err != nil {
+		return fmt.Errorf("establishing port-forward to atenet-router: %w", err)
 	}
-
 	if cleanup != nil {
 		defer cleanup()
+	}
+	guestClient, err := guest.DialTarget(routerEndpoint, targetActor)
+	if err != nil {
+		return fmt.Errorf("connecting to guest via atenet-router at %s: %w", routerEndpoint, err)
 	}
 	defer guestClient.Close()
 
