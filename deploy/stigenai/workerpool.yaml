@@ -67,6 +67,12 @@ spec:
     # A 16Gi worker now takes at most 4 tasks. 6 workers take 24 tasks in
     # total. A 5th task on a full pool waits. Its phase is Pending, with
     # reason WaitingForCapacity. It does not land on a full worker.
+    #
+    # ax-9gp: AX_MAX_TASK_MEMORY is set in
+    # deploy/stigenai/kustomization.yaml, on both ax-server and
+    # ax-controller. It must equal this limits.memory value.
+    # A task that asks for more gets a clear Failed status.
+    # It does not wait forever for a worker that can never fit it.
     resources:
       limits:
         cpu: "4"
