@@ -263,6 +263,24 @@ func (s *MemoryStore) RequeueTask(ctx context.Context, atespace, name string) er
 	return nil
 }
 
+// RequeueTaskDeletion publishes a new delete event carrying p, marked Retry,
+// without touching the stored record.
+func (s *MemoryStore) RequeueTaskDeletion(ctx context.Context, atespace, name string, p store.TaskDeletePreconditions) error {
+	event := store.TaskEvent{
+		ID:       fmt.Sprintf("%d", time.Now().UnixNano()),
+		Atespace: atespace,
+		Name:     name,
+		Action:   "delete",
+		Deletion: p,
+		Retry:    true,
+	}
+	select {
+	case s.events <- event:
+	default:
+	}
+	return nil
+}
+
 func (s *MemoryStore) SaveModel(ctx context.Context, model *v1alpha1.Model) error {
 	if model.Metadata.Name == "" {
 		return errors.New("model name is required")

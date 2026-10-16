@@ -398,6 +398,26 @@ func (s *Store) RequeueTask(ctx context.Context, atespace, name string) error {
 	}).Err()
 }
 
+// RequeueTaskDeletion publishes a new delete event carrying p, marked
+// retry=1, without touching the stored task record. The stream entry has the
+// same shape MarkTaskDeleting publishes, so a worker handles it the same way.
+func (s *Store) RequeueTaskDeletion(ctx context.Context, atespace, name string, p store.TaskDeletePreconditions) error {
+	if atespace == "" {
+		atespace = "default"
+	}
+	return s.client.XAdd(ctx, &redis.XAddArgs{
+		Stream: s.opts.StreamName,
+		Values: map[string]interface{}{
+			"action":             "delete",
+			"atespace":           atespace,
+			"name":               name,
+			"actor_uid":          p.ActorUID,
+			"creation_timestamp": p.CreationTimestamp,
+			"retry":              "1",
+		},
+	}).Err()
+}
+
 // SaveModel stores a model.
 func (s *Store) SaveModel(ctx context.Context, model *v1alpha1.Model) error {
 	if model.Metadata == nil {
@@ -743,6 +763,9 @@ func eventFromMessage(msg redis.XMessage) store.TaskEvent {
 	}
 	ev.Deletion.ActorUID, _ = msg.Values["actor_uid"].(string)
 	ev.Deletion.CreationTimestamp, _ = msg.Values["creation_timestamp"].(string)
+	if retry, ok := msg.Values["retry"].(string); ok {
+		ev.Retry = retry == "1"
+	}
 	return ev
 }
 
