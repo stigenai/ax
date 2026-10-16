@@ -66,6 +66,10 @@ type TaskEvent struct {
 	Name     string
 	Action   string // "reconcile", "delete"
 	Deletion TaskDeletePreconditions
+	// Retry marks a delete event republished after an earlier delivery of the
+	// same deletion failed to reconcile. A worker uses it to tell a stale
+	// replay (the task is no longer Terminating) from a fresh request.
+	Retry bool
 }
 
 // EventQueue delivers task events to groups of cooperating workers. Every event
@@ -108,6 +112,13 @@ type Store interface {
 	// Substrate out of capacity, and at startup to retry every task a previous
 	// process left waiting for capacity.
 	RequeueTask(ctx context.Context, atespace, name string) error
+	// RequeueTaskDeletion publishes a new delete event for atespace/name. The
+	// event carries p, the same preconditions as the original MarkTaskDeleting
+	// call. It marks the event Retry. It does not change the stored task
+	// record. A worker calls it after a failed ReconcileDelete, after a
+	// backoff. A worker also calls it at startup, to retry each task a
+	// previous process left Terminating.
+	RequeueTaskDeletion(ctx context.Context, atespace, name string, p TaskDeletePreconditions) error
 
 	SaveWorkspace(ctx context.Context, ws *v1alpha1.Workspace) error
 	GetWorkspace(ctx context.Context, atespace, name string) (*v1alpha1.Workspace, error)
