@@ -39,6 +39,9 @@ const (
 	// defaultClaimInterval is the minimum time between XAUTOCLAIM calls from
 	// one subscription when a scan finds nothing to claim.
 	defaultClaimInterval = 30 * time.Second
+	// defaultMaxDeliveries is how many times a task event may be delivered
+	// before a subscription drops it as poison.
+	defaultMaxDeliveries = 5
 )
 
 var (
@@ -69,6 +72,11 @@ type Options struct {
 	// Zero uses the default: 30 seconds.
 	// This field has no effect when reclaim is off.
 	ClaimInterval time.Duration
+	// MaxDeliveries caps how many times a subscription may deliver the same
+	// event. A subscription acks and drops a claimed event past this count,
+	// so a poison event cannot crash-loop the process that reads it forever.
+	// Zero uses the default: 5.
+	MaxDeliveries int64
 }
 
 // Store is a Redis-backed implementation of store.Store.
@@ -96,6 +104,9 @@ func NewStore(client *redis.Client, opts Options) *Store {
 	}
 	if opts.ClaimInterval <= 0 {
 		opts.ClaimInterval = defaultClaimInterval
+	}
+	if opts.MaxDeliveries <= 0 {
+		opts.MaxDeliveries = defaultMaxDeliveries
 	}
 	return &Store{
 		client: client,
@@ -858,14 +869,51 @@ func (sub *subscription) claim(ctx context.Context) ([]store.TaskEvent, error) {
 		return nil, nil
 	}
 
-	events := make([]store.TaskEvent, len(msgs))
-	ids := make([]string, len(msgs))
-	for i, msg := range msgs {
-		events[i] = eventFromMessage(msg)
-		ids[i] = msg.ID
+	events := make([]store.TaskEvent, 0, len(msgs))
+	ids := make([]string, 0, len(msgs))
+	for _, msg := range msgs {
+		ev := eventFromMessage(msg)
+		dropped, err := sub.dropIfPoison(ctx, ev)
+		if err != nil {
+			return nil, err
+		}
+		if dropped {
+			continue
+		}
+		events = append(events, ev)
+		ids = append(ids, ev.ID)
 	}
-	slog.Info("reclaimed idle task events", "consumer", sub.consumer, "count", len(events), "ids", ids)
+	if len(events) > 0 {
+		slog.Info("reclaimed idle task events", "consumer", sub.consumer, "count", len(events), "ids", ids)
+	}
 	return events, nil
+}
+
+// dropIfPoison checks ev's delivery count and, when it is past
+// Options.MaxDeliveries, acks and drops ev instead of returning it. This
+// stops an event that always crashes its processor from cycling between
+// consumers forever: it caps a poison event's cost at MaxDeliveries tries.
+func (sub *subscription) dropIfPoison(ctx context.Context, ev store.TaskEvent) (bool, error) {
+	pending, err := sub.store.client.XPendingExt(ctx, &redis.XPendingExtArgs{
+		Stream: sub.store.opts.StreamName,
+		Group:  sub.group,
+		Start:  ev.ID,
+		End:    ev.ID,
+		Count:  1,
+	}).Result()
+	if err != nil {
+		return false, fmt.Errorf("checking delivery count for task event %s: %w", ev.ID, err)
+	}
+	if len(pending) == 0 || pending[0].RetryCount <= sub.store.opts.MaxDeliveries {
+		return false, nil
+	}
+	deliveries := pending[0].RetryCount
+	if err := sub.store.client.XAck(ctx, sub.store.opts.StreamName, sub.group, ev.ID).Err(); err != nil {
+		return false, fmt.Errorf("acking poison task event %s: %w", ev.ID, err)
+	}
+	slog.Error("dropping task event after too many deliveries",
+		"id", ev.ID, "atespace", ev.Atespace, "name", ev.Name, "action", ev.Action, "deliveries", deliveries)
+	return true, nil
 }
 
 func (sub *subscription) Ack(ctx context.Context, ev store.TaskEvent) error {

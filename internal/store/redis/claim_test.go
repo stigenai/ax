@@ -282,3 +282,66 @@ func TestClaimDoesNotRedeliverAckedEvents(t *testing.T) {
 		t.Fatalf("unexpected error waiting for no duplicate: %v", err)
 	}
 }
+
+// AC6: a poison event (one that is never acked) must not be delivered more
+// than MaxDeliveries times. With MaxDeliveries=2, delivery 1 (the initial
+// XREADGROUP) and delivery 2 (the first self-claim once idle) must both
+// return the event; delivery 3 (the next self-claim) must instead ack and
+// drop it, so it is never returned and XPENDING ends at 0.
+func TestClaimDropsPoisonEventAfterMaxDeliveries(t *testing.T) {
+	s, client := newClaimTestStore(t, "ac6", Options{
+		ReadBatchSize: 10,
+		ReadBlock:     20 * time.Millisecond,
+		ClaimMinIdle:  50 * time.Millisecond,
+		ClaimInterval: 10 * time.Millisecond,
+		MaxDeliveries: 2,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	sub, err := s.Subscribe(ctx, "group", "consumer-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	id := addTestEvent(t, ctx, client, s.opts.StreamName, "job")
+
+	// Delivery 1: the initial XREADGROUP read. Never ack it, so it goes
+	// idle and becomes claimable.
+	ev, err := sub.Next(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ev.ID != id {
+		t.Fatalf("delivery 1: got id %q, want %q", ev.ID, id)
+	}
+
+	// Delivery 2: a self-claim once idle. Still within MaxDeliveries, so it
+	// must come back. Never ack it either.
+	claim2Ctx, claim2Cancel := context.WithTimeout(ctx, 2*time.Second)
+	ev, err = sub.Next(claim2Ctx)
+	claim2Cancel()
+	if err != nil {
+		t.Fatalf("delivery 2: want the event back, got: %v", err)
+	}
+	if ev.ID != id {
+		t.Fatalf("delivery 2: got id %q, want %q", ev.ID, id)
+	}
+
+	// Delivery 3 would push the count past MaxDeliveries=2: it must be
+	// dropped, not returned.
+	claim3Ctx, claim3Cancel := context.WithTimeout(ctx, 2*time.Second)
+	_, err = sub.Next(claim3Ctx)
+	claim3Cancel()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("delivery 3: want context.DeadlineExceeded (event must be dropped), got: %v", err)
+	}
+
+	pending, err := client.XPending(ctx, s.opts.StreamName, "group").Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pending.Count != 0 {
+		t.Fatalf("XPENDING count = %d, want 0", pending.Count)
+	}
+}
