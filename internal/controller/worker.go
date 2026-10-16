@@ -71,11 +71,20 @@ type Worker struct {
 
 	deleteMu       sync.Mutex
 	deleteAttempts map[string]int
-	// deletePending marks a key while its scheduleDeleteRetry goroutine still
-	// sleeps on its backoff. A second failure for that key must not start a
-	// second chain. See ax-706.6: a sweep requeue can land on top of the
-	// worker's own chain. The entry clears when the goroutine fires.
-	deletePending map[string]bool
+	// deletePending marks a pending key with its goroutine's generation
+	// number, while that goroutine sleeps on its delete-retry backoff. A
+	// second failure for the same key must not start a second chain (bug
+	// ax-706.6). The goroutine clears its own mark before it republishes,
+	// not after (bug ax-706.10). A clear after the republish is too late:
+	// a fast delete failure can reach processEvent while the mark still
+	// shows pending, and drop the retry.
+	deletePending map[string]int64
+	// deleteGen hands out the next generation number for each key. It is
+	// never reset. An old goroutine can then tell its own mark apart from
+	// a newer chain's mark, and never clear a mark it did not set. Bug
+	// ax-706.10 (sibling case): a success can clear a key and start a new
+	// chain, while an old goroutine for the same key still sleeps.
+	deleteGen map[string]int64
 }
 
 // NewWorker creates a worker that joins group as consumer. An empty group uses the
@@ -330,15 +339,20 @@ func (w *Worker) scheduleDeleteRetry(ctx context.Context, atespace, name string,
 
 	w.deleteMu.Lock()
 	if w.deletePending == nil {
-		w.deletePending = make(map[string]bool)
+		w.deletePending = make(map[string]int64)
 	}
-	if w.deletePending[key] {
+	if _, pending := w.deletePending[key]; pending {
 		w.deleteMu.Unlock()
 		slog.Info("task delete failed, a retry chain is already pending, not starting a second one",
 			"atespace", atespace, "name", name, "error", cause)
 		return
 	}
-	w.deletePending[key] = true
+	if w.deleteGen == nil {
+		w.deleteGen = make(map[string]int64)
+	}
+	w.deleteGen[key]++
+	myGen := w.deleteGen[key]
+	w.deletePending[key] = myGen
 	if w.deleteAttempts == nil {
 		w.deleteAttempts = make(map[string]int)
 	}
@@ -357,17 +371,32 @@ func (w *Worker) scheduleDeleteRetry(ctx context.Context, atespace, name string,
 	slog.Warn("task delete failed, retrying", "atespace", atespace, "name", name,
 		"attempt", attempt+1, "next_retry", backoff, "error", cause)
 
-	go func() {
-		defer func() {
-			w.deleteMu.Lock()
+	// clearOwnMark removes this chain's pending mark, but only while it
+	// still holds myGen. A clearDeleteBackoff call for this key, followed
+	// by a new chain, hands the key a new generation; this guard then skips
+	// the delete so the stale goroutine never erases the newer chain's mark
+	// (ax-706.10, sibling case).
+	clearOwnMark := func() {
+		w.deleteMu.Lock()
+		if w.deletePending[key] == myGen {
 			delete(w.deletePending, key)
-			w.deleteMu.Unlock()
-		}()
+		}
+		w.deleteMu.Unlock()
+	}
+
+	go func() {
 		select {
 		case <-ctx.Done():
+			clearOwnMark()
 			return
 		case <-time.After(backoff):
 		}
+		// Clear the mark before republishing, not in a defer after
+		// (ax-706.10): the republished event can reach processEvent and
+		// fail before a deferred clear runs. scheduleDeleteRetry would then
+		// see pending still set and drop the retry, leaving no chain for
+		// the next sweep tick to catch other than the 15-minute sweep.
+		clearOwnMark()
 		if err := w.store.RequeueTaskDeletion(context.Background(), atespace, name, deletion); err != nil {
 			slog.Warn("failed to requeue task deletion", "atespace", atespace, "name", name, "error", err)
 		}
@@ -378,6 +407,10 @@ func (w *Worker) scheduleDeleteRetry(ctx context.Context, atespace, name string,
 // reconciles without error, so a later deletion of the same name starts its
 // own schedule at DeleteBackoffBase. It also clears any pending-chain mark,
 // so a later failure for the same name can start a fresh chain right away.
+// It does not touch deleteGen: a stale goroutine from the cleared chain may
+// still sleep on its own backoff, and deleteGen's next value must stay
+// ahead of that goroutine's captured generation so it can never clear a
+// newer chain's mark (ax-706.10).
 func (w *Worker) clearDeleteBackoff(atespace, name string) {
 	w.deleteMu.Lock()
 	delete(w.deletePending, atespace+"/"+name)

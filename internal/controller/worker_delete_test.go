@@ -279,6 +279,142 @@ func TestDeleteBackoffClearedOnSuccessRestartsSchedule(t *testing.T) {
 	}
 }
 
+// gateRequeueStore wraps a store.Store and pauses inside RequeueTaskDeletion,
+// after the real publish but before it returns, so a test can run
+// processEvent on the republished event while the publishing call is still
+// in flight. It stands in for a retry chain whose republished delete event
+// reaches processEvent and fails again before the chain's own goroutine
+// finishes its RequeueTaskDeletion call (ax-706.10).
+type gateRequeueStore struct {
+	store.Store
+	published chan struct{}
+	release   chan struct{}
+}
+
+func (s *gateRequeueStore) RequeueTaskDeletion(ctx context.Context, atespace, name string, p store.TaskDeletePreconditions) error {
+	err := s.Store.RequeueTaskDeletion(ctx, atespace, name, p)
+	s.published <- struct{}{}
+	<-s.release
+	return err
+}
+
+// TestDeleteRetryChainSurvivesFastFailureOnRepublishedEvent covers
+// ax-706.10: a retry chain's republished delete event can reach
+// processEvent and fail again before the chain's own goroutine finishes its
+// RequeueTaskDeletion call. The fix clears the chain's pending mark before
+// that call, not after: this test fails on the pre-fix code (a defer that
+// clears the mark only once the call returns), because the fast second
+// failure then finds the mark still set and starts no new chain.
+func TestDeleteRetryChainSurvivesFastFailureOnRepublishedEvent(t *testing.T) {
+	control := &deletionControlServer{
+		deletions:      make(chan *ateapipb.DeleteActorRequest, 16),
+		templates:      make(chan *ateapipb.ListActorTemplatesRequest, 16),
+		remainingFails: 1000, // DeleteActor never succeeds during this test.
+	}
+	client := newDeletionTestClient(t, control)
+
+	ctx := context.Background()
+	base := memory.NewStore()
+	created := time.Now().UTC()
+	task := &v1alpha1.Task{Metadata: &v1alpha1.ObjectMeta{Name: "stuck", Atespace: "default", CreationTimestamp: timestamppb.New(created)}}
+	if err := base.SaveTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	sub, err := base.Subscribe(ctx, "g", "c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	drainN(t, sub, 1) // SaveTask's own reconcile event.
+
+	deletion := store.TaskDeletePreconditions{ActorUID: "actor-1", CreationTimestamp: created.Format(time.RFC3339Nano)}
+	if err := base.MarkTaskDeleting(ctx, "default", "stuck", deletion); err != nil {
+		t.Fatal(err)
+	}
+
+	gs := &gateRequeueStore{Store: base, published: make(chan struct{}, 4), release: make(chan struct{})}
+	worker := NewWorker(gs, NewTaskReconciler(client, "default-template", "ax-system"), "", "")
+	worker.DeleteBackoffBase = 10 * time.Millisecond
+	worker.DeleteBackoffMax = 10 * time.Millisecond
+
+	next := func() store.TaskEvent {
+		c, cancel := context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+		ev, err := sub.Next(c)
+		if err != nil {
+			t.Fatalf("next: %v", err)
+		}
+		return ev
+	}
+
+	// First delivery fails. Chain 1 starts and sleeps on its backoff.
+	if err := worker.processEvent(ctx, next()); err != nil {
+		t.Fatalf("first delivery: %v", err)
+	}
+
+	<-gs.published // Chain 1 woke and is republishing; its RequeueTaskDeletion call is gated.
+
+	// The republished event reaches processEvent and fails again, while
+	// chain 1's own call is still blocked in the gate.
+	if err := worker.processEvent(ctx, next()); err != nil {
+		t.Fatalf("republished delivery: %v", err)
+	}
+
+	close(gs.release) // Let chain 1's call return.
+	time.Sleep(50 * time.Millisecond)
+
+	worker.deleteMu.Lock()
+	_, pending := worker.deletePending["default/stuck"]
+	worker.deleteMu.Unlock()
+	if !pending {
+		c, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+		defer cancel()
+		if _, err := sub.Next(c); err != nil {
+			t.Fatalf("retry chain lost: no pending chain and no further delete event after a failed republish (err=%v)", err)
+		}
+	}
+}
+
+// TestClearDeleteBackoffDoesNotLoseANewerChainsMark covers ax-706.10's
+// sibling bug: clearDeleteBackoff can run for a key while an older chain's
+// goroutine still sleeps on a stale backoff. That old goroutine must not
+// clear a newer chain's pending mark when it later wakes.
+func TestClearDeleteBackoffDoesNotLoseANewerChainsMark(t *testing.T) {
+	ctx := context.Background()
+	w := &Worker{store: memory.NewStore()}
+
+	// Chain 1 starts with a short backoff and sleeps.
+	w.DeleteBackoffBase = 20 * time.Millisecond
+	w.DeleteBackoffMax = 20 * time.Millisecond
+	w.scheduleDeleteRetry(ctx, "private", "job", store.TaskDeletePreconditions{}, errors.New("boom"))
+
+	// The delete succeeds through a separate path before chain 1 wakes.
+	w.clearDeleteBackoff("private", "job")
+
+	// Chain 2 starts right away, for a fresh failure of the same key, with a
+	// backoff long enough to still be asleep when chain 1 wakes.
+	w.DeleteBackoffBase = 300 * time.Millisecond
+	w.DeleteBackoffMax = 300 * time.Millisecond
+	w.scheduleDeleteRetry(ctx, "private", "job", store.TaskDeletePreconditions{}, errors.New("boom again"))
+
+	w.deleteMu.Lock()
+	chain2Gen, ok := w.deletePending["private/job"]
+	w.deleteMu.Unlock()
+	if !ok || chain2Gen == 0 {
+		t.Fatal("chain 2 did not mark itself pending")
+	}
+
+	// Wait past chain 1's 20ms backoff, well short of chain 2's 300ms one:
+	// chain 1 wakes first and must not touch chain 2's mark.
+	time.Sleep(80 * time.Millisecond)
+
+	w.deleteMu.Lock()
+	gen, pending := w.deletePending["private/job"]
+	w.deleteMu.Unlock()
+	if !pending || gen != chain2Gen {
+		t.Fatalf("chain 1 cleared chain 2's mark on waking: pending=%v gen=%d want chain 2's gen %d", pending, gen, chain2Gen)
+	}
+}
+
 // AC3 (ax-8qz.3): the startup sweep must requeue a delete for every
 // Terminating non-supervisor task, skip a Terminating supervisor task (its
 // preconditions are not stored on the record), and leave a Running task

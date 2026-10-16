@@ -307,7 +307,7 @@ func TestDeleteSweepDoesNotMultiplyRetryChainsOnRepeatedFailure(t *testing.T) {
 
 	worker.deleteMu.Lock()
 	chains := worker.deleteAttempts["default/stuck"]
-	pending := worker.deletePending["default/stuck"]
+	_, pending := worker.deletePending["default/stuck"]
 	worker.deleteMu.Unlock()
 	if chains != 1 {
 		t.Fatalf("want 1 retry chain total despite 3 extra sweep-driven failures, got %d (each extra failure started its own chain)", chains)
