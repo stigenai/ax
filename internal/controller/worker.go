@@ -211,10 +211,20 @@ func (w *Worker) processEvent(ctx context.Context, ev store.TaskEvent) error {
 			w.scheduleDeleteRetry(ctx, ev.Atespace, ev.Name, ev.Deletion, err)
 			return nil
 		}
-		w.clearDeleteBackoff(ev.Atespace, ev.Name)
 		if err := w.store.DeleteTask(ctx, ev.Atespace, ev.Name, ev.Deletion); err != nil {
-			return fmt.Errorf("removing task record %s/%s: %w", ev.Atespace, ev.Name, err)
+			if errors.Is(err, store.ErrConflict) {
+				// The record changed incarnation under the worker: no
+				// retry is safe or correct for this event anymore.
+				return err
+			}
+			// Retry the whole delete event instead of leaving the record
+			// Terminating until the next restart sweep: ReconcileDelete
+			// already ran, and a retry's ReconcileDelete call is safe to
+			// repeat (DeleteActor maps NotFound to nil).
+			w.scheduleDeleteRetry(ctx, ev.Atespace, ev.Name, ev.Deletion, fmt.Errorf("removing task record %s/%s: %w", ev.Atespace, ev.Name, err))
+			return nil
 		}
+		w.clearDeleteBackoff(ev.Atespace, ev.Name)
 		return nil
 	}
 

@@ -762,3 +762,149 @@ func TestDeleteRetrySurvivesFailedRequeue(t *testing.T) {
 		t.Fatalf("want deleteAttempts 2 (the original failure plus the dropped requeue's own retry), got %d", attempt)
 	}
 }
+
+// failNDeleteTaskStore wraps a store.Store and fails the first
+// remainingFails calls to DeleteTask with a non-conflict error, then
+// delegates. It stands in for a store write failure after ReconcileDelete
+// already removed the actor (ax-atj AC1).
+type failNDeleteTaskStore struct {
+	store.Store
+	mu             sync.Mutex
+	remainingFails int
+}
+
+func (s *failNDeleteTaskStore) DeleteTask(ctx context.Context, atespace, name string, p ...store.TaskDeletePreconditions) error {
+	s.mu.Lock()
+	fail := s.remainingFails > 0
+	if fail {
+		s.remainingFails--
+	}
+	s.mu.Unlock()
+	if fail {
+		return errors.New("simulated delete task failure")
+	}
+	return s.Store.DeleteTask(ctx, atespace, name, p...)
+}
+
+// TestDeleteRetriesWhenTaskRecordRemovalFails covers ax-atj AC1: a
+// store.DeleteTask failure after a successful ReconcileDelete must retry
+// the whole delete event instead of leaving the record Terminating until
+// the next restart sweep. It fails on the pre-fix code: processEvent
+// returns the DeleteTask error with no scheduleDeleteRetry call, so round 2
+// below gets no event.
+func TestDeleteRetriesWhenTaskRecordRemovalFails(t *testing.T) {
+	control := &deletionControlServer{deletions: make(chan *ateapipb.DeleteActorRequest, 4), templates: make(chan *ateapipb.ListActorTemplatesRequest, 4)}
+	client := newDeletionTestClient(t, control)
+
+	ctx := context.Background()
+	base := memory.NewStore()
+	created := time.Now().UTC()
+	task := &v1alpha1.Task{Metadata: &v1alpha1.ObjectMeta{Name: "flaky-record", Atespace: "private", CreationTimestamp: timestamppb.New(created)}}
+	if err := base.SaveTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+
+	sub, err := base.Subscribe(ctx, "test-group", "test-consumer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	drainN(t, sub, 1) // SaveTask's own reconcile event.
+
+	deletion := store.TaskDeletePreconditions{ActorUID: "actor-1", CreationTimestamp: created.Format(time.RFC3339Nano)}
+	if err := base.MarkTaskDeleting(ctx, "private", "flaky-record", deletion); err != nil {
+		t.Fatal(err)
+	}
+
+	wrapped := &failNDeleteTaskStore{Store: base, remainingFails: 1}
+	worker := NewWorker(wrapped, NewTaskReconciler(client, "default-template", "ax-system"), "", "")
+	worker.DeleteBackoffBase = 10 * time.Millisecond
+	worker.DeleteBackoffMax = 10 * time.Millisecond
+
+	for round := 0; round < 2; round++ {
+		readCtx, readCancel := context.WithTimeout(ctx, 2*time.Second)
+		ev, err := sub.Next(readCtx)
+		readCancel()
+		if err != nil {
+			t.Fatalf("round %d: no delete event delivered: %v", round, err)
+		}
+		if err := worker.processEvent(context.Background(), ev); err != nil {
+			t.Fatalf("round %d: processEvent error: %v", round, err)
+		}
+	}
+
+	if _, err := base.GetTask(ctx, "private", "flaky-record"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("task record not removed after the retry succeeded: %v", err)
+	}
+	if got := control.Attempts(); got != 2 {
+		t.Fatalf("want 2 DeleteActor attempts (the retry re-runs ReconcileDelete), got %d", got)
+	}
+	select {
+	case request := <-control.deletions:
+		if request.GetOptions().GetUid() != "actor-1" {
+			t.Fatalf("retry lost the original ActorUID: %v", request)
+		}
+	default:
+		t.Fatal("no successful deletion request recorded")
+	}
+}
+
+// TestDeleteTaskConflictReturnsErrorWithNoRetry covers ax-atj AC1's second
+// half: a DeleteTask ErrConflict means the record changed incarnation
+// under the worker, so processEvent must return the conflict with no retry
+// chain started.
+func TestDeleteTaskConflictReturnsErrorWithNoRetry(t *testing.T) {
+	control := &deletionControlServer{deletions: make(chan *ateapipb.DeleteActorRequest, 4), templates: make(chan *ateapipb.ListActorTemplatesRequest, 4)}
+	client := newDeletionTestClient(t, control)
+
+	ctx := context.Background()
+	base := memory.NewStore()
+	created := time.Now().UTC()
+	task := &v1alpha1.Task{Metadata: &v1alpha1.ObjectMeta{Name: "conflicted", Atespace: "private", CreationTimestamp: timestamppb.New(created)}}
+	if err := base.SaveTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+
+	sub, err := base.Subscribe(ctx, "test-group", "test-consumer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	drainN(t, sub, 1) // SaveTask's own reconcile event.
+
+	deletion := store.TaskDeletePreconditions{ActorUID: "actor-1", CreationTimestamp: created.Format(time.RFC3339Nano)}
+	if err := base.MarkTaskDeleting(ctx, "private", "conflicted", deletion); err != nil {
+		t.Fatal(err)
+	}
+
+	wrapped := &failNDeleteTaskStore{Store: base}
+	wrapped.remainingFails = 0
+	conflictStore := &conflictDeleteTaskStore{Store: wrapped}
+	worker := NewWorker(conflictStore, NewTaskReconciler(client, "default-template", "ax-system"), "", "")
+
+	readCtx, readCancel := context.WithTimeout(ctx, 2*time.Second)
+	ev, err := sub.Next(readCtx)
+	readCancel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := worker.processEvent(context.Background(), ev); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("want ErrConflict, got %v", err)
+	}
+
+	worker.deleteMu.Lock()
+	_, pending := worker.deletePending["private/conflicted"]
+	worker.deleteMu.Unlock()
+	if pending {
+		t.Fatal("a DeleteTask conflict must not start a retry chain")
+	}
+}
+
+// conflictDeleteTaskStore wraps a store.Store and always returns
+// store.ErrConflict from DeleteTask, standing in for the record changing
+// incarnation under the worker.
+type conflictDeleteTaskStore struct {
+	store.Store
+}
+
+func (s *conflictDeleteTaskStore) DeleteTask(ctx context.Context, atespace, name string, p ...store.TaskDeletePreconditions) error {
+	return store.ErrConflict
+}
