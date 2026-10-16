@@ -22,6 +22,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/google/ax/internal/controller"
 	"github.com/google/ax/internal/store/redis"
@@ -30,6 +31,20 @@ import (
 	goredis "github.com/redis/go-redis/v9"
 	"k8s.io/apimachinery/pkg/api/resource"
 )
+
+// defaultTaskMemoryDefault is the value of --default-task-memory and
+// AX_DEFAULT_TASK_MEMORY when a user sets neither one.
+//
+// ax-9qu raised this value from 4Gi. A Claude Code session plus a Go or Node
+// build needs more memory than 4Gi. 7680Mi still fits 2 tasks on each 16Gi
+// worker. The sum is 2*7680Mi plus about 400Mi for ateom overhead. The total,
+// 15760Mi, stays under the 16384Mi limit. See
+// deploy/stigenai/workerpool.yaml for the full sizing math.
+const defaultTaskMemoryDefault = "7680Mi"
+
+// livenessIntervalDefault is the --liveness-interval / AX_LIVENESS_INTERVAL
+// value used when neither is set: a Go duration string.
+const livenessIntervalDefault = "30s"
 
 // resolveDefaultTaskMemory applies the AX_DEFAULT_TASK_MEMORY override (the
 // caller does that before calling this) and validates the result. "0"
@@ -51,6 +66,14 @@ func resolveDefaultTaskMemory(value string) (string, error) {
 	return value, nil
 }
 
+// resolveLivenessInterval parses the --liveness-interval / AX_LIVENESS_INTERVAL
+// value as a Go duration (for example "30s"). The caller treats zero or a
+// negative result as disabled, instead of as an error. So "0", "0s" and
+// "-1s" all disable the monitor.
+func resolveLivenessInterval(value string) (time.Duration, error) {
+	return time.ParseDuration(value)
+}
+
 func main() {
 	var (
 		substrateEndpoint       string
@@ -62,6 +85,7 @@ func main() {
 		defaultTemplate         string
 		defaultTemplateAtespace string
 		defaultTaskMemory       string
+		livenessInterval        string
 		redisAddr               string
 		redisPassword           string
 		redisGroup              string
@@ -81,7 +105,8 @@ func main() {
 	flag.BoolVar(&substratePlaintext, "substrate-plaintext", false, "Use insecure plaintext gRPC connection to Substrate")
 	flag.StringVar(&defaultTemplate, "template", "default-template", "Default Substrate ActorTemplate name")
 	flag.StringVar(&defaultTemplateAtespace, "template-atespace", "ax-system", "Default Substrate ActorTemplate atespace")
-	flag.StringVar(&defaultTaskMemory, "default-task-memory", "4Gi", "Memory limit booked for a task that names none (Substrate quantity, e.g. 4Gi); 0 disables")
+	flag.StringVar(&defaultTaskMemory, "default-task-memory", defaultTaskMemoryDefault, "Memory limit booked for a task that names none (Substrate quantity, e.g. 7680Mi); 0 disables")
+	flag.StringVar(&livenessInterval, "liveness-interval", livenessIntervalDefault, "How often the liveness monitor checks each Running task's actor and runner (Go duration, e.g. 30s); 0 disables it")
 	flag.StringVar(&nativeTLSDestination, "native-tls-destination", "", "Private protected-actor TLS destination; install or verify exact policy before resume")
 	flag.Parse()
 
@@ -97,9 +122,17 @@ func main() {
 	if envMemory := os.Getenv("AX_DEFAULT_TASK_MEMORY"); envMemory != "" {
 		defaultTaskMemory = envMemory
 	}
+	if envLiveness := os.Getenv("AX_LIVENESS_INTERVAL"); envLiveness != "" {
+		livenessInterval = envLiveness
+	}
 	defaultTaskMemory, err := resolveDefaultTaskMemory(defaultTaskMemory)
 	if err != nil {
 		slog.Error("invalid --default-task-memory / AX_DEFAULT_TASK_MEMORY", "error", err)
+		os.Exit(1)
+	}
+	livenessIntervalDuration, err := resolveLivenessInterval(livenessInterval)
+	if err != nil {
+		slog.Error("invalid --liveness-interval / AX_LIVENESS_INTERVAL", "error", err)
 		os.Exit(1)
 	}
 
@@ -114,6 +147,7 @@ func main() {
 		"templateAtespace", defaultTemplateAtespace,
 		"template", defaultTemplate,
 		"defaultTaskMemory", defaultTaskMemory,
+		"livenessInterval", livenessIntervalDuration,
 	)
 
 	subClient, err := substrate.NewClientWithOptions(substrate.ClientOptions{
@@ -149,6 +183,10 @@ func main() {
 	defer rClient.Close()
 
 	rStore := redis.NewStore(rClient, redis.Options{})
+
+	monitor := controller.NewTaskMonitor(rStore, reconciler, livenessIntervalDuration)
+	go monitor.Run(ctx)
+
 	worker := controller.NewWorker(rStore, reconciler, redisGroup, redisConsumer)
 	if err := worker.Run(ctx); err != nil && err != context.Canceled {
 		slog.Error("redis worker stopped with error", "error", err)
