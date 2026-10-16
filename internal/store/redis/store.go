@@ -381,6 +381,23 @@ func (s *Store) DeleteTask(ctx context.Context, atespace, name string, precondit
 	}, key)
 }
 
+// RequeueTask publishes a new reconcile event for an existing task, without
+// touching the stored record. The stream entry is the same shape SaveTask
+// publishes, so a worker handles it the same way.
+func (s *Store) RequeueTask(ctx context.Context, atespace, name string) error {
+	if atespace == "" {
+		atespace = "default"
+	}
+	return s.client.XAdd(ctx, &redis.XAddArgs{
+		Stream: s.opts.StreamName,
+		Values: map[string]interface{}{
+			"action":   "reconcile",
+			"atespace": atespace,
+			"name":     name,
+		},
+	}).Err()
+}
+
 // SaveModel stores a model.
 func (s *Store) SaveModel(ctx context.Context, model *v1alpha1.Model) error {
 	if model.Metadata == nil {

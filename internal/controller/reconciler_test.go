@@ -16,9 +16,11 @@ package controller_test
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -49,6 +51,10 @@ type mockControlServer struct {
 	existingActor     *ateapipb.Actor
 	deleteUID         string
 	expectedDeleteUID string
+	// resumeErr makes ResumeActor fail, as Substrate does when it has no free
+	// worker (codes.ResourceExhausted) or for any other reason.
+	resumeErr      error
+	resumeAttempts atomic.Int32
 }
 
 // noSecrets is a SecretResolver for tests: it never finds a key and never touches a cluster.
@@ -111,6 +117,10 @@ func (m *mockControlServer) CreateActor(ctx context.Context, req *ateapipb.Creat
 }
 
 func (m *mockControlServer) ResumeActor(ctx context.Context, req *ateapipb.ResumeActorRequest) (*ateapipb.ResumeActorResponse, error) {
+	m.resumeAttempts.Add(1)
+	if m.resumeErr != nil {
+		return nil, m.resumeErr
+	}
 	name := ""
 	if req.Actor != nil {
 		name = req.Actor.Name
@@ -618,6 +628,39 @@ func TestTaskReconciler_TemplateRefusedFailsTask(t *testing.T) {
 	}
 	if len(mockSrv.createdActors) != 0 {
 		t.Errorf("an actor was created from another template: %v", mockSrv.createdActors)
+	}
+}
+
+// A full Substrate worker pool must not fail the task: it must wait and retry.
+func TestTaskReconciler_ResumeResourceExhaustedWaitsForCapacity(t *testing.T) {
+	mockSrv := &mockControlServer{resumeErr: status.Error(codes.ResourceExhausted, "no free workers available")}
+	task, err := newTestReconciler(t, mockSrv).Reconcile(context.Background(), envTask("x"))
+	if !errors.Is(err, controller.ErrWaitingForCapacity) {
+		t.Fatalf("expected ErrWaitingForCapacity, got %v", err)
+	}
+	if task.Status.Phase != "Pending" {
+		t.Errorf("expected phase Pending, got %q", task.Status.Phase)
+	}
+	var reason, message string
+	for _, c := range task.Status.Conditions {
+		if c.Type == "Ready" {
+			reason, message = c.Reason, c.Message
+		}
+	}
+	if reason != "WaitingForCapacity" || !strings.Contains(message, "no free workers") {
+		t.Errorf("expected WaitingForCapacity naming Substrate's reason, got %q: %q", reason, message)
+	}
+}
+
+// Any other resume failure still fails the task, as before.
+func TestTaskReconciler_ResumeOtherErrorFailsTask(t *testing.T) {
+	mockSrv := &mockControlServer{resumeErr: status.Error(codes.Internal, "boom")}
+	task, err := newTestReconciler(t, mockSrv).Reconcile(context.Background(), envTask("x"))
+	if err == nil || errors.Is(err, controller.ErrWaitingForCapacity) {
+		t.Fatalf("expected a plain resume failure, got %v", err)
+	}
+	if task.Status.Phase != "Failed" {
+		t.Errorf("expected phase Failed, got %q", task.Status.Phase)
 	}
 }
 

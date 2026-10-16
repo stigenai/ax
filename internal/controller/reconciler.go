@@ -39,6 +39,15 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// ErrWaitingForCapacity means Substrate has no free worker right now.
+// The caller must retry the task later, not fail it.
+var ErrWaitingForCapacity = errors.New("waiting for substrate capacity")
+
+// reasonWaitingForCapacity is the task's Ready condition reason while it
+// waits. The worker's startup sweep looks for this value to find stranded
+// tasks.
+const reasonWaitingForCapacity = "WaitingForCapacity"
+
 const (
 	geminiSecretName = "gemini-api-secret"
 	geminiSecretKey  = "GEMINI_API_KEY"
@@ -242,6 +251,11 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 	slog.Info("resuming actor on Substrate worker", "actor", actorName)
 	_, workerIP, err := r.client.ResumeActor(ctx, atespace, actorName)
 	if err != nil {
+		if status.Code(err) == codes.ResourceExhausted {
+			r.setNotReady(task, reasonWaitingForCapacity, err.Error(), now)
+			task.Status.Phase = "Pending"
+			return task, fmt.Errorf("%w: %s", ErrWaitingForCapacity, err.Error())
+		}
 		r.setNotReady(task, "ActorResumeFailed", err.Error(), now)
 		task.Status.Phase = "Failed"
 		return task, fmt.Errorf("resuming actor: %w", err)
