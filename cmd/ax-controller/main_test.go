@@ -22,17 +22,17 @@ import (
 )
 
 // TestDefaultTaskMemoryFlagDefault pins --default-task-memory's default at
-// 7680Mi (ax-9qu raised it from 4Gi: see defaultTaskMemoryDefault's comment).
+// 8Gi (ax-9qu raised it from 4Gi: see defaultTaskMemoryDefault's comment).
 func TestDefaultTaskMemoryFlagDefault(t *testing.T) {
-	if defaultTaskMemoryDefault != "7680Mi" {
-		t.Fatalf("defaultTaskMemoryDefault = %q, want 7680Mi", defaultTaskMemoryDefault)
+	if defaultTaskMemoryDefault != "8Gi" {
+		t.Fatalf("defaultTaskMemoryDefault = %q, want 8Gi", defaultTaskMemoryDefault)
 	}
 	got, err := resolveDefaultTaskMemory(defaultTaskMemoryDefault)
 	if err != nil {
 		t.Fatalf("resolveDefaultTaskMemory(%q) returned an unexpected error: %v", defaultTaskMemoryDefault, err)
 	}
-	if got != "7680Mi" {
-		t.Fatalf("resolveDefaultTaskMemory(%q) = %q, want 7680Mi", defaultTaskMemoryDefault, got)
+	if got != "8Gi" {
+		t.Fatalf("resolveDefaultTaskMemory(%q) = %q, want 8Gi", defaultTaskMemoryDefault, got)
 	}
 }
 
@@ -43,8 +43,8 @@ func TestResolveDefaultTaskMemory(t *testing.T) {
 		want    string
 		wantErr bool
 	}{
-		{name: "the 7680Mi default parses and passes through", value: "7680Mi", want: "7680Mi"},
-		{name: "an explicit override parses and passes through", value: "8Gi", want: "8Gi"},
+		{name: "the 8Gi default parses and passes through", value: "8Gi", want: "8Gi"},
+		{name: "an explicit override parses and passes through", value: "6Gi", want: "6Gi"},
 		{name: "0 disables the default", value: "0", want: ""},
 		{name: "empty stays disabled", value: "", want: ""},
 		{name: "a value that does not parse as a quantity is an error", value: "not-a-quantity", wantErr: true},

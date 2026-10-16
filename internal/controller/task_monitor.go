@@ -181,34 +181,56 @@ func (r *TaskReconciler) probeReadyz(ctx context.Context, workerIP, atespace, ac
 	return last, false
 }
 
+// errRouterAddrEmpty marks the defensive routerAddr == "" case in
+// probeSandboxViaRouter. checkTask checks TaskMonitor.RouterAddr first.
+// This path must not run in production.
+var errRouterAddrEmpty = errors.New("router address is empty")
+
 // probeSandboxViaRouter checks a runner's /readyz through atenet-router
 // only. It never dials a worker directly.
 //
 // Substrate's atunnel ingress needs the ate-target-actor header on every
 // request (internal/atunnel/ingress.go:519-531). A direct dial has no such
-// header, so it always answers 421. The monitor used to try a direct dial
-// first, through probeReadyz, and that 421 counted as a dead probe. So
-// every RUNNING task failed SandboxUnresponsive after 3 sweeps, whether or
-// not its sandbox was still alive. probeSandboxViaRouter fixes this by
-// going through the router, which supplies the header, or not probing at
-// all (ax-9qu.10).
+// header. It always gets a 421 response.
 //
-// It returns ok=false with a zero readyzProbe at once when routerAddr is
-// empty: the SandboxUnresponsive check needs ATENET_ROUTER_ADDR, the same
-// as LivenessChecker's sweep.
-func (r *TaskReconciler) probeSandboxViaRouter(ctx context.Context, routerAddr, atespace, actorName string) (readyzProbe, bool) {
+// Earlier, the monitor tried a direct dial first, through probeReadyz.
+// That 421 counted as a dead probe. As a result, every RUNNING task failed
+// SandboxUnresponsive after 3 sweeps, even when its sandbox was alive.
+//
+// probeSandboxViaRouter fixes this. It either goes through the router, which
+// supplies the header, or it does not probe at all (ax-9qu.10).
+//
+// The returned error is non-nil only for a transport-level failure. These
+// failures are:
+//
+//   - The probe cannot build the request.
+//   - The probe cannot send the request.
+//   - The probe gets no response. Examples are a refused dial, a timeout,
+//     and the router itself being down.
+//
+// This result is inconclusive. It does not prove that the sandbox died
+// (ax-9qu.15).
+//
+// The caller must leave the miss count unchanged. It must not clear the
+// count or increase it.
+//
+// When the probe gets a real HTTP response, the error is nil. The status
+// code, body and alive bool of the probe carry the result. This includes a
+// 502 or another dead response. The caller must count each of these as a
+// miss.
+func (r *TaskReconciler) probeSandboxViaRouter(ctx context.Context, routerAddr, atespace, actorName string) (readyzProbe, bool, error) {
 	if routerAddr == "" {
-		return readyzProbe{}, false
+		return readyzProbe{}, false, errRouterAddrEmpty
 	}
 	url := fmt.Sprintf("http://%s/readyz?check=workspace", routerAddr)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return readyzProbe{}, false
+		return readyzProbe{}, false, err
 	}
 	req.Header.Set("ate-target-actor", fmt.Sprintf("%s/%s", atespace, actorName))
 	resp, err := r.httpClient.Do(req)
 	if err != nil {
-		return readyzProbe{}, false
+		return readyzProbe{}, false, err
 	}
 	body, _ := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
@@ -217,7 +239,7 @@ func (r *TaskReconciler) probeSandboxViaRouter(ctx context.Context, routerAddr, 
 		body:            string(body),
 		staleAssignment: resp.StatusCode == http.StatusMisdirectedRequest && resp.Header.Get("X-Ate-Assignment-Stale") == "true",
 	}
-	return probe, readyzAlive(probe)
+	return probe, readyzAlive(probe), nil
 }
 
 // monitorPageSize bounds one ListTasks call in a liveness sweep.
@@ -256,6 +278,28 @@ type TaskMonitor struct {
 	// Now returns the current time. Tests replace it so the
 	// sandboxUnresponsiveWindow check needs no real sleep.
 	Now func() time.Time
+
+	// RouterAddr is atenet-router's host:port for the SandboxUnresponsive
+	// /readyz probe. An empty value turns off that probe. The GetActor and
+	// actor-loss checks still run.
+	//
+	// NewTaskMonitor leaves this at its zero value. main.go sets it once
+	// from ATENET_ROUTER_ADDR. checkTask no longer reads the environment
+	// for every task in every sweep (ax-9qu.16). This field mirrors
+	// LivenessChecker.RouterAddr.
+	RouterAddr string
+
+	// DeferStaleAssignment is true when LivenessChecker's own sweep will
+	// run. That sweep can then fail a stale-routed task on its own
+	// timeline (docs/networking.md). main.go sets this field to
+	// taskLivenessSweepEnabled(routerAddr, taskLivenessInterval).
+	//
+	// False means LivenessChecker will not run. Either ATENET_ROUTER_ADDR
+	// is unset, or --task-liveness-interval is 0. In that case, nothing
+	// else catches a stale-assignment 421 (ax-9qu.17). checkTask must then
+	// count that 421 like any other dead probe. It must not defer to a
+	// sweep that never runs.
+	DeferStaleAssignment bool
 
 	mu     sync.Mutex
 	misses map[string]*taskMonitorMiss
@@ -410,28 +454,41 @@ func (m *TaskMonitor) checkTask(ctx context.Context, task *v1alpha1.Task) {
 	}
 
 	// The SandboxUnresponsive probe goes through atenet-router only, gated
-	// on ATENET_ROUTER_ADDR, same as LivenessChecker's sweep (main.go). A
-	// direct dial to the worker has no ate-target-actor header, so it
-	// always 421s and would fail every RUNNING task after 3 sweeps
-	// regardless of the sandbox's real state (ax-9qu.10). With no router
-	// address, this check stays off: clear any stale count and return.
-	routerAddr := os.Getenv("ATENET_ROUTER_ADDR")
-	if routerAddr == "" {
+	// on m.RouterAddr, same as LivenessChecker's sweep (main.go). A direct
+	// dial to the worker has no ate-target-actor header, so it always
+	// 421s. That would fail every RUNNING task after 3 sweeps, regardless
+	// of the sandbox's real state (ax-9qu.10). With no router address,
+	// this check stays off: clear any stale count and return.
+	if m.RouterAddr == "" {
 		m.clearMiss(key)
 		return
 	}
-	probe, alive := m.reconciler.probeSandboxViaRouter(ctx, routerAddr, atespace, actorName)
+	probe, alive, probeErr := m.reconciler.probeSandboxViaRouter(ctx, m.RouterAddr, atespace, actorName)
+	if probeErr != nil {
+		// A transport-level failure to reach atenet-router itself, not a
+		// response from it. This is inconclusive, not proof the sandbox
+		// died (ax-9qu.15). Leave the miss count as is: an outage must not
+		// fail every RUNNING task, but a real dead response (handled
+		// below) still must.
+		return
+	}
 	if alive {
 		m.clearMiss(key)
 		return
 	}
 	if probe.staleAssignment {
-		// A 421 with X-Ate-Assignment-Stale is LivenessChecker's signal, on
-		// its own threshold and timeline (docs/networking.md). Counting it
-		// here too would fail the same task for the same symptom on a
-		// shorter timeline (ax-9qu.8). Leave it to LivenessChecker.
-		m.clearMiss(key)
-		return
+		if m.DeferStaleAssignment {
+			// A 421 with X-Ate-Assignment-Stale is LivenessChecker's
+			// signal, on its own threshold and timeline
+			// (docs/networking.md). Counting it here too would fail the
+			// same task for the same symptom on a shorter timeline
+			// (ax-9qu.8). Leave it to LivenessChecker.
+			m.clearMiss(key)
+			return
+		}
+		// LivenessChecker will not run (ax-9qu.17): no other sweep catches
+		// this stale-routed task. Fall through and count the 421 like any
+		// other dead probe.
 	}
 
 	count, first := m.recordMiss(key, m.now())

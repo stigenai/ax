@@ -35,12 +35,16 @@ import (
 // defaultTaskMemoryDefault is the value of --default-task-memory and
 // AX_DEFAULT_TASK_MEMORY when a user sets neither one.
 //
-// ax-9qu raised this value from 4Gi. A Claude Code session plus a Go or Node
-// build needs more memory than 4Gi. 7680Mi still fits 2 tasks on each 16Gi
-// worker. The sum is 2*7680Mi plus about 400Mi for ateom overhead. The total,
-// 15760Mi, stays under the 16384Mi limit. See
+// ax-9qu raised this value from 4Gi. A Claude Code session needs more
+// memory than 4Gi. A Go or Node build also needs more than 4Gi.
+//
+// The person set this value by hand at 8Gi, live, on 2026-10-16 03:20Z.
+// This commit matches the repo to that live value.
+//
+// 2*8192Mi equals the 16384Mi (16Gi) limit of each worker exactly. 2 tasks
+// fit. No margin is left for ateom's own overhead (about 400Mi). See
 // deploy/stigenai/workerpool.yaml for the full sizing math.
-const defaultTaskMemoryDefault = "7680Mi"
+const defaultTaskMemoryDefault = "8Gi"
 
 // sandboxCheckIntervalDefault is the --sandbox-check-interval /
 // AX_SANDBOX_CHECK_INTERVAL value used when neither is set: a Go duration
@@ -177,7 +181,7 @@ func main() {
 	flag.BoolVar(&substratePlaintext, "substrate-plaintext", false, "Use insecure plaintext gRPC connection to Substrate")
 	flag.StringVar(&defaultTemplate, "template", "default-template", "Default Substrate ActorTemplate name")
 	flag.StringVar(&defaultTemplateAtespace, "template-atespace", "ax-system", "Default Substrate ActorTemplate atespace")
-	flag.StringVar(&defaultTaskMemory, "default-task-memory", defaultTaskMemoryDefault, "Memory limit booked for a task that names none (Substrate quantity, e.g. 7680Mi); 0 disables")
+	flag.StringVar(&defaultTaskMemory, "default-task-memory", defaultTaskMemoryDefault, "Memory limit booked for a task that names none (Substrate quantity, e.g. 8Gi); 0 disables")
 	flag.StringVar(&maxTaskMemory, "max-task-memory", "", "Largest memory limit any worker can hold (Kubernetes quantity, e.g. 16Gi); Reconcile fails a task above it instead of waiting for capacity. Empty or 0 disables the check")
 	flag.StringVar(&sandboxCheckInterval, "sandbox-check-interval", sandboxCheckIntervalDefault, "How often TaskMonitor checks each Running task's actor and runner (Go duration, e.g. 30s); 0 disables it (env AX_SANDBOX_CHECK_INTERVAL)")
 	flag.StringVar(&nativeTLSDestination, "native-tls-destination", "", "Private protected-actor TLS destination; install or verify exact policy before resume")
@@ -279,15 +283,31 @@ func main() {
 	rStore := redis.NewStore(rClient, redis.Options{})
 
 	routerAddr := os.Getenv("ATENET_ROUTER_ADDR")
+	livenessSweepEnabled := taskLivenessSweepEnabled(routerAddr, taskLivenessInterval)
+
 	monitor := controller.NewTaskMonitor(rStore, reconciler, sandboxCheckIntervalDuration)
-	slog.Info("sandbox check monitor",
+	// ax-9qu.16: set these fields once here. checkTask no longer reads
+	// ATENET_ROUTER_ADDR itself for every task in every sweep.
+	monitor.RouterAddr = routerAddr
+	// ax-9qu.17: defer a stale-assignment 421 to LivenessChecker only when
+	// that sweep will run. Otherwise, TaskMonitor is the only sweep that
+	// can catch a stale-routed task. It must count the 421 itself, not
+	// drop it.
+	monitor.DeferStaleAssignment = livenessSweepEnabled
+
+	sandboxCheckLogArgs := []any{
 		"interval", sandboxCheckIntervalDuration,
 		"routerAddr", routerAddr,
-		"note", "SandboxUnresponsive stays off until ATENET_ROUTER_ADDR is set (ax-9qu.10)",
-	)
+	}
+	if routerAddr == "" {
+		// ax-9qu.16: log this note only when ATENET_ROUTER_ADDR is unset.
+		// It names the real cause only in that case.
+		sandboxCheckLogArgs = append(sandboxCheckLogArgs, "note", "SandboxUnresponsive stays off until ATENET_ROUTER_ADDR is set (ax-9qu.10)")
+	}
+	slog.Info("sandbox check monitor", sandboxCheckLogArgs...)
 	go monitor.Run(ctx)
 
-	if taskLivenessSweepEnabled(routerAddr, taskLivenessInterval) {
+	if livenessSweepEnabled {
 		checker := controller.NewLivenessChecker(rStore, subClient, routerAddr)
 		checker.Threshold = taskLivenessThreshold
 		slog.Info("task liveness sweep",
