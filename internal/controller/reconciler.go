@@ -100,18 +100,28 @@ type TaskReconciler struct {
 	// digest stay the same with or without this default.
 	DefaultTaskMemory string
 
-	// MaxTaskMemory is the memory limit of the largest task any worker can
-	// hold. Reconcile checks it with v1alpha1.ValidateTaskMemoryCap, using
-	// DefaultTaskMemory as the fallback for a task with no limit of its own.
-	// A task above the cap fails with reason reasonMemoryExceedsCapacity.
-	// It does not wait for Substrate capacity it can never get.
-	// A zero value, the default, turns the check off.
+	// MaxTaskMemory is the memory limit of the largest task any worker
+	// can hold.
+	//
+	// Reconcile checks the cap before each placement, with
+	// v1alpha1.ValidateTaskMemoryCap. The check uses DefaultTaskMemory as
+	// the fallback for a task with no limit of its own. A task above the
+	// cap fails with reason reasonMemoryExceedsCapacity, so it does not
+	// wait for Substrate capacity it can never get.
+	//
+	// The check skips a task already in phase Running: that task already
+	// holds a worker booking. A lower cap applies to it only at its next
+	// suspend or resume (ax-7ku). A zero value turns the
+	// check off. Zero is the default value.
 	MaxTaskMemory resource.Quantity
 
-	// MaxTaskCPU is the cpu limit of the largest task any worker can hold
-	// (see MaxTaskMemory). No AX_DEFAULT_TASK_CPU exists, so this checks
-	// only a task's own limit. A task above the cap fails with reason
-	// reasonCPUExceedsCapacity.
+	// MaxTaskCPU is the cpu limit of the largest task any worker can
+	// hold (see MaxTaskMemory).
+	//
+	// No AX_DEFAULT_TASK_CPU exists, so this check uses only a task's own
+	// limit. A task above the cap fails with reason
+	// reasonCPUExceedsCapacity. As with MaxTaskMemory, the check applies
+	// before each placement, not to a task already in phase Running.
 	MaxTaskCPU resource.Quantity
 }
 
@@ -168,20 +178,37 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 
 	now := time.Now()
 
-	// A task above MaxTaskMemory can never fit any worker: fail it now,
-	// before any Substrate call, instead of letting it loop in Pending.
-	if err := v1alpha1.ValidateTaskMemoryCap(task, r.DefaultTaskMemory, r.MaxTaskMemory); err != nil {
-		r.setNotReady(task, reasonMemoryExceedsCapacity, err.Error(), now)
-		task.Status.Phase = "Failed"
-		return task, err
-	}
+	// The cap gates placement. It stops a task that can never fit any
+	// worker from a loop in Pending.
+	//
+	// A task already in phase Running holds a worker booking from an
+	// earlier, passing check. This check must skip that task. A fail here
+	// would set Phase=Failed while the task's Substrate actor keeps
+	// running and keeps the booking (ax-7ku). The cap applies again at
+	// the task's next suspend or resume.
+	if task.Status.Phase != "Running" {
+		// A task above MaxTaskMemory can never fit any worker. Fail it
+		// now, before any Substrate call, instead of a loop in Pending.
+		if err := v1alpha1.ValidateTaskMemoryCap(task, r.DefaultTaskMemory, r.MaxTaskMemory); err != nil {
+			r.setNotReady(task, reasonMemoryExceedsCapacity, err.Error(), now)
+			task.Status.Phase = "Failed"
+			return task, err
+		}
 
-	// A task above MaxTaskCPU can never fit any worker: fail it now, before
-	// any Substrate call, instead of letting it loop in Pending.
-	if err := v1alpha1.ValidateTaskCPUCap(task, r.MaxTaskCPU); err != nil {
-		r.setNotReady(task, reasonCPUExceedsCapacity, err.Error(), now)
-		task.Status.Phase = "Failed"
-		return task, err
+		// A task above MaxTaskCPU can never fit any worker. Fail it now,
+		// before any Substrate call, instead of a loop in Pending.
+		if err := v1alpha1.ValidateTaskCPUCap(task, r.MaxTaskCPU); err != nil {
+			r.setNotReady(task, reasonCPUExceedsCapacity, err.Error(), now)
+			task.Status.Phase = "Failed"
+			return task, err
+		}
+	} else {
+		if err := v1alpha1.ValidateTaskMemoryCap(task, r.DefaultTaskMemory, r.MaxTaskMemory); err != nil {
+			slog.Warn("task above cap kept running; cap applies at next resume", "name", task.Metadata.Name, "atespace", atespace, "error", err)
+		}
+		if err := v1alpha1.ValidateTaskCPUCap(task, r.MaxTaskCPU); err != nil {
+			slog.Warn("task above cap kept running; cap applies at next resume", "name", task.Metadata.Name, "atespace", atespace, "error", err)
+		}
 	}
 
 	// 1. Ensure the Atespace exists in Substrate
