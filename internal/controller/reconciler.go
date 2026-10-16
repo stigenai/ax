@@ -20,7 +20,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net"
 	"net/http"
 	"os"
 	"regexp"
@@ -83,7 +82,7 @@ type TaskReconciler struct {
 	// to report ready before recording it as still initializing.
 	WorkspaceReadyTimeout time.Duration
 
-	// DefaultTaskMemory is a Substrate quantity, for example "4Gi". Reconcile
+	// DefaultTaskMemory is a Substrate quantity, for example "7680Mi". Reconcile
 	// books it as the memory limit for a non-supervisor task that sets no
 	// spec.resources.limits.memory. An empty value disables the default: the
 	// task's actor then gets no top-level memory booking. Reconcile never
@@ -287,13 +286,6 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 	task.Status.Phase = "Running"
 
 	// Check if workspace setup inside the actor has completed
-	host := workerIP
-	port := "80"
-	if h, p, err := net.SplitHostPort(workerIP); err == nil {
-		host = h
-		port = p
-	}
-	readyURL := fmt.Sprintf("http://%s:%s/readyz?check=workspace", host, port)
 	// Workspace setup happens once per task. After it has completed, WorkspaceReady stays
 	// True across suspend/resume cycles, so only poll while it is still initializing.
 	workspaceReady := r.conditionTrue(task, condWorkspaceReady)
@@ -306,29 +298,8 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 		defer ticker.Stop()
 
 		checkReady := func() bool {
-			// 1. Direct readyz check
-			req, _ := http.NewRequestWithContext(pollCtx, http.MethodGet, readyURL, nil)
-			if resp, err := r.httpClient.Do(req); err == nil {
-				_ = resp.Body.Close()
-				if resp.StatusCode == http.StatusOK {
-					return true
-				}
-			}
-
-			// 2. Router-based readyz check (in-cluster via atenet-router)
-			if routerAddr := os.Getenv("ATENET_ROUTER_ADDR"); routerAddr != "" {
-				rReq, _ := http.NewRequestWithContext(pollCtx, http.MethodGet, fmt.Sprintf("http://%s/readyz?check=workspace", routerAddr), nil)
-				if rReq != nil {
-					rReq.Header.Set("ate-target-actor", fmt.Sprintf("%s/%s", atespace, actorName))
-					if resp, err := r.httpClient.Do(rReq); err == nil {
-						_ = resp.Body.Close()
-						if resp.StatusCode == http.StatusOK {
-							return true
-						}
-					}
-				}
-			}
-			return false
+			_, ok := r.probeReadyz(pollCtx, workerIP, atespace, actorName, readyzStatusOK)
+			return ok
 		}
 
 		// Initial check
