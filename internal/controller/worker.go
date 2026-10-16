@@ -363,13 +363,7 @@ func (w *Worker) scheduleDeleteRetry(ctx context.Context, atespace, name string,
 	w.deleteAttempts[key] = attempt + 1
 	w.deleteMu.Unlock()
 
-	backoff := base
-	for i := 0; i < attempt && backoff < max; i++ {
-		backoff *= 2
-	}
-	if backoff > max {
-		backoff = max
-	}
+	backoff := deleteBackoff(attempt, base, max)
 
 	slog.Warn("task delete failed, retrying", "atespace", atespace, "name", name,
 		"attempt", attempt+1, "next_retry", backoff, "error", cause)
@@ -404,6 +398,21 @@ func (w *Worker) scheduleDeleteRetry(ctx context.Context, atespace, name string,
 			slog.Warn("failed to requeue task deletion", "atespace", atespace, "name", name, "error", err)
 		}
 	}()
+}
+
+// deleteBackoff reports the delete-retry delay for attempt (0-indexed),
+// doubling base once per attempt and clamping at max. It never overflows:
+// the loop stops doubling as soon as backoff reaches max, no matter how
+// large attempt is.
+func deleteBackoff(attempt int, base, max time.Duration) time.Duration {
+	backoff := base
+	for i := 0; i < attempt && backoff < max; i++ {
+		backoff *= 2
+	}
+	if backoff > max {
+		backoff = max
+	}
+	return backoff
 }
 
 // clearDeleteBackoff resets a task's delete-retry schedule once its deletion

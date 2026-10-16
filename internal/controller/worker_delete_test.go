@@ -592,3 +592,37 @@ func TestDeleteSurvivesStatusWriteRacingMarkTaskDeletingForOrdinaryTask(t *testi
 		t.Fatalf("want 1 DeleteActor attempt, got %d", control.Attempts())
 	}
 }
+
+// TestDeleteBackoffDoublesAndCaps covers ax-atj AC2: deleteBackoff doubles on
+// each attempt and clamps at max, with no overflow for a large attempt
+// count. It fails under a mutation that removes "backoff *= 2" (every
+// attempt would then report base), and under a mutation that removes the
+// max clamp (an uncapped attempt count would overflow or exceed max).
+func TestDeleteBackoffDoublesAndCaps(t *testing.T) {
+	base, max := 15*time.Second, 5*time.Minute
+	want := []time.Duration{
+		15 * time.Second,
+		30 * time.Second,
+		60 * time.Second,
+		120 * time.Second,
+		240 * time.Second,
+		300 * time.Second,
+		300 * time.Second,
+	}
+	for attempt, w := range want {
+		if got := deleteBackoff(attempt, base, max); got != w {
+			t.Fatalf("attempt %d: want %v, got %v", attempt, w, got)
+		}
+	}
+	if got := deleteBackoff(1000, base, max); got != max {
+		t.Fatalf("attempt 1000: want max %v (no overflow), got %v", max, got)
+	}
+
+	smallBase, smallMax := 10*time.Millisecond, 40*time.Millisecond
+	wantSmall := []time.Duration{10 * time.Millisecond, 20 * time.Millisecond, 40 * time.Millisecond, 40 * time.Millisecond}
+	for attempt, w := range wantSmall {
+		if got := deleteBackoff(attempt, smallBase, smallMax); got != w {
+			t.Fatalf("small schedule attempt %d: want %v, got %v", attempt, w, got)
+		}
+	}
+}
