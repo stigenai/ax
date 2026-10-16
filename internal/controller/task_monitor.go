@@ -27,6 +27,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"github.com/google/ax/internal/store"
@@ -47,20 +48,33 @@ const maxCrashMessageBytes = 512
 // direct signal).
 var oomPattern = regexp.MustCompile(`(?i)\boom\b|out of memory`)
 
-// classifyActorLoss decides whether a Running task's actor is lost, given a
-// Client.GetActor result. It is pure. The same actor and error always give
-// the same verdict. So a test can check it with no call to Substrate.
+// reasonActorCrashed and reasonOOMKilled name the Ready condition reason
+// for a CRASHED actor. liveness.go defines reasonActorLost and
+// reasonActorMissing. classifyActorLoss reuses those two names below for
+// the matching GetActor-error case, so TaskMonitor and LivenessChecker
+// report the same reason for the same actor-gone state.
+const (
+	reasonActorCrashed = "ActorCrashed"
+	reasonOOMKilled    = "OOMKilled"
+)
+
+// classifyActorLoss decides whether a Running task's actor is lost. It
+// takes a Client.GetActor result for actorName. It is pure: the same
+// inputs always give the same verdict. A test can check it with no call to
+// Substrate.
 //
-// A gRPC NotFound error means the actor record itself is gone. The reason is
-// ActorLost. State ACTOR_STATE_CRASHED means the sandbox died. The reason is
-// OOMKilled when the crash message matches oomPattern, and ActorCrashed
-// otherwise. Any other state, or any other error, is not loss. A RUNNING
-// actor instead goes to a liveness probe. A transient Substrate error must
-// not fail a live task.
-func classifyActorLoss(actor *ateapipb.Actor, getErr error) (reason, message string, lost bool) {
+// A gRPC NotFound error means Substrate no longer knows the actor. This
+// case sets reason reasonActorMissing. liveness.go:44-45 and
+// docs/networking.md use this same reason for this same NotFound case.
+// State ACTOR_STATE_CRASHED means the sandbox died. A crash message that
+// matches oomPattern sets reason reasonOOMKilled. Any other crash message
+// sets reason reasonActorCrashed. Any other state, or any other error, is
+// not loss. A RUNNING actor instead goes to a liveness probe. A transient
+// Substrate error must not fail a live task.
+func classifyActorLoss(actorName string, actor *ateapipb.Actor, getErr error) (reason, message string, lost bool) {
 	if getErr != nil {
 		if status.Code(getErr) == codes.NotFound {
-			return "ActorLost", truncateMessage(getErr.Error()), true
+			return reasonActorMissing, fmt.Sprintf("actor %s is no longer known to Substrate", actorName), true
 		}
 		return "", "", false
 	}
@@ -69,24 +83,35 @@ func classifyActorLoss(actor *ateapipb.Actor, getErr error) (reason, message str
 	}
 	msg := truncateMessage(actor.GetStatus().GetCrash().GetMessage())
 	if oomPattern.MatchString(msg) {
-		return "OOMKilled", msg, true
+		return reasonOOMKilled, msg, true
 	}
-	return "ActorCrashed", msg, true
+	return reasonActorCrashed, msg, true
 }
 
 // truncateMessage bounds msg to maxCrashMessageBytes, so a status field
-// never grows without limit.
+// never grows without limit. It never cuts in the middle of a UTF-8 rune:
+// a message that splits a multi-byte rune fails protojson's write of the
+// Condition (reproduced: "Condition.message contains invalid UTF-8"), which
+// would leave the task stuck Running instead of Failed.
 func truncateMessage(msg string) string {
-	if len(msg) > maxCrashMessageBytes {
-		return msg[:maxCrashMessageBytes]
+	if len(msg) <= maxCrashMessageBytes {
+		return msg
 	}
-	return msg
+	cut := maxCrashMessageBytes
+	for cut > 0 && !utf8.ValidString(msg[:cut]) {
+		cut--
+	}
+	return msg[:cut]
 }
 
 // readyzProbe is one /readyz response: the HTTP status code and the body.
+// staleAssignment marks a 421 that carries X-Ate-Assignment-Stale: true.
+// This is a worker-restarted-in-place signal (ax-lox), not proof that the
+// sandbox itself died. See probeSandboxViaRouter.
 type readyzProbe struct {
-	statusCode int
-	body       string
+	statusCode      int
+	body            string
+	staleAssignment bool
 }
 
 // readyzStatusOK is the alive predicate Reconcile's workspace-ready poll
@@ -154,6 +179,45 @@ func (r *TaskReconciler) probeReadyz(ctx context.Context, workerIP, atespace, ac
 		}
 	}
 	return last, false
+}
+
+// probeSandboxViaRouter checks a runner's /readyz through atenet-router
+// only. It never dials a worker directly.
+//
+// Substrate's atunnel ingress needs the ate-target-actor header on every
+// request (internal/atunnel/ingress.go:519-531). A direct dial has no such
+// header, so it always answers 421. The monitor used to try a direct dial
+// first, through probeReadyz, and that 421 counted as a dead probe. So
+// every RUNNING task failed SandboxUnresponsive after 3 sweeps, whether or
+// not its sandbox was still alive. probeSandboxViaRouter fixes this by
+// going through the router, which supplies the header, or not probing at
+// all (ax-9qu.10).
+//
+// It returns ok=false with a zero readyzProbe at once when routerAddr is
+// empty: the SandboxUnresponsive check needs ATENET_ROUTER_ADDR, the same
+// as LivenessChecker's sweep.
+func (r *TaskReconciler) probeSandboxViaRouter(ctx context.Context, routerAddr, atespace, actorName string) (readyzProbe, bool) {
+	if routerAddr == "" {
+		return readyzProbe{}, false
+	}
+	url := fmt.Sprintf("http://%s/readyz?check=workspace", routerAddr)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return readyzProbe{}, false
+	}
+	req.Header.Set("ate-target-actor", fmt.Sprintf("%s/%s", atespace, actorName))
+	resp, err := r.httpClient.Do(req)
+	if err != nil {
+		return readyzProbe{}, false
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	probe := readyzProbe{
+		statusCode:      resp.StatusCode,
+		body:            string(body),
+		staleAssignment: resp.StatusCode == http.StatusMisdirectedRequest && resp.Header.Get("X-Ate-Assignment-Stale") == "true",
+	}
+	return probe, readyzAlive(probe)
 }
 
 // monitorPageSize bounds one ListTasks call in a liveness sweep.
@@ -236,25 +300,36 @@ func (m *TaskMonitor) Run(ctx context.Context) {
 
 // Sweep checks every Running task once. It logs and goes on past a listing
 // or per-task error, so one bad page or task cannot stop the sweep.
+//
+// After the pass, it prunes misses for every key it did not see as Running
+// this sweep: a key for a task that changed phase, or that a delete already
+// removed from ListTasks. This mirrors LivenessChecker.pruneMisses
+// (ax-lox.8, d254c8f). Without it, a deleted and recreated task with the
+// same name, atespace and status.id would start with a stale miss count
+// instead of a fresh run (ax-9qu.13).
 func (m *TaskMonitor) Sweep(ctx context.Context) {
+	seenRunning := make(map[string]bool)
 	var offset int64
 	for {
 		tasks, err := m.store.ListTasks(ctx, "*", monitorPageSize, offset)
 		if err != nil {
-			slog.Warn("liveness monitor: failed to list tasks", "error", err)
+			slog.Warn("sandbox check monitor: failed to list tasks", "error", err)
 			return
 		}
 		for _, task := range tasks {
 			if task.GetStatus().GetPhase() != "Running" {
 				continue
 			}
+			key := taskMonitorMissKey(task.GetMetadata().GetAtespace(), task.GetMetadata().GetName(), task.GetStatus().GetId())
+			seenRunning[key] = true
 			m.checkTask(ctx, task)
 		}
 		if int64(len(tasks)) < monitorPageSize {
-			return
+			break
 		}
 		offset += monitorPageSize
 	}
+	m.pruneMisses(seenRunning)
 }
 
 // taskMonitorMissKey identifies one task incarnation's run of dead probes.
@@ -268,6 +343,19 @@ func (m *TaskMonitor) clearMiss(key string) {
 	m.mu.Lock()
 	delete(m.misses, key)
 	m.mu.Unlock()
+}
+
+// pruneMisses drops every miss count whose key is not in seenRunning: a
+// task this sweep did not see as Running, whether it moved to another phase
+// or a delete already removed it from ListTasks.
+func (m *TaskMonitor) pruneMisses(seenRunning map[string]bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for key := range m.misses {
+		if !seenRunning[key] {
+			delete(m.misses, key)
+		}
+	}
 }
 
 // recordMiss adds one dead probe for key and returns the resulting count and
@@ -284,6 +372,11 @@ func (m *TaskMonitor) recordMiss(key string, at time.Time) (count int, first tim
 	return rec.count, rec.first
 }
 
+// getActorTimeout bounds one checkTask's call to Substrate's GetActor, the
+// same bound LivenessChecker.probeOne uses (liveness.go:193). Without it, a
+// hung Substrate call would stall the whole serial sweep (ax-9qu.11).
+const getActorTimeout = 5 * time.Second
+
 // checkTask decides whether task's actor is lost or its runner has stopped
 // answering, and fails the task when either is true.
 func (m *TaskMonitor) checkTask(ctx context.Context, task *v1alpha1.Task) {
@@ -296,15 +389,17 @@ func (m *TaskMonitor) checkTask(ctx context.Context, task *v1alpha1.Task) {
 	statusID := task.GetStatus().GetId()
 	key := taskMonitorMissKey(atespace, name, statusID)
 
-	actor, getErr := m.reconciler.client.GetActor(ctx, atespace, actorName)
-	if reason, message, lost := classifyActorLoss(actor, getErr); lost {
+	getCtx, cancel := context.WithTimeout(ctx, getActorTimeout)
+	actor, getErr := m.reconciler.client.GetActor(getCtx, atespace, actorName)
+	cancel()
+	if reason, message, lost := classifyActorLoss(actorName, actor, getErr); lost {
 		m.clearMiss(key)
 		m.failTask(ctx, atespace, name, statusID, reason, message)
 		return
 	}
 	if getErr != nil {
-		// A transient Substrate error. Leave the task alone; the next sweep
-		// tries again.
+		// A transient Substrate error, or this call's own timeout. Leave the
+		// task alone; the next sweep tries again.
 		return
 	}
 	if actor.GetStatus().GetState() != ateapipb.ActorState_ACTOR_STATE_RUNNING {
@@ -314,11 +409,27 @@ func (m *TaskMonitor) checkTask(ctx context.Context, task *v1alpha1.Task) {
 		return
 	}
 
-	workerIP := task.GetStatus().GetWorkerIp()
-	if workerIP == "" {
+	// The SandboxUnresponsive probe goes through atenet-router only, gated
+	// on ATENET_ROUTER_ADDR, same as LivenessChecker's sweep (main.go). A
+	// direct dial to the worker has no ate-target-actor header, so it
+	// always 421s and would fail every RUNNING task after 3 sweeps
+	// regardless of the sandbox's real state (ax-9qu.10). With no router
+	// address, this check stays off: clear any stale count and return.
+	routerAddr := os.Getenv("ATENET_ROUTER_ADDR")
+	if routerAddr == "" {
+		m.clearMiss(key)
 		return
 	}
-	if _, alive := m.reconciler.probeReadyz(ctx, workerIP, atespace, actorName, readyzAlive); alive {
+	probe, alive := m.reconciler.probeSandboxViaRouter(ctx, routerAddr, atespace, actorName)
+	if alive {
+		m.clearMiss(key)
+		return
+	}
+	if probe.staleAssignment {
+		// A 421 with X-Ate-Assignment-Stale is LivenessChecker's signal, on
+		// its own threshold and timeline (docs/networking.md). Counting it
+		// here too would fail the same task for the same symptom on a
+		// shorter timeline (ax-9qu.8). Leave it to LivenessChecker.
 		m.clearMiss(key)
 		return
 	}

@@ -18,6 +18,9 @@ import (
 	"context"
 	"net"
 	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -77,6 +80,70 @@ func taskWithWorker(atespace, name, actor, workerIP, id string) *v1alpha1.Task {
 	task := runningTaskWithActor(atespace, name, actor, workerIP)
 	task.Status.Id = id
 	return task
+}
+
+// sandboxRouter is a fake atenet-router for TaskMonitor's router-only
+// /readyz probe (probeSandboxViaRouter, ax-9qu.10). A test picks the reply
+// for one atespace/actor key with set(); an unset key answers "dead" (502),
+// as a sandbox with no working route would. callsFor records every
+// ate-target-actor header value the router saw, in order, so a test can
+// prove the probe used the header instead of a direct dial.
+type sandboxRouter struct {
+	mu    sync.Mutex
+	mode  map[string]string
+	calls []string
+	srv   *httptest.Server
+}
+
+func newSandboxRouter(t *testing.T) *sandboxRouter {
+	t.Helper()
+	r := &sandboxRouter{mode: map[string]string{}}
+	r.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		actor := req.Header.Get("ate-target-actor")
+		r.mu.Lock()
+		r.calls = append(r.calls, actor)
+		mode := r.mode[actor]
+		r.mu.Unlock()
+		switch mode {
+		case "alive":
+			w.WriteHeader(http.StatusOK)
+		case "initializing":
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte("workspace initializing"))
+		case "stale":
+			w.Header().Set("X-Ate-Assignment-Stale", "true")
+			w.WriteHeader(http.StatusMisdirectedRequest)
+		default: // "dead" or unset: a sandbox that never answers.
+			w.WriteHeader(http.StatusBadGateway)
+		}
+	}))
+	t.Cleanup(r.srv.Close)
+	return r
+}
+
+func (r *sandboxRouter) set(atespace, actor, mode string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.mode[atespace+"/"+actor] = mode
+}
+
+func (r *sandboxRouter) headerCalls() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]string, len(r.calls))
+	copy(out, r.calls)
+	return out
+}
+
+func (r *sandboxRouter) addr() string {
+	return strings.TrimPrefix(r.srv.URL, "http://")
+}
+
+// setRouterEnv points ATENET_ROUTER_ADDR at router for the life of the
+// test, mirroring the only path that reaches it in production (main.go).
+func setRouterEnv(t *testing.T, router *sandboxRouter) {
+	t.Helper()
+	t.Setenv("ATENET_ROUTER_ADDR", router.addr())
 }
 
 // TestTaskMonitorSweepCrashedActorFailsWithActorCrashed covers AC4's crashed
@@ -147,9 +214,11 @@ func TestTaskMonitorSweepOOMCrashFailsWithOOMKilled(t *testing.T) {
 	}
 }
 
-// TestTaskMonitorSweepNotFoundActorFailsWithActorLost covers AC4's NotFound
-// branch: Substrate no longer knowing the actor becomes Failed/ActorLost.
-func TestTaskMonitorSweepNotFoundActorFailsWithActorLost(t *testing.T) {
+// TestTaskMonitorSweepNotFoundActorFailsWithActorMissing covers AC4's
+// NotFound branch and ax-9qu.7: Substrate no longer knowing the actor at
+// all becomes Failed/ActorMissing, the same reason LivenessChecker uses for
+// this case (liveness.go:44-45, docs/networking.md), not ActorLost.
+func TestTaskMonitorSweepNotFoundActorFailsWithActorMissing(t *testing.T) {
 	ctx := context.Background()
 	s := memory.NewStore()
 	task := taskWithWorker("default", "task1", "task1", deadRunnerAddr(t), "id-1")
@@ -169,8 +238,42 @@ func TestTaskMonitorSweepNotFoundActorFailsWithActorLost(t *testing.T) {
 	if got.GetStatus().GetPhase() != "Failed" {
 		t.Fatalf("phase = %q, want Failed", got.GetStatus().GetPhase())
 	}
-	if reason := readyReason(got); reason != "ActorLost" {
-		t.Fatalf("Ready reason = %q, want ActorLost", reason)
+	if reason := readyReason(got); reason != "ActorMissing" {
+		t.Fatalf("Ready reason = %q, want ActorMissing", reason)
+	}
+}
+
+// TestTaskMonitorGetActorBoundedByTimeout covers ax-9qu.11: a hung
+// Substrate GetActor call must not stall the serial sweep. getActorDelay
+// outlasts getActorTimeout (5s), so Sweep must still return promptly.
+func TestTaskMonitorGetActorBoundedByTimeout(t *testing.T) {
+	ctx := context.Background()
+	s := memory.NewStore()
+	task := taskWithWorker("default", "task1", "task1", deadRunnerAddr(t), "id-1")
+	if err := s.SaveTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	mockSrv := &mockControlServer{getActorDelay: 10 * time.Second}
+	reconciler := newTestReconciler(t, mockSrv)
+	monitor := controller.NewTaskMonitor(s, reconciler, 0)
+
+	done := make(chan struct{})
+	go func() {
+		monitor.Sweep(ctx)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(8 * time.Second):
+		t.Fatal("Sweep did not return within 8s: GetActor's 10s delay was not bounded by a shorter timeout")
+	}
+
+	got, err := s.GetTask(ctx, "default", "task1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.GetStatus().GetPhase() != "Running" {
+		t.Fatalf("phase = %q, want Running: a GetActor timeout is transient, not proof of loss", got.GetStatus().GetPhase())
 	}
 }
 
@@ -209,6 +312,9 @@ func TestTaskMonitorSandboxUnresponsiveNeedsThresholdAndWindow(t *testing.T) {
 			if err := s.SaveTask(ctx, task); err != nil {
 				t.Fatal(err)
 			}
+			router := newSandboxRouter(t)
+			router.set("default", "task1", "dead")
+			setRouterEnv(t, router)
 			mockSrv := &mockControlServer{getActorActor: runningActor()}
 			reconciler := newTestReconciler(t, mockSrv)
 			monitor := controller.NewTaskMonitor(s, reconciler, 0)
@@ -240,23 +346,14 @@ func TestTaskMonitorSandboxUnresponsiveNeedsThresholdAndWindow(t *testing.T) {
 func TestTaskMonitorReadyz503WorkspaceInitializingStaysRunning(t *testing.T) {
 	ctx := context.Background()
 	s := memory.NewStore()
-	lis, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	mux := http.NewServeMux()
-	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusServiceUnavailable)
-		_, _ = w.Write([]byte("workspace initializing"))
-	})
-	srv := &http.Server{Handler: mux}
-	go srv.Serve(lis)
-	t.Cleanup(func() { _ = srv.Close() })
 
-	task := taskWithWorker("default", "task1", "task1", lis.Addr().String(), "id-1")
+	task := taskWithWorker("default", "task1", "task1", deadRunnerAddr(t), "id-1")
 	if err := s.SaveTask(ctx, task); err != nil {
 		t.Fatal(err)
 	}
+	router := newSandboxRouter(t)
+	router.set("default", "task1", "initializing")
+	setRouterEnv(t, router)
 	mockSrv := &mockControlServer{getActorActor: runningActor()}
 	reconciler := newTestReconciler(t, mockSrv)
 	monitor := controller.NewTaskMonitor(s, reconciler, 0)
@@ -291,6 +388,9 @@ func TestTaskMonitorFailTaskSkipsWriteWhenStatusIDChanged(t *testing.T) {
 	if err := inner.SaveTask(ctx, task); err != nil {
 		t.Fatal(err)
 	}
+	router := newSandboxRouter(t)
+	router.set("default", "task1", "dead")
+	setRouterEnv(t, router)
 
 	raced := &raceStore{Store: inner, hook: func() {
 		if err := inner.UpdateTaskStatus(ctx, "default", "task1", &v1alpha1.TaskStatus{
@@ -332,6 +432,9 @@ func TestTaskMonitorFailTaskSkipsWriteWhenPhaseLeftRunning(t *testing.T) {
 	if err := inner.SaveTask(ctx, task); err != nil {
 		t.Fatal(err)
 	}
+	router := newSandboxRouter(t)
+	router.set("default", "task1", "dead")
+	setRouterEnv(t, router)
 
 	raced := &raceStore{Store: inner, hook: func() {
 		if err := inner.UpdateTaskStatus(ctx, "default", "task1", &v1alpha1.TaskStatus{
@@ -396,5 +499,201 @@ func TestTaskMonitorRunDisabledNeverListsTasks(t *testing.T) {
 
 	if counted.calls != 0 {
 		t.Fatalf("ListTasks was called %d times, want 0 when the monitor is disabled", counted.calls)
+	}
+}
+
+// TestTaskMonitorNoRouterAddrDisablesSandboxCheck covers ax-9qu.10: with no
+// ATENET_ROUTER_ADDR, the SandboxUnresponsive check must stay off, not fail
+// a task from a direct dial that would 421 for lack of the
+// ate-target-actor header atunnel's ingress requires on every request.
+func TestTaskMonitorNoRouterAddrDisablesSandboxCheck(t *testing.T) {
+	t.Setenv("ATENET_ROUTER_ADDR", "")
+	ctx := context.Background()
+	s := memory.NewStore()
+	task := taskWithWorker("default", "task1", "task1", deadRunnerAddr(t), "id-1")
+	if err := s.SaveTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	mockSrv := &mockControlServer{getActorActor: runningActor()}
+	reconciler := newTestReconciler(t, mockSrv)
+	monitor := controller.NewTaskMonitor(s, reconciler, 0)
+
+	start := time.Now()
+	for _, d := range []time.Duration{0, 45 * time.Second, 95 * time.Second, 200 * time.Second} {
+		sweepWithClock(ctx, monitor, start.Add(d))
+	}
+
+	got, err := s.GetTask(ctx, "default", "task1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.GetStatus().GetPhase() != "Running" {
+		t.Fatalf("phase = %q, want Running: the sandbox check must stay off with no router address", got.GetStatus().GetPhase())
+	}
+}
+
+// TestTaskMonitorStaleAssignmentDefersToLivenessChecker covers ax-9qu.8: a
+// 421 with X-Ate-Assignment-Stale is LivenessChecker's signal, on its own
+// threshold and timeline (docs/networking.md). TaskMonitor must not count
+// it toward SandboxUnresponsive: that would fail the same task for the
+// same symptom on a shorter timeline than the documented one.
+func TestTaskMonitorStaleAssignmentDefersToLivenessChecker(t *testing.T) {
+	ctx := context.Background()
+	s := memory.NewStore()
+	task := taskWithWorker("default", "task1", "task1", deadRunnerAddr(t), "id-1")
+	if err := s.SaveTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	router := newSandboxRouter(t)
+	router.set("default", "task1", "stale")
+	setRouterEnv(t, router)
+	mockSrv := &mockControlServer{getActorActor: runningActor()}
+	reconciler := newTestReconciler(t, mockSrv)
+	monitor := controller.NewTaskMonitor(s, reconciler, 0)
+
+	start := time.Now()
+	for _, d := range []time.Duration{0, 45 * time.Second, 95 * time.Second} {
+		sweepWithClock(ctx, monitor, start.Add(d))
+	}
+
+	got, err := s.GetTask(ctx, "default", "task1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.GetStatus().GetPhase() != "Running" {
+		t.Fatalf("phase = %q, want Running: a stale-assignment 421 is LivenessChecker's signal, not TaskMonitor's", got.GetStatus().GetPhase())
+	}
+}
+
+// TestTaskMonitorProbeUsesAteTargetActorHeaderAndRouterAlive covers
+// ax-9qu.14: the only production path (ATENET_ROUTER_ADDR set) must send
+// the ate-target-actor header, and a 200 through the router must keep the
+// task Running.
+func TestTaskMonitorProbeUsesAteTargetActorHeaderAndRouterAlive(t *testing.T) {
+	ctx := context.Background()
+	s := memory.NewStore()
+	task := taskWithWorker("default", "task1", "task1", deadRunnerAddr(t), "id-1")
+	if err := s.SaveTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	router := newSandboxRouter(t)
+	router.set("default", "task1", "alive")
+	setRouterEnv(t, router)
+	mockSrv := &mockControlServer{getActorActor: runningActor()}
+	reconciler := newTestReconciler(t, mockSrv)
+	monitor := controller.NewTaskMonitor(s, reconciler, 0)
+
+	monitor.Sweep(ctx)
+
+	calls := router.headerCalls()
+	if len(calls) == 0 {
+		t.Fatal("router saw no requests: the monitor did not probe through atenet-router")
+	}
+	for _, c := range calls {
+		if c != "default/task1" {
+			t.Fatalf("ate-target-actor header = %q, want %q", c, "default/task1")
+		}
+	}
+
+	got, err := s.GetTask(ctx, "default", "task1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.GetStatus().GetPhase() != "Running" {
+		t.Fatalf("phase = %q, want Running", got.GetStatus().GetPhase())
+	}
+}
+
+// TestTaskMonitorMissStreakResetsOnAliveProbe covers ax-9qu.14: a healthy
+// probe between two short runs of misses resets the streak, so the task
+// never fails even though 4 total dead probes happen across the test.
+// Without the reset, these would add up to a streak that reaches the
+// threshold.
+func TestTaskMonitorMissStreakResetsOnAliveProbe(t *testing.T) {
+	ctx := context.Background()
+	s := memory.NewStore()
+	task := taskWithWorker("default", "task1", "task1", deadRunnerAddr(t), "id-1")
+	if err := s.SaveTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	router := newSandboxRouter(t)
+	setRouterEnv(t, router)
+	mockSrv := &mockControlServer{getActorActor: runningActor()}
+	reconciler := newTestReconciler(t, mockSrv)
+	monitor := controller.NewTaskMonitor(s, reconciler, 0)
+
+	start := time.Now()
+	router.set("default", "task1", "dead")
+	sweepWithClock(ctx, monitor, start)
+	sweepWithClock(ctx, monitor, start.Add(45*time.Second))
+
+	router.set("default", "task1", "alive")
+	sweepWithClock(ctx, monitor, start.Add(60*time.Second))
+
+	router.set("default", "task1", "dead")
+	sweepWithClock(ctx, monitor, start.Add(200*time.Second))
+	sweepWithClock(ctx, monitor, start.Add(245*time.Second))
+
+	got, err := s.GetTask(ctx, "default", "task1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.GetStatus().GetPhase() != "Running" {
+		t.Fatalf("phase = %q, want Running: an alive probe must reset the miss streak", got.GetStatus().GetPhase())
+	}
+}
+
+// TestTaskMonitorPruneMissesAcrossNonRunningGap covers ax-9qu.13: a task
+// that leaves Running and later returns to Running, keeping the same
+// status.id, must not inherit its earlier, stale miss count. Sweep's
+// pruneMisses call must drop the count while the task is not Running, so
+// the task starts a fresh run of misses once it returns, instead of
+// failing on this sweep's first new miss.
+func TestTaskMonitorPruneMissesAcrossNonRunningGap(t *testing.T) {
+	ctx := context.Background()
+	s := memory.NewStore()
+	task := taskWithWorker("default", "task1", "task1", deadRunnerAddr(t), "id-1")
+	if err := s.SaveTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	router := newSandboxRouter(t)
+	router.set("default", "task1", "dead")
+	setRouterEnv(t, router)
+	mockSrv := &mockControlServer{getActorActor: runningActor()}
+	reconciler := newTestReconciler(t, mockSrv)
+	monitor := controller.NewTaskMonitor(s, reconciler, 0)
+
+	start := time.Now()
+	// Two dead probes, still short of the 3-miss threshold.
+	sweepWithClock(ctx, monitor, start)
+	sweepWithClock(ctx, monitor, start.Add(10*time.Second))
+
+	// The task leaves Running for a while, with the same status.id: a
+	// suspend/resume cycle without a fresh Id. Sweep must not see it as
+	// Running here, so pruneMisses drops its miss count.
+	if err := s.UpdateTaskStatus(ctx, "default", "task1", &v1alpha1.TaskStatus{
+		Phase: "Suspended", Actor: "task1", WorkerIp: task.GetStatus().GetWorkerIp(), Id: "id-1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sweepWithClock(ctx, monitor, start.Add(500*time.Second))
+
+	// Back to Running, same Id. A long time has passed since the very
+	// first miss above (> the 90s window), so an unpruned count would
+	// reach the 3-miss threshold on this single new miss and fail the task
+	// at once.
+	if err := s.UpdateTaskStatus(ctx, "default", "task1", &v1alpha1.TaskStatus{
+		Phase: "Running", Actor: "task1", WorkerIp: task.GetStatus().GetWorkerIp(), Id: "id-1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sweepWithClock(ctx, monitor, start.Add(600*time.Second))
+
+	got, err := s.GetTask(ctx, "default", "task1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.GetStatus().GetPhase() != "Running" {
+		t.Fatalf("phase = %q, want Running: the pruned miss count must not let one post-gap miss reach the threshold", got.GetStatus().GetPhase())
 	}
 }

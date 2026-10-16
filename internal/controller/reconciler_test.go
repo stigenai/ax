@@ -62,6 +62,11 @@ type mockControlServer struct {
 	// written before these fields existed keeps its original behavior.
 	getActorActor *ateapipb.Actor
 	getActorErr   error
+	// getActorDelay, when positive, makes GetActor wait this long, or until
+	// the caller's context is done, before replying. This proves a caller
+	// bounds the call with its own timeout instead of hanging forever
+	// (ax-9qu.11).
+	getActorDelay time.Duration
 }
 
 // noSecrets is a SecretResolver for tests: it never finds a key and never touches a cluster.
@@ -102,7 +107,14 @@ func (m *mockControlServer) CreateAtespace(ctx context.Context, req *ateapipb.Cr
 	return &ateapipb.Atespace{Metadata: &ateapipb.ResourceMetadata{Name: name}}, nil
 }
 
-func (m *mockControlServer) GetActor(context.Context, *ateapipb.GetActorRequest) (*ateapipb.Actor, error) {
+func (m *mockControlServer) GetActor(ctx context.Context, _ *ateapipb.GetActorRequest) (*ateapipb.Actor, error) {
+	if m.getActorDelay > 0 {
+		select {
+		case <-time.After(m.getActorDelay):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 	if m.getActorErr != nil {
 		return nil, m.getActorErr
 	}

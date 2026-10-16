@@ -61,7 +61,11 @@ follows the task's current worker, not a cached address. On a 421 with
 connection but does not answer, `StartProcess` fails within 30 seconds
 (`guest.ExecOptions.StartTimeout`). It does not hang.
 
-## The controller's liveness sweep
+## The controller's two sweeps
+
+`ax-controller` runs two sweeps over every `Running` task: LivenessChecker and TaskMonitor. Each sweep can fail the same task, for a different reason and on a different timeline. See "Which sweep fails a task first" below.
+
+## LivenessChecker: stale routing after a worker restarts in place
 
 `ax-controller` probes the actor of each `Running` task through atenet-router's
 `/readyz`. It probes once per `--task-liveness-interval` (default `1m`; env
@@ -99,6 +103,34 @@ suspend, a delete) is never overwritten with stale information.
 Pending, Suspended, Terminating and Failed tasks get no probes. If
 `ATENET_ROUTER_ADDR` is unset, the controller logs "task liveness sweep
 disabled" and does not start the sweep.
+
+## TaskMonitor: a dead actor or an unresponsive runner
+
+TaskMonitor sweeps every `Running` task once per `--sandbox-check-interval`. The default interval is `30s`. The environment variable is `AX_SANDBOX_CHECK_INTERVAL`. Set it to `0` to disable the sweep.
+
+For each task, TaskMonitor calls Substrate's `GetActor`, with a 5s timeout. It then classifies the result:
+
+- If `GetActor` returns `NotFound`, Substrate no longer knows the actor. The task fails immediately with reason `ActorMissing`.
+- If the actor's state is `CRASHED`, the sandbox died. The task fails immediately. The reason is `OOMKilled` when the crash message names an out-of-memory kill. Otherwise, the reason is `ActorCrashed`.
+- Any other error is transient. TaskMonitor leaves the task alone. The next sweep tries again.
+- If the actor's state is not `RUNNING` (for example `SUSPENDED`), TaskMonitor does not probe it. It resets the miss count for this task.
+
+TaskMonitor probes the runner's `/readyz` only when Substrate still reports the actor `RUNNING`. The probe goes through atenet-router with the `ate-target-actor` header. Do not dial the runner directly. A direct dial has no such header, and Substrate's atunnel ingress returns 421 for every request without one. The probe needs `ATENET_ROUTER_ADDR`. If `ATENET_ROUTER_ADDR` is unset, this check stays off and the miss count resets.
+
+A 200 response counts as alive. So does a 503 that names workspace setup as the cause. Either result resets the miss count. Any other result counts as a miss, except a 421 with `X-Ate-Assignment-Stale: true`. That 421 is neither alive nor a miss (see "Which sweep fails a task first" below). After 3 consecutive misses that span at least 90s, the task fails with reason `SandboxUnresponsive`.
+
+When TaskMonitor fails a task, it sets the task's phase to `Failed`. It clears `Status.WorkerIp`. It sets condition `Ready=False` with the reason and a message. The message has the same format as the LivenessChecker message. The write applies only if the task has the same `status.id` and is still `Running`. A task that changed in between is never overwritten with stale information.
+
+After each full sweep, TaskMonitor drops the miss count for each task that it did not see as `Running` in this sweep. LivenessChecker does the same. So a task that left `Running` and later returned to it starts counting misses from zero. This applies even when the `status.id` is the same. The task does not keep a stale count from before the gap.
+
+## Which sweep fails a task first
+
+LivenessChecker and TaskMonitor both probe atenet-router. They answer different questions, on different timelines:
+
+- LivenessChecker asks whether routing is stale. This happens when a worker restarts in place, but the router still sends it requests. Its threshold is 3 consecutive stale misses. The sweep runs every `--task-liveness-interval` (default `1m`). This takes about 3 minutes end to end.
+- TaskMonitor asks whether the actor is gone. It also asks whether the runner inside the actor has stopped answering at all. Its threshold is 3 consecutive misses that span at least 90s. The sweep runs every `--sandbox-check-interval` (default `30s`).
+
+LivenessChecker alone handles a router response of 421 with `X-Ate-Assignment-Stale: true`. TaskMonitor sees the same response during its own `/readyz` probe. It counts this response as neither alive nor a miss. It resets its own count and leaves the task to LivenessChecker. Without this rule, the shorter TaskMonitor window fails the task for the same stale-routing symptom, before LivenessChecker's 3-minute check runs. The task would then get the wrong reason: `SandboxUnresponsive`, not `ActorLost` or `ActorMissing`.
 
 ## Manual check on gtr
 
