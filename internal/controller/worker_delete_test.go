@@ -592,3 +592,462 @@ func TestDeleteSurvivesStatusWriteRacingMarkTaskDeletingForOrdinaryTask(t *testi
 		t.Fatalf("want 1 DeleteActor attempt, got %d", control.Attempts())
 	}
 }
+
+// TestDeleteBackoffDoublesAndCaps covers ax-atj AC2: deleteBackoff doubles on
+// each attempt and clamps at max, with no overflow for a large attempt
+// count. It fails under a mutation that removes "backoff *= 2" (every
+// attempt would then report base), and under a mutation that removes the
+// max clamp (an uncapped attempt count would overflow or exceed max).
+func TestDeleteBackoffDoublesAndCaps(t *testing.T) {
+	base, max := 15*time.Second, 5*time.Minute
+	want := []time.Duration{
+		15 * time.Second,
+		30 * time.Second,
+		60 * time.Second,
+		120 * time.Second,
+		240 * time.Second,
+		300 * time.Second,
+		300 * time.Second,
+	}
+	for attempt, w := range want {
+		if got := deleteBackoff(attempt, base, max); got != w {
+			t.Fatalf("attempt %d: want %v, got %v", attempt, w, got)
+		}
+	}
+	if got := deleteBackoff(1000, base, max); got != max {
+		t.Fatalf("attempt 1000: want max %v (no overflow), got %v", max, got)
+	}
+
+	smallBase, smallMax := 10*time.Millisecond, 40*time.Millisecond
+	wantSmall := []time.Duration{10 * time.Millisecond, 20 * time.Millisecond, 40 * time.Millisecond, 40 * time.Millisecond}
+	for attempt, w := range wantSmall {
+		if got := deleteBackoff(attempt, smallBase, smallMax); got != w {
+			t.Fatalf("small schedule attempt %d: want %v, got %v", attempt, w, got)
+		}
+	}
+}
+
+// TestDefaultDeleteJitterRange covers ax-atj AC3: defaultDeleteJitter(d)
+// always returns a value in [d/2, d], and does not always return the same
+// value. It fails under a mutation that replaces the jitter with "return d"
+// (every sample would equal d, so the "at least 2 distinct values" check
+// would fail; a mutation that drops the d/2 floor can sample below d/2).
+func TestDefaultDeleteJitterRange(t *testing.T) {
+	d := 15 * time.Second
+	min, max := d/2, d
+	seen := map[time.Duration]bool{}
+	for i := 0; i < 1000; i++ {
+		got := defaultDeleteJitter(d)
+		if got < min || got > max {
+			t.Fatalf("sample %d: %v out of range [%v, %v]", i, got, min, max)
+		}
+		seen[got] = true
+	}
+	if len(seen) < 2 {
+		t.Fatalf("want at least 2 distinct jittered values across 1000 samples, got %d", len(seen))
+	}
+}
+
+// TestDefaultDeleteJitterNonPositiveReturnsUnchanged covers the d<=0 edge
+// case: a non-positive delay has nothing to spread, so it returns unchanged.
+func TestDefaultDeleteJitterNonPositiveReturnsUnchanged(t *testing.T) {
+	for _, d := range []time.Duration{0, -time.Second} {
+		if got := defaultDeleteJitter(d); got != d {
+			t.Fatalf("defaultDeleteJitter(%v) = %v, want %v unchanged", d, got, d)
+		}
+	}
+}
+
+// jitterRecorder records every delay scheduleDeleteRetry's jitter hook is
+// called with, and passes the delay through unchanged so timing-based tests
+// that set a Worker's deleteJitter stay predictable.
+type jitterRecorder struct {
+	mu    sync.Mutex
+	calls []time.Duration
+}
+
+func (r *jitterRecorder) jitter(d time.Duration) time.Duration {
+	r.mu.Lock()
+	r.calls = append(r.calls, d)
+	r.mu.Unlock()
+	return d
+}
+
+func (r *jitterRecorder) recorded() []time.Duration {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]time.Duration, len(r.calls))
+	copy(out, r.calls)
+	return out
+}
+
+// TestScheduleDeleteRetryUsesBackoffAndJitter covers ax-atj AC3: each call
+// to scheduleDeleteRetry for the same key computes the attempt's
+// deleteBackoff value and passes it through the worker's jitter hook before
+// sleeping on it. It fails under a mutation that calls deleteJitter with a
+// fixed argument instead of the computed backoff.
+func TestScheduleDeleteRetryUsesBackoffAndJitter(t *testing.T) {
+	ctx := context.Background()
+	base := 10 * time.Millisecond
+	recorder := &jitterRecorder{}
+	w := &Worker{
+		store:             memory.NewStore(),
+		DeleteBackoffBase: base,
+		DeleteBackoffMax:  time.Hour,
+		deleteJitter:      recorder.jitter,
+	}
+
+	for i := 0; i < 3; i++ {
+		w.scheduleDeleteRetry(ctx, "private", "job", store.TaskDeletePreconditions{}, errors.New("boom"))
+		// Clear the pending mark by hand, standing in for a real retry
+		// chain's own goroutine waking and republishing: this test drives 3
+		// attempts back to back without waiting out any real backoff.
+		w.deleteMu.Lock()
+		delete(w.deletePending, "private/job")
+		w.deleteMu.Unlock()
+	}
+
+	want := []time.Duration{base, 2 * base, 4 * base}
+	got := recorder.recorded()
+	if len(got) != len(want) {
+		t.Fatalf("want %d jitter calls, got %d: %v", len(want), len(got), got)
+	}
+	for i, w := range want {
+		if got[i] != w {
+			t.Fatalf("call %d: want backoff %v passed to jitter, got %v", i, w, got[i])
+		}
+	}
+}
+
+// TestDeleteRetrySurvivesFailedRequeue covers ax-atj AC4: when the
+// delete-retry goroutine's own RequeueTaskDeletion call fails, it must
+// start a new retry chain (attempt+1) instead of dropping the retry until
+// the next restart or sweep tick. It fails on the pre-fix code: the first
+// requeue failure only logs a warning and no event, and no second chain,
+// ever follows.
+func TestDeleteRetrySurvivesFailedRequeue(t *testing.T) {
+	ctx := context.Background()
+	base := memory.NewStore()
+	task := &v1alpha1.Task{Metadata: &v1alpha1.ObjectMeta{Name: "job", Atespace: "private"}}
+	if err := base.SaveTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	sub, err := base.Subscribe(ctx, "g", "c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	drainN(t, sub, 1) // SaveTask's own reconcile event.
+
+	wrapped := &failNRequeueStore{Store: base, remainingFails: 1}
+	w := NewWorker(wrapped, nil, "", "")
+	w.DeleteBackoffBase = 10 * time.Millisecond
+	w.DeleteBackoffMax = 10 * time.Millisecond
+
+	w.scheduleDeleteRetry(ctx, "private", "job", store.TaskDeletePreconditions{}, errors.New("boom"))
+
+	readCtx, readCancel := context.WithTimeout(ctx, 2*time.Second)
+	ev, err := sub.Next(readCtx)
+	readCancel()
+	if err != nil {
+		t.Fatalf("want a delete event after the requeue retries past the dropped call: %v", err)
+	}
+	if !ev.Retry || ev.Action != "delete" {
+		t.Fatalf("unexpected event: %+v", ev)
+	}
+
+	w.deleteMu.Lock()
+	attempt := w.deleteAttempts["private/job"]
+	w.deleteMu.Unlock()
+	if attempt != 2 {
+		t.Fatalf("want deleteAttempts 2 (the original failure plus the dropped requeue's own retry), got %d", attempt)
+	}
+}
+
+// failNDeleteTaskStore wraps a store.Store and fails the first
+// remainingFails calls to DeleteTask with a non-conflict error, then
+// delegates. It stands in for a store write failure after ReconcileDelete
+// already removed the actor (ax-atj AC1).
+type failNDeleteTaskStore struct {
+	store.Store
+	mu             sync.Mutex
+	remainingFails int
+}
+
+func (s *failNDeleteTaskStore) DeleteTask(ctx context.Context, atespace, name string, p ...store.TaskDeletePreconditions) error {
+	s.mu.Lock()
+	fail := s.remainingFails > 0
+	if fail {
+		s.remainingFails--
+	}
+	s.mu.Unlock()
+	if fail {
+		return errors.New("simulated delete task failure")
+	}
+	return s.Store.DeleteTask(ctx, atespace, name, p...)
+}
+
+// TestDeleteRetriesWhenTaskRecordRemovalFails covers ax-atj AC1: a
+// store.DeleteTask failure after a successful ReconcileDelete must retry
+// the whole delete event instead of leaving the record Terminating until
+// the next restart sweep. It fails on the pre-fix code: processEvent
+// returns the DeleteTask error with no scheduleDeleteRetry call, so round 2
+// below gets no event.
+func TestDeleteRetriesWhenTaskRecordRemovalFails(t *testing.T) {
+	control := &deletionControlServer{deletions: make(chan *ateapipb.DeleteActorRequest, 4), templates: make(chan *ateapipb.ListActorTemplatesRequest, 4)}
+	client := newDeletionTestClient(t, control)
+
+	ctx := context.Background()
+	base := memory.NewStore()
+	created := time.Now().UTC()
+	task := &v1alpha1.Task{Metadata: &v1alpha1.ObjectMeta{Name: "flaky-record", Atespace: "private", CreationTimestamp: timestamppb.New(created)}}
+	if err := base.SaveTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+
+	sub, err := base.Subscribe(ctx, "test-group", "test-consumer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	drainN(t, sub, 1) // SaveTask's own reconcile event.
+
+	deletion := store.TaskDeletePreconditions{ActorUID: "actor-1", CreationTimestamp: created.Format(time.RFC3339Nano)}
+	if err := base.MarkTaskDeleting(ctx, "private", "flaky-record", deletion); err != nil {
+		t.Fatal(err)
+	}
+
+	wrapped := &failNDeleteTaskStore{Store: base, remainingFails: 1}
+	worker := NewWorker(wrapped, NewTaskReconciler(client, "default-template", "ax-system"), "", "")
+	worker.DeleteBackoffBase = 10 * time.Millisecond
+	worker.DeleteBackoffMax = 10 * time.Millisecond
+
+	for round := 0; round < 2; round++ {
+		readCtx, readCancel := context.WithTimeout(ctx, 2*time.Second)
+		ev, err := sub.Next(readCtx)
+		readCancel()
+		if err != nil {
+			t.Fatalf("round %d: no delete event delivered: %v", round, err)
+		}
+		if err := worker.processEvent(context.Background(), ev); err != nil {
+			t.Fatalf("round %d: processEvent error: %v", round, err)
+		}
+	}
+
+	if _, err := base.GetTask(ctx, "private", "flaky-record"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("task record not removed after the retry succeeded: %v", err)
+	}
+	if got := control.Attempts(); got != 2 {
+		t.Fatalf("want 2 DeleteActor attempts (the retry re-runs ReconcileDelete), got %d", got)
+	}
+	select {
+	case request := <-control.deletions:
+		if request.GetOptions().GetUid() != "actor-1" {
+			t.Fatalf("retry lost the original ActorUID: %v", request)
+		}
+	default:
+		t.Fatal("no successful deletion request recorded")
+	}
+}
+
+// TestDeleteTaskConflictReturnsErrorWithNoRetry covers ax-atj AC1's second
+// half: a DeleteTask ErrConflict means the record changed incarnation
+// under the worker, so processEvent must return the conflict with no retry
+// chain started.
+func TestDeleteTaskConflictReturnsErrorWithNoRetry(t *testing.T) {
+	control := &deletionControlServer{deletions: make(chan *ateapipb.DeleteActorRequest, 4), templates: make(chan *ateapipb.ListActorTemplatesRequest, 4)}
+	client := newDeletionTestClient(t, control)
+
+	ctx := context.Background()
+	base := memory.NewStore()
+	created := time.Now().UTC()
+	task := &v1alpha1.Task{Metadata: &v1alpha1.ObjectMeta{Name: "conflicted", Atespace: "private", CreationTimestamp: timestamppb.New(created)}}
+	if err := base.SaveTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+
+	sub, err := base.Subscribe(ctx, "test-group", "test-consumer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	drainN(t, sub, 1) // SaveTask's own reconcile event.
+
+	deletion := store.TaskDeletePreconditions{ActorUID: "actor-1", CreationTimestamp: created.Format(time.RFC3339Nano)}
+	if err := base.MarkTaskDeleting(ctx, "private", "conflicted", deletion); err != nil {
+		t.Fatal(err)
+	}
+
+	wrapped := &failNDeleteTaskStore{Store: base}
+	wrapped.remainingFails = 0
+	conflictStore := &conflictDeleteTaskStore{Store: wrapped}
+	worker := NewWorker(conflictStore, NewTaskReconciler(client, "default-template", "ax-system"), "", "")
+
+	readCtx, readCancel := context.WithTimeout(ctx, 2*time.Second)
+	ev, err := sub.Next(readCtx)
+	readCancel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := worker.processEvent(context.Background(), ev); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("want ErrConflict, got %v", err)
+	}
+
+	worker.deleteMu.Lock()
+	_, pending := worker.deletePending["private/conflicted"]
+	worker.deleteMu.Unlock()
+	if pending {
+		t.Fatal("a DeleteTask conflict must not start a retry chain")
+	}
+}
+
+// conflictDeleteTaskStore wraps a store.Store and always returns
+// store.ErrConflict from DeleteTask, standing in for the record changing
+// incarnation under the worker.
+type conflictDeleteTaskStore struct {
+	store.Store
+}
+
+func (s *conflictDeleteTaskStore) DeleteTask(ctx context.Context, atespace, name string, p ...store.TaskDeletePreconditions) error {
+	return store.ErrConflict
+}
+
+// TestStaleDeleteClearsRetryState covers ax-atj AC5(a): a stale delete
+// delivery for a task that already left Terminating must clear any
+// delete-attempt count left over from an earlier chain for the same name,
+// so a later real failure starts fresh instead of continuing a stale
+// exponential climb. It fails on the pre-fix code: the stale-skip path
+// returns nil without clearing anything.
+func TestStaleDeleteClearsRetryState(t *testing.T) {
+	ctx := context.Background()
+	s := memory.NewStore()
+	task := &v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{Name: "recreated", Atespace: "private"},
+		Status:   &v1alpha1.TaskStatus{Phase: "Running"},
+	}
+	if err := s.SaveTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateTaskStatus(ctx, "private", "recreated", task.Status); err != nil {
+		t.Fatal(err)
+	}
+
+	w := &Worker{store: s, deleteAttempts: map[string]int{"private/recreated": 3}}
+	ev := store.TaskEvent{Atespace: "private", Name: "recreated", Action: "delete", Retry: true}
+	if err := w.processEvent(ctx, ev); err != nil {
+		t.Fatal(err)
+	}
+
+	w.deleteMu.Lock()
+	_, present := w.deleteAttempts["private/recreated"]
+	w.deleteMu.Unlock()
+	if present {
+		t.Fatal("stale delete left a delete-attempt count for the recreated task")
+	}
+}
+
+// TestDeleteCheckConflictClearsIdleAttempts covers ax-atj AC5(c): an
+// ev.Deletion.Check conflict (a stale precondition for the task's current
+// incarnation) must clear a leftover delete-attempt count, when no retry
+// chain is pending for that key. It fails on the pre-fix code: the Check
+// conflict path returns the error without clearing anything.
+func TestDeleteCheckConflictClearsIdleAttempts(t *testing.T) {
+	ctx := context.Background()
+	s := memory.NewStore()
+	created := time.Now().UTC()
+	task := &v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{Name: "job", Atespace: "private", CreationTimestamp: timestamppb.New(created)},
+		Status:   &v1alpha1.TaskStatus{Phase: v1alpha1.PhaseTerminating},
+	}
+	if err := s.SaveTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateTaskStatus(ctx, "private", "job", task.Status); err != nil {
+		t.Fatal(err)
+	}
+
+	w := &Worker{store: s, deleteAttempts: map[string]int{"private/job": 3}}
+	// A mismatched CreationTimestamp targets a different incarnation than
+	// the one now Terminating: ev.Deletion.Check rejects it.
+	ev := store.TaskEvent{
+		Atespace: "private", Name: "job", Action: "delete",
+		Deletion: store.TaskDeletePreconditions{ActorUID: "actor-1", CreationTimestamp: created.Add(-time.Hour).Format(time.RFC3339Nano)},
+	}
+	if err := w.processEvent(ctx, ev); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("want ErrConflict, got %v", err)
+	}
+
+	w.deleteMu.Lock()
+	_, present := w.deleteAttempts["private/job"]
+	w.deleteMu.Unlock()
+	if present {
+		t.Fatal("a Check conflict with no pending chain left a stale delete-attempt count")
+	}
+}
+
+// TestDeleteCheckConflictKeepsPendingChain covers ax-atj AC5(c)'s guard: a
+// Check conflict must never clear deletePending. A live chain for the
+// task's current incarnation keeps its own schedule (the one-chain rule of
+// ax-706.6); clearing its mark here can let a second chain start for
+// that same incarnation.
+func TestDeleteCheckConflictKeepsPendingChain(t *testing.T) {
+	ctx := context.Background()
+	s := memory.NewStore()
+	created := time.Now().UTC()
+	task := &v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{Name: "job", Atespace: "private", CreationTimestamp: timestamppb.New(created)},
+		Status:   &v1alpha1.TaskStatus{Phase: v1alpha1.PhaseTerminating},
+	}
+	if err := s.SaveTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateTaskStatus(ctx, "private", "job", task.Status); err != nil {
+		t.Fatal(err)
+	}
+
+	w := &Worker{
+		store:          s,
+		deleteAttempts: map[string]int{"private/job": 3},
+		deletePending:  map[string]int64{"private/job": 1},
+	}
+	ev := store.TaskEvent{
+		Atespace: "private", Name: "job", Action: "delete",
+		Deletion: store.TaskDeletePreconditions{ActorUID: "actor-1", CreationTimestamp: created.Add(-time.Hour).Format(time.RFC3339Nano)},
+	}
+	if err := w.processEvent(ctx, ev); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("want ErrConflict, got %v", err)
+	}
+
+	w.deleteMu.Lock()
+	attempt, attemptsPresent := w.deleteAttempts["private/job"]
+	gen, pendingPresent := w.deletePending["private/job"]
+	w.deleteMu.Unlock()
+	if !attemptsPresent || attempt != 3 {
+		t.Fatalf("want deleteAttempts kept at 3, got present=%v value=%d", attemptsPresent, attempt)
+	}
+	if !pendingPresent || gen != 1 {
+		t.Fatalf("want deletePending kept at gen 1, got present=%v value=%d", pendingPresent, gen)
+	}
+}
+
+// TestMissingProtectedTaskClearsRetryState covers ax-atj AC5(b): a delete
+// event for a protected task whose record is already gone (GetTask
+// ErrNotFound, full ActorUID and CreationTimestamp preconditions) must
+// clear any leftover delete-attempt count: the record is gone either way,
+// so a pending schedule for it is moot.
+func TestMissingProtectedTaskClearsRetryState(t *testing.T) {
+	ctx := context.Background()
+	s := memory.NewStore()
+	w := &Worker{store: s, deleteAttempts: map[string]int{"private/missing": 3}}
+	ev := store.TaskEvent{
+		Atespace: "private", Name: "missing", Action: "delete",
+		Deletion: store.TaskDeletePreconditions{ActorUID: "actor-1", CreationTimestamp: time.Now().UTC().Format(time.RFC3339Nano)},
+	}
+	if err := w.processEvent(ctx, ev); err != nil {
+		t.Fatal(err)
+	}
+
+	w.deleteMu.Lock()
+	_, present := w.deleteAttempts["private/missing"]
+	w.deleteMu.Unlock()
+	if present {
+		t.Fatal("missing protected task left a stale delete-attempt count")
+	}
+}

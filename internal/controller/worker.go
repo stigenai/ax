@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"os"
 	"sync"
 	"time"
@@ -39,8 +40,10 @@ const (
 	requeueBackoffMax  = 2 * time.Minute
 	// deleteBackoffBase and deleteBackoffMax bound the delay before the
 	// worker retries a task delete that failed to reconcile. The delay
-	// doubles on each consecutive failure for that task. There is no limit
-	// on the number of attempts.
+	// doubles on each consecutive failure for that task, up to
+	// deleteBackoffMax. The worker's jitter hook then picks the actual
+	// sleep from [delay/2, delay], so it never exceeds deleteBackoffMax.
+	// There is no limit on the number of attempts.
 	deleteBackoffBase = 15 * time.Second
 	deleteBackoffMax  = 5 * time.Minute
 	// strandedTasksPageSize bounds one ListTasks call in the startup sweep.
@@ -85,6 +88,9 @@ type Worker struct {
 	// ax-706.10 (sibling case): a success can clear a key and start a new
 	// chain, while an old goroutine for the same key still sleeps.
 	deleteGen map[string]int64
+	// deleteJitter overrides defaultDeleteJitter for tests. A nil value uses
+	// defaultDeleteJitter.
+	deleteJitter func(time.Duration) time.Duration
 }
 
 // NewWorker creates a worker that joins group as consumer. An empty group uses the
@@ -176,9 +182,13 @@ func (w *Worker) processEvent(ctx context.Context, ev store.TaskEvent) error {
 				return nil
 			}
 			if ev.Deletion.ActorUID == "" || ev.Deletion.CreationTimestamp == "" {
+				w.clearDeleteBackoff(ev.Atespace, ev.Name)
 				return store.ErrConflict
 			}
-			// Missing protected task state cannot authorize cleanup or prove it.
+			// Missing protected task state cannot authorize cleanup or
+			// prove it. The record is already gone either way, so any
+			// pending retry schedule for it is moot.
+			w.clearDeleteBackoff(ev.Atespace, ev.Name)
 			return nil
 		}
 		if err != nil {
@@ -195,9 +205,11 @@ func (w *Worker) processEvent(ctx context.Context, ev store.TaskEvent) error {
 		// targets a task recreated under the same name.
 		if task.GetStatus().GetPhase() != v1alpha1.PhaseTerminating {
 			slog.Info("skipping stale delete: task left Terminating", "atespace", ev.Atespace, "name", ev.Name, "retry", ev.Retry)
+			w.clearDeleteBackoff(ev.Atespace, ev.Name)
 			return nil
 		}
 		if err := ev.Deletion.Check(task); err != nil {
+			w.clearIdleDeleteAttempts(ev.Atespace, ev.Name)
 			return err
 		}
 		if err := w.reconciler.ReconcileDelete(ctx, ev.Atespace, ev.Name, ev.Deletion.ActorUID); err != nil {
@@ -207,10 +219,20 @@ func (w *Worker) processEvent(ctx context.Context, ev store.TaskEvent) error {
 			w.scheduleDeleteRetry(ctx, ev.Atespace, ev.Name, ev.Deletion, err)
 			return nil
 		}
-		w.clearDeleteBackoff(ev.Atespace, ev.Name)
 		if err := w.store.DeleteTask(ctx, ev.Atespace, ev.Name, ev.Deletion); err != nil {
-			return fmt.Errorf("removing task record %s/%s: %w", ev.Atespace, ev.Name, err)
+			if errors.Is(err, store.ErrConflict) {
+				// The record changed incarnation under the worker: no
+				// retry is safe or correct for this event anymore.
+				return err
+			}
+			// Retry the whole delete event instead of leaving the record
+			// Terminating until the next restart sweep: ReconcileDelete
+			// already ran, and a retry's ReconcileDelete call is safe to
+			// repeat (DeleteActor maps NotFound to nil).
+			w.scheduleDeleteRetry(ctx, ev.Atespace, ev.Name, ev.Deletion, fmt.Errorf("removing task record %s/%s: %w", ev.Atespace, ev.Name, err))
+			return nil
 		}
+		w.clearDeleteBackoff(ev.Atespace, ev.Name)
 		return nil
 	}
 
@@ -363,16 +385,15 @@ func (w *Worker) scheduleDeleteRetry(ctx context.Context, atespace, name string,
 	w.deleteAttempts[key] = attempt + 1
 	w.deleteMu.Unlock()
 
-	backoff := base
-	for i := 0; i < attempt && backoff < max; i++ {
-		backoff *= 2
+	backoff := deleteBackoff(attempt, base, max)
+	jitter := w.deleteJitter
+	if jitter == nil {
+		jitter = defaultDeleteJitter
 	}
-	if backoff > max {
-		backoff = max
-	}
+	delay := jitter(backoff)
 
 	slog.Warn("task delete failed, retrying", "atespace", atespace, "name", name,
-		"attempt", attempt+1, "next_retry", backoff, "error", cause)
+		"attempt", attempt+1, "next_retry", delay, "error", cause)
 
 	// clearOwnMark removes this chain's pending mark, but only while it
 	// still holds myGen. A clearDeleteBackoff call for this key, followed
@@ -392,7 +413,7 @@ func (w *Worker) scheduleDeleteRetry(ctx context.Context, atespace, name string,
 		case <-ctx.Done():
 			clearOwnMark()
 			return
-		case <-time.After(backoff):
+		case <-time.After(delay):
 		}
 		// Clear the mark before republishing, not in a defer after
 		// (ax-706.10): the republished event can reach processEvent and
@@ -402,8 +423,42 @@ func (w *Worker) scheduleDeleteRetry(ctx context.Context, atespace, name string,
 		clearOwnMark()
 		if err := w.store.RequeueTaskDeletion(context.Background(), atespace, name, deletion); err != nil {
 			slog.Warn("failed to requeue task deletion", "atespace", atespace, "name", name, "error", err)
+			// clearOwnMark already ran, so this call starts the next chain
+			// at attempt+1 (a longer backoff). If another chain is already
+			// pending for this key, it only logs and returns, which is
+			// correct: that chain's own retry still covers this failure.
+			w.scheduleDeleteRetry(ctx, atespace, name, deletion, fmt.Errorf("requeue task deletion: %w", err))
 		}
 	}()
+}
+
+// deleteBackoff reports the delete-retry delay for attempt (0-indexed),
+// doubling base once per attempt and clamping at max. It never overflows:
+// the loop stops doubling as soon as backoff reaches max, no matter how
+// large attempt is.
+func deleteBackoff(attempt int, base, max time.Duration) time.Duration {
+	backoff := base
+	for i := 0; i < attempt && backoff < max; i++ {
+		backoff *= 2
+	}
+	if backoff > max {
+		backoff = max
+	}
+	return backoff
+}
+
+// defaultDeleteJitter spreads a delete retry's delay across a range. This
+// stops an outage that fails many deletes at once from retrying them all at
+// the same time. The return value is in the range [d/2, d]. The value is
+// never less than half of d. The value is never more than d. So the jitter
+// never makes a backoff longer than w.DeleteBackoffMax. A d value of zero or
+// less returns d unchanged.
+func defaultDeleteJitter(d time.Duration) time.Duration {
+	if d <= 0 {
+		return d
+	}
+	half := d / 2
+	return half + rand.N(half+1)
 }
 
 // clearDeleteBackoff resets a task's delete-retry schedule once its deletion
@@ -418,6 +473,21 @@ func (w *Worker) clearDeleteBackoff(atespace, name string) {
 	w.deleteMu.Lock()
 	delete(w.deletePending, atespace+"/"+name)
 	delete(w.deleteAttempts, atespace+"/"+name)
+	w.deleteMu.Unlock()
+}
+
+// clearIdleDeleteAttempts resets a task's delete-attempt count, but only
+// when no retry chain is pending for it. ev.Deletion.Check can reject a
+// stale precondition for the task's current incarnation. A live chain for
+// that incarnation must keep its own schedule (the one-chain rule of
+// ax-706.6), so this never touches deletePending: clearing a live chain's
+// mark here can let a second chain start for the same incarnation.
+func (w *Worker) clearIdleDeleteAttempts(atespace, name string) {
+	key := atespace + "/" + name
+	w.deleteMu.Lock()
+	if _, pending := w.deletePending[key]; !pending {
+		delete(w.deleteAttempts, key)
+	}
 	w.deleteMu.Unlock()
 }
 
