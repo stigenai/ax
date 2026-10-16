@@ -29,20 +29,29 @@ this query to read the raw lines:
 {namespace="ax-system",container="controller"} |= "delete sweep: stuck deletions"
 ```
 
-Read the `stuck` field in each line:
+Every line has the same fields: `stuck`, `stuck_tasks`, `stuck_actors`,
+`protected`, `requeued`, `requeue_failed`, `task_list_error`,
+`actor_list_error`, and `min_age`. `task_list_error` and `actor_list_error`
+are on every line, not only on a line where `stuck` is greater than 0.
 
-- `stuck=0` on every line: nothing is stuck.
+Read the fields in this order:
+
+- Check `task_list_error` and `actor_list_error` first.
+  - If either field is `true`, the sweep did not list tasks, actors, or
+    both, this tick. It could not count anything stuck this tick.
+  - A line with `stuck=0` and `task_list_error=true` or
+    `actor_list_error=true` is NOT an all-clear.
+  - Wait one more tick (the sweep's interval), then read the next line.
+  - If one of the two fields stays `true` for many ticks, go to step 3.
+    Check whether Substrate or the task store is reachable.
+- `stuck=0` and `task_list_error=false` and `actor_list_error=false`:
+  nothing is stuck. This is the only all-clear case.
   - If `AxStuckDeletions` still fires, check the alert's query and time
     range in Grafana.
-- `stuck>0`: the line also has these fields: `stuck_tasks`, `stuck_actors`,
-  `protected`, `requeued`, `requeue_failed`, `task_list_error`,
-  `actor_list_error`, and `min_age`.
-  - `task_list_error=true` means the sweep did not list tasks this tick.
-    `stuck_tasks` is 0 on that line, but this is not an all-clear: the
-    sweep did not check tasks at all that tick.
-  - `requeued` counts tasks for which the sweep already sent a delete.
-  - Wait one more tick (the sweep's interval). Then check again before you
-    act further.
+- `stuck>0`: `requeued` counts tasks for which the sweep already sent a
+  delete.
+  - Wait one more tick (the sweep's interval). Then check again before
+    you act further.
 - No lines appear in the last 30 minutes: `AxDeleteSweepMissing` fires in
   this case. Go to step 4.
 
