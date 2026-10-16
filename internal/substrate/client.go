@@ -210,6 +210,20 @@ const (
 	DefaultSnapshotsBucket = "gs://dberkov-gke-dev3/ate-env/"
 )
 
+// resourceLimitsFromReqs converts a task's resource limits to Substrate's
+// top-level ateapipb.Limits form. It returns nil when resources or its
+// Limits are nil or empty, so an old caller's output does not change.
+func resourceLimitsFromReqs(resources *v1alpha1.ResourceReqs) []*ateapipb.Limits {
+	var limits []*ateapipb.Limits
+	if cpu := resources.GetLimits().GetCpu(); cpu != "" {
+		limits = append(limits, &ateapipb.Limits{Name: "cpu", Quantity: cpu})
+	}
+	if memory := resources.GetLimits().GetMemory(); memory != "" {
+		limits = append(limits, &ateapipb.Limits{Name: "memory", Quantity: memory})
+	}
+	return limits
+}
+
 // BuildActorTemplate constructs a Substrate ActorTemplate based on the standard ate-env specification.
 func BuildActorTemplate(atespace, name, image string, envMap map[string]string, command []string, snapshotsBucket, supervisorProfile string, resources *v1alpha1.ResourceReqs, capabilities []string) *ateapipb.ActorTemplate {
 	if atespace == "" {
@@ -291,6 +305,12 @@ func BuildActorTemplate(atespace, name, image string, envMap map[string]string, 
 			SandboxClass: ateapipb.SandboxClass_SANDBOX_CLASS_GVISOR,
 			ConfigName:   "gvisor-default",
 		},
+	}
+	if limits := resourceLimitsFromReqs(resources); limits != nil {
+		// Set on every task, supervisor or not: Substrate's scheduler
+		// (HasRoom) and sandbox sizing both read only this top-level
+		// field, never Containers[].Resources.
+		tmpl.Resources = &ateapipb.Resources{Limits: limits}
 	}
 	if supervisorProfile != "" {
 		tmpl.Containers[0].Resources = &ateapipb.Resources{Limits: []*ateapipb.Limits{

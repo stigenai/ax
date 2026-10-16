@@ -55,6 +55,18 @@ spec:
     # The 8Gi (8192Mi) request equals the average load per worker at 20
     # tasks. The calculation is 20/6*2200+400=7733Mi. This lets the scheduler
     # place workers by their real need.
+    #
+    # ax-768: the sizing above bounds the risk of random placement. That
+    # was the worst case this pool ever saw.
+    #
+    # Placement is no longer random. Substrate now books 4Gi against each
+    # worker's reported memory limit, for each task. The env var
+    # AX_DEFAULT_TASK_MEMORY sets this value, in
+    # deploy/stigenai/kustomization.yaml.
+    #
+    # A 16Gi worker now takes at most 4 tasks. 6 workers take 24 tasks in
+    # total. A 5th task on a full pool waits. Its phase is Pending, with
+    # reason WaitingForCapacity. It does not land on a full worker.
     resources:
       limits:
         cpu: "4"

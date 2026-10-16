@@ -103,6 +103,11 @@ type Store interface {
 	// DeleteTask removes the task record. It publishes no event; callers are
 	// expected to have cleaned up the task's actor first.
 	DeleteTask(ctx context.Context, atespace, name string, preconditions ...TaskDeletePreconditions) error
+	// RequeueTask publishes a new reconcile event for an existing task without
+	// changing its stored record. A worker calls it to retry a task that found
+	// Substrate out of capacity, and at startup to retry every task a previous
+	// process left waiting for capacity.
+	RequeueTask(ctx context.Context, atespace, name string) error
 
 	SaveWorkspace(ctx context.Context, ws *v1alpha1.Workspace) error
 	GetWorkspace(ctx context.Context, atespace, name string) (*v1alpha1.Workspace, error)

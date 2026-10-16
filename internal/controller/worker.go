@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/google/ax/internal/store"
@@ -31,6 +32,13 @@ const (
 	// readRetryDelay is how long the worker waits after a transient error from the
 	// event queue before trying again.
 	readRetryDelay = time.Second
+	// requeueBackoffBase and requeueBackoffMax bound the delay before the
+	// worker requeues a task that waits for Substrate capacity. The delay
+	// doubles on each consecutive ErrWaitingForCapacity result for that task.
+	requeueBackoffBase = 15 * time.Second
+	requeueBackoffMax  = 2 * time.Minute
+	// strandedTasksPageSize bounds one ListTasks call in the startup sweep.
+	strandedTasksPageSize = 200
 )
 
 // Worker consumes task events from the store's event queue and reconciles each
@@ -41,6 +49,14 @@ type Worker struct {
 	reconciler *TaskReconciler
 	group      string
 	consumer   string
+
+	// BackoffBase and BackoffMax override the capacity requeue schedule for
+	// tests. Both default to the production schedule when left zero.
+	BackoffBase time.Duration
+	BackoffMax  time.Duration
+
+	requeueMu       sync.Mutex
+	requeueAttempts map[string]int
 }
 
 // NewWorker creates a worker that joins group as consumer. An empty group uses the
@@ -54,10 +70,13 @@ func NewWorker(s store.Store, reconciler *TaskReconciler, group, consumer string
 		consumer = fmt.Sprintf("%s-%d", hostname, time.Now().UnixNano()%10000)
 	}
 	return &Worker{
-		store:      s,
-		reconciler: reconciler,
-		group:      group,
-		consumer:   consumer,
+		store:           s,
+		reconciler:      reconciler,
+		group:           group,
+		consumer:        consumer,
+		BackoffBase:     requeueBackoffBase,
+		BackoffMax:      requeueBackoffMax,
+		requeueAttempts: make(map[string]int),
 	}
 }
 
@@ -72,6 +91,11 @@ func (w *Worker) Run(ctx context.Context) error {
 		return fmt.Errorf("subscribing to task events: %w", err)
 	}
 	defer sub.Close()
+
+	// Requeue every task a previous process left waiting for capacity, so a
+	// crash or restart strands none. This runs after Subscribe so a brand new
+	// consumer group's start position already covers the events it publishes.
+	w.requeueStrandedTasks(ctx)
 
 	for {
 		ev, err := sub.Next(ctx)
@@ -169,14 +193,116 @@ func (w *Worker) processEvent(ctx context.Context, ev store.TaskEvent) error {
 
 	reconciled, err := w.reconciler.Reconcile(ctx, task, workspaces...)
 	if err != nil {
+		if errors.Is(err, ErrWaitingForCapacity) {
+			// task already carries Phase=Pending and the WaitingForCapacity
+			// condition: Reconcile set them on this same pointer.
+			if serr := w.store.UpdateTaskStatus(ctx, task.Metadata.Atespace, task.Metadata.Name, task.Status); serr != nil {
+				return fmt.Errorf("updating task status %s/%s: %w", task.Metadata.Atespace, task.Metadata.Name, serr)
+			}
+			w.scheduleRequeue(ctx, task.Metadata.Atespace, task.Metadata.Name)
+			slog.Info("task waiting for substrate capacity", "atespace", task.Metadata.Atespace, "name", task.Metadata.Name)
+			return nil
+		}
 		task.Status.Phase = "Failed"
 		_ = w.store.UpdateTaskStatus(ctx, task.Metadata.Atespace, task.Metadata.Name, task.Status)
 		return fmt.Errorf("reconciling task %s/%s: %w", task.Metadata.Atespace, task.Metadata.Name, err)
 	}
+
+	w.clearRequeueBackoff(task.Metadata.Atespace, task.Metadata.Name)
 
 	if err := w.store.UpdateTaskStatus(ctx, task.Metadata.Atespace, task.Metadata.Name, reconciled.Status); err != nil {
 		return fmt.Errorf("updating task status %s/%s: %w", task.Metadata.Atespace, task.Metadata.Name, err)
 	}
 
 	return nil
+}
+
+// scheduleRequeue requeues atespace/name after a backoff that doubles on each
+// consecutive call for the same task, capped at w.BackoffMax. The requeue
+// itself runs in a separate goroutine so it never blocks the event loop.
+func (w *Worker) scheduleRequeue(ctx context.Context, atespace, name string) {
+	key := atespace + "/" + name
+
+	base, max := w.BackoffBase, w.BackoffMax
+	if base <= 0 {
+		base = requeueBackoffBase
+	}
+	if max <= 0 {
+		max = requeueBackoffMax
+	}
+
+	w.requeueMu.Lock()
+	attempt := w.requeueAttempts[key]
+	w.requeueAttempts[key] = attempt + 1
+	w.requeueMu.Unlock()
+
+	backoff := base
+	for i := 0; i < attempt && backoff < max; i++ {
+		backoff *= 2
+	}
+	if backoff > max {
+		backoff = max
+	}
+
+	go func() {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+		if err := w.store.RequeueTask(context.Background(), atespace, name); err != nil {
+			slog.Warn("failed to requeue task waiting for capacity", "atespace", atespace, "name", name, "error", err)
+		}
+	}()
+}
+
+// clearRequeueBackoff resets a task's backoff schedule once it reconciles
+// without ErrWaitingForCapacity, so the next time it waits for capacity the
+// schedule restarts at BackoffBase.
+func (w *Worker) clearRequeueBackoff(atespace, name string) {
+	w.requeueMu.Lock()
+	delete(w.requeueAttempts, atespace+"/"+name)
+	w.requeueMu.Unlock()
+}
+
+// requeueStrandedTasks retries every task left waiting for Substrate capacity
+// by a previous controller process, with no backoff: a restart is not a new
+// capacity failure. It logs and continues past a listing or requeue error, so
+// one bad page or task cannot stop the worker from starting.
+func (w *Worker) requeueStrandedTasks(ctx context.Context) {
+	var offset int64
+	for {
+		tasks, err := w.store.ListTasks(ctx, "*", strandedTasksPageSize, offset)
+		if err != nil {
+			slog.Warn("capacity sweep: failed to list tasks", "error", err)
+			return
+		}
+		for _, task := range tasks {
+			if !waitingForCapacity(task) {
+				continue
+			}
+			atespace := task.GetMetadata().GetAtespace()
+			name := task.GetMetadata().GetName()
+			if err := w.store.RequeueTask(ctx, atespace, name); err != nil {
+				slog.Warn("capacity sweep: failed to requeue task", "atespace", atespace, "name", name, "error", err)
+				continue
+			}
+			slog.Info("capacity sweep: requeued a task stranded waiting for capacity", "atespace", atespace, "name", name)
+		}
+		if int64(len(tasks)) < strandedTasksPageSize {
+			return
+		}
+		offset += strandedTasksPageSize
+	}
+}
+
+// waitingForCapacity reports whether task's Ready condition reason is
+// reasonWaitingForCapacity.
+func waitingForCapacity(task *v1alpha1.Task) bool {
+	for _, c := range task.GetStatus().GetConditions() {
+		if c.GetType() == condReady {
+			return c.GetReason() == reasonWaitingForCapacity
+		}
+	}
+	return false
 }

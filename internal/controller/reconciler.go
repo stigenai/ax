@@ -39,6 +39,15 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// ErrWaitingForCapacity means Substrate has no free worker right now.
+// The caller must retry the task later, not fail it.
+var ErrWaitingForCapacity = errors.New("waiting for substrate capacity")
+
+// reasonWaitingForCapacity is the task's Ready condition reason while it
+// waits. The worker's startup sweep looks for this value to find stranded
+// tasks.
+const reasonWaitingForCapacity = "WaitingForCapacity"
+
 const (
 	geminiSecretName = "gemini-api-secret"
 	geminiSecretKey  = "GEMINI_API_KEY"
@@ -73,6 +82,14 @@ type TaskReconciler struct {
 	// WorkspaceReadyTimeout bounds how long Reconcile waits for the actor's workspace
 	// to report ready before recording it as still initializing.
 	WorkspaceReadyTimeout time.Duration
+
+	// DefaultTaskMemory is a Substrate quantity, for example "4Gi". Reconcile
+	// books it as the memory limit for a non-supervisor task that sets no
+	// spec.resources.limits.memory. An empty value disables the default: the
+	// task's actor then gets no top-level memory booking. Reconcile never
+	// writes this value into task.Spec. AX_TASK_YAML and the task's template
+	// digest stay the same with or without this default.
+	DefaultTaskMemory string
 }
 
 // NewTaskReconciler creates a new TaskReconciler.
@@ -193,7 +210,21 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 		slog.Info("ensuring custom ActorTemplate for task", "image", task.Spec.Image)
 		customTemplateName := taskTemplateName(task.Metadata.Name, task.Spec.Image, task.Spec.Capabilities, extraEnv)
 
-		tmpl, err := r.client.EnsureActorTemplateWithImage(ctx, templateAtespace, templateName, atespace, customTemplateName, task.Spec.Image, task.Spec.SupervisorProfile, task.Spec.Resources, task.Spec.Capabilities, extraEnv)
+		// The default books only memory, and only when the task named none:
+		// an explicit task limit always wins. This never touches task.Spec,
+		// so it never changes customTemplateName's digest or AX_TASK_YAML.
+		effectiveResources := task.Spec.GetResources()
+		if task.Spec.GetSupervisorProfile() == "" && effectiveResources.GetLimits().GetMemory() == "" && r.DefaultTaskMemory != "" {
+			effectiveResources = &v1alpha1.ResourceReqs{
+				Limits: &v1alpha1.ResourceList{
+					Cpu:    effectiveResources.GetLimits().GetCpu(),
+					Memory: r.DefaultTaskMemory,
+				},
+				Requests: effectiveResources.GetRequests(),
+			}
+		}
+
+		tmpl, err := r.client.EnsureActorTemplateWithImage(ctx, templateAtespace, templateName, atespace, customTemplateName, task.Spec.Image, task.Spec.SupervisorProfile, effectiveResources, task.Spec.Capabilities, extraEnv)
 		if err != nil {
 			// The default template has neither this image nor this env, so an
 			// actor made from it would not be this task: fail with the reason.
@@ -242,6 +273,11 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 	slog.Info("resuming actor on Substrate worker", "actor", actorName)
 	_, workerIP, err := r.client.ResumeActor(ctx, atespace, actorName)
 	if err != nil {
+		if status.Code(err) == codes.ResourceExhausted {
+			r.setNotReady(task, reasonWaitingForCapacity, err.Error(), now)
+			task.Status.Phase = "Pending"
+			return task, fmt.Errorf("%w: %s", ErrWaitingForCapacity, err.Error())
+		}
 		r.setNotReady(task, "ActorResumeFailed", err.Error(), now)
 		task.Status.Phase = "Failed"
 		return task, fmt.Errorf("resuming actor: %w", err)

@@ -426,6 +426,43 @@ func TestValidateTask(t *testing.T) {
 	}
 }
 
+func TestValidateTaskResources(t *testing.T) {
+	tests := []struct {
+		name    string
+		memory  string
+		cpu     string
+		wantErr string
+	}{
+		{name: "empty memory is allowed", memory: ""},
+		{name: "empty cpu is allowed", cpu: ""},
+		{name: "valid memory quantity", memory: "4Gi"},
+		{name: "valid cpu quantity", cpu: "2"},
+		{name: "unparseable memory", memory: "lots", wantErr: "spec.resources.limits.memory"},
+		{name: "negative memory", memory: "-1Gi", wantErr: "spec.resources.limits.memory"},
+		{name: "zero memory", memory: "0", wantErr: "spec.resources.limits.memory"},
+		{name: "unparseable cpu", cpu: "lots", wantErr: "spec.resources.limits.cpu"},
+		{name: "negative cpu", cpu: "-1", wantErr: "spec.resources.limits.cpu"},
+		{name: "zero cpu", cpu: "0", wantErr: "spec.resources.limits.cpu"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			spec := &v1alpha1.TaskSpec{
+				Resources: &v1alpha1.ResourceReqs{Limits: &v1alpha1.ResourceList{Cpu: tt.cpu, Memory: tt.memory}},
+			}
+			err := v1alpha1.ValidateTask(&v1alpha1.Task{Spec: spec})
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("error = %v, want containing %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestTask_Workspaces_YAML(t *testing.T) {
 	taskYAML := `
 apiVersion: ax.io/v1alpha1

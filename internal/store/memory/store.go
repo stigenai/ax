@@ -247,6 +247,22 @@ func (s *MemoryStore) DeleteTask(ctx context.Context, atespace, name string, pre
 	return nil
 }
 
+// RequeueTask publishes a new reconcile event for an existing task, without
+// touching the stored record.
+func (s *MemoryStore) RequeueTask(ctx context.Context, atespace, name string) error {
+	event := store.TaskEvent{
+		ID:       fmt.Sprintf("%d", time.Now().UnixNano()),
+		Atespace: atespace,
+		Name:     name,
+		Action:   "reconcile",
+	}
+	select {
+	case s.events <- event:
+	default:
+	}
+	return nil
+}
+
 func (s *MemoryStore) SaveModel(ctx context.Context, model *v1alpha1.Model) error {
 	if model.Metadata.Name == "" {
 		return errors.New("model name is required")
