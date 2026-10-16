@@ -1038,10 +1038,14 @@ type routerDialer func() (endpoint string, cleanup func(), err error)
 
 // sshRetryDelay is the wait before runSSHExec's one retry on a 421 stale
 // assignment. sshStartTimeout bounds the wait for the guest to start the
-// command. Tests override both, to run fast.
+// command. sshGetTaskTimeout bounds each getTask call: the initial fetch
+// and the re-fetch after a 421 alike. This stops a server that never
+// answers from hanging ax ssh (ax-lox.9). Tests override all three, to run
+// fast.
 var (
-	sshRetryDelay   = 2 * time.Second
-	sshStartTimeout = 30 * time.Second
+	sshRetryDelay     = 2 * time.Second
+	sshStartTimeout   = 30 * time.Second
+	sshGetTaskTimeout = 10 * time.Second
 )
 
 // staleAssignment421 is the exact substring in grpc-go's error for an HTTP
@@ -1122,7 +1126,7 @@ func runSSH(serverURL, atespace, kubeContext string, args []string) error {
 // retryDelay and startTimeout let a test run the 421-retry and start-timeout
 // paths fast; production uses sshRetryDelay and sshStartTimeout.
 func runSSHExec(taskName string, cmdToRun []string, getTask taskGetter, dialRouter routerDialer, retryDelay, startTimeout time.Duration, stdout, stderr io.Writer) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), sshGetTaskTimeout)
 	defer cancel()
 
 	task, err := getTask(ctx)
@@ -1181,11 +1185,14 @@ func runSSHExec(taskName string, cmdToRun []string, getTask taskGetter, dialRout
 			return fmt.Errorf("task %q: %w", taskName, err)
 		}
 
-		// atunnel rejected the request before the actor ran anything, so no
-		// process started: a retry is safe. Re-fetch the task first, since
-		// the actor may already be gone for good (the controller's liveness
-		// sweep can have failed it between the dial and this error).
-		refetched, gerr := getTask(context.Background())
+		// atunnel rejected the request before the actor ran anything. No
+		// process started, so a retry is safe. Re-fetch the task first: the
+		// controller's liveness sweep may have failed it between the dial
+		// and this error. Bound this call like the initial fetch. This
+		// stops a server that never answers from hanging ax ssh (ax-lox.9).
+		refetchCtx, refetchCancel := context.WithTimeout(context.Background(), sshGetTaskTimeout)
+		refetched, gerr := getTask(refetchCtx)
+		refetchCancel()
 		if gerr != nil {
 			return fmt.Errorf("task %q: actor %q has a stale assignment (HTTP 421), and re-fetching the task failed: %w", taskName, task.Status.Actor, gerr)
 		}

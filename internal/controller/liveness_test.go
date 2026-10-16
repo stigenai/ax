@@ -320,6 +320,159 @@ func TestLivenessSweepSkipsNonRunningTasks(t *testing.T) {
 	}
 }
 
+// TestLivenessSweepPrunesMissesOnDeleteAndRecreate covers ax-lox.8. A
+// person deletes a task, then creates a new task with the same name. The
+// new task must not inherit the old task's miss count. Without the fix,
+// the new task fails after 1 more stale sweep, not after
+// DefaultLivenessThreshold sweeps.
+func TestLivenessSweepPrunesMissesOnDeleteAndRecreate(t *testing.T) {
+	ctx := context.Background()
+	s := memory.NewStore()
+	task := runningTaskWithActor("default", "task1", "task1", "10.244.3.47")
+	if err := s.SaveTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+
+	mockSrv := &mockControlServer{existingActor: &ateapipb.Actor{
+		Status: &ateapipb.ActorStatus{
+			State:            ateapipb.ActorState_ACTOR_STATE_RUNNING,
+			WorkerAssignment: &ateapipb.WorkerAssignment{WorkerPodIp: "10.244.3.47"},
+		},
+	}}
+	router := newLivenessRouter(t)
+	router.set("default", "task1", "stale")
+	checker := newLivenessChecker(t, s, mockSrv, router)
+
+	// 2 stale sweeps: 1 short of DefaultLivenessThreshold (3).
+	checker.SweepOnce(ctx)
+	checker.SweepOnce(ctx)
+	got, err := s.GetTask(ctx, "default", "task1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.GetStatus().GetPhase() != "Running" {
+		t.Fatalf("phase is %q after 2 misses, want Running", got.GetStatus().GetPhase())
+	}
+
+	// Delete the task, then re-create a same-name task fresh. A sweep with
+	// nothing listed must drop the old task's miss count.
+	if err := s.DeleteTask(ctx, "default", "task1"); err != nil {
+		t.Fatal(err)
+	}
+	checker.SweepOnce(ctx)
+
+	fresh := runningTaskWithActor("default", "task1", "task1", "10.244.3.47")
+	if err := s.SaveTask(ctx, fresh); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1 stale sweep on the re-created task: it must stay Running. Before
+	// the fix, it inherits the old task's 2 misses and fails on this sweep.
+	checker.SweepOnce(ctx)
+	got, err = s.GetTask(ctx, "default", "task1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.GetStatus().GetPhase() != "Running" {
+		t.Fatalf("phase is %q after 1 miss on the re-created task, want Running: it must not inherit the deleted task's miss count", got.GetStatus().GetPhase())
+	}
+}
+
+// TestLivenessSweepHealthyProbeRefreshesMovedActor covers ax-lox.10's
+// healthy branch. A healthy probe plus Substrate showing the actor on a
+// new worker must update Task.Status.WorkerIp and keep the task Running.
+func TestLivenessSweepHealthyProbeRefreshesMovedActor(t *testing.T) {
+	ctx := context.Background()
+	s := memory.NewStore()
+	task := runningTaskWithActor("default", "task1", "task1", "10.244.3.47")
+	if err := s.SaveTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+
+	mockSrv := &mockControlServer{existingActor: &ateapipb.Actor{
+		Status: &ateapipb.ActorStatus{
+			State:            ateapipb.ActorState_ACTOR_STATE_RUNNING,
+			WorkerAssignment: &ateapipb.WorkerAssignment{WorkerPodIp: "10.244.9.9"},
+		},
+	}}
+	router := newLivenessRouter(t)
+	router.set("default", "task1", "ok")
+	checker := newLivenessChecker(t, s, mockSrv, router)
+
+	checker.SweepOnce(ctx)
+
+	got, err := s.GetTask(ctx, "default", "task1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.GetStatus().GetPhase() != "Running" {
+		t.Fatalf("phase is %q, want Running", got.GetStatus().GetPhase())
+	}
+	if got.GetStatus().GetWorkerIp() != "10.244.9.9" {
+		t.Fatalf("WorkerIp is %q, want the moved actor's new worker %q", got.GetStatus().GetWorkerIp(), "10.244.9.9")
+	}
+}
+
+// TestLivenessSweepStaleProbeWithMovedActorRefreshesAndResets covers
+// ax-lox.10's default branch for a stale probe. Substrate shows the actor
+// RUNNING on a worker other than the one that answered stale. This is a
+// moved actor, not a lost one. The sweep must update WorkerIp, keep the
+// task Running, and reset the miss count instead of adding to it.
+func TestLivenessSweepStaleProbeWithMovedActorRefreshesAndResets(t *testing.T) {
+	ctx := context.Background()
+	s := memory.NewStore()
+	task := runningTaskWithActor("default", "task1", "task1", "10.244.3.47")
+	if err := s.SaveTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+
+	mockSrv := &mockControlServer{existingActor: &ateapipb.Actor{
+		Status: &ateapipb.ActorStatus{
+			State:            ateapipb.ActorState_ACTOR_STATE_RUNNING,
+			WorkerAssignment: &ateapipb.WorkerAssignment{WorkerPodIp: "10.244.3.47"},
+		},
+	}}
+	router := newLivenessRouter(t)
+	router.set("default", "task1", "stale")
+	checker := newLivenessChecker(t, s, mockSrv, router)
+
+	// 2 stale misses against the old worker: 1 short of the threshold.
+	checker.SweepOnce(ctx)
+	checker.SweepOnce(ctx)
+
+	// Substrate now shows the actor moved to a new worker. The stale
+	// result against the old worker is stale information on ax's side:
+	// the sweep must refresh WorkerIp, not count this as a miss.
+	mockSrv.existingActor.Status.WorkerAssignment.WorkerPodIp = "10.244.9.9"
+	checker.SweepOnce(ctx)
+
+	got, err := s.GetTask(ctx, "default", "task1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.GetStatus().GetPhase() != "Running" {
+		t.Fatalf("phase is %q, want Running", got.GetStatus().GetPhase())
+	}
+	if got.GetStatus().GetWorkerIp() != "10.244.9.9" {
+		t.Fatalf("WorkerIp is %q, want the moved actor's new worker %q", got.GetStatus().GetWorkerIp(), "10.244.9.9")
+	}
+
+	// The miss count must have reset to 0. 2 more stale probes, now
+	// against the current worker, must not reach DefaultLivenessThreshold
+	// (3).
+	router.set("default", "task1", "stale")
+	checker.SweepOnce(ctx)
+	checker.SweepOnce(ctx)
+
+	got, err = s.GetTask(ctx, "default", "task1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.GetStatus().GetPhase() != "Running" {
+		t.Fatalf("phase is %q after 2 more misses, want Running: the moved-actor refresh must reset the miss count", got.GetStatus().GetPhase())
+	}
+}
+
 // raceStore wraps a store.Store and runs hook immediately before every
 // UpdateTaskStatusIf call, so a test can simulate a concurrent write that
 // lands between a liveness probe and its conditional write.
