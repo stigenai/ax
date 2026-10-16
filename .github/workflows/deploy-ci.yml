@@ -1,0 +1,92 @@
+# CI for the stigenai/deploy branch (ax-kky).
+#
+# go.yml and check-binaries.yml run only on branches: [main]. That is the
+# upstream google/ax branch. A pull request against stigenai/deploy gets
+# no check-run from them. This workflow adds that check.
+#
+# The ruleset factory-merge-gate on stigenai/deploy can then require this
+# check (ax-kky.2, owner-only: a person must add the check name to the
+# ruleset).
+#
+# The job name build-vet-test is the check name.
+
+name: Deploy CI
+
+on:
+  pull_request:
+    branches: [ "stigenai/deploy" ]
+  push:
+    branches: [ "stigenai/deploy" ]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-ci-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build-vet-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      redis:
+        image: redis:7-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    env:
+      AX_DELETE_TEST_REDIS_ADDRESS: 127.0.0.1:6379
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Go
+        uses: actions/setup-go@f111f3307d8850f501ac008e886eec1fd1932a34 # v5.3.0
+        with:
+          go-version-file: go.mod
+
+      - name: Verify go mod tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+      - name: Gofmt
+        run: |
+          UNFORMATTED="$(gofmt -l .)"
+          if [ -n "$UNFORMATTED" ]; then
+            echo "::error::gofmt -l found unformatted files:"
+            echo "$UNFORMATTED"
+            exit 1
+          fi
+
+      - name: Build
+        run: go build -v ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: |
+          set -o pipefail
+          go test -count=1 -v ./... | tee /tmp/ax-deploy-ci-test.log
+
+      - name: Verify Redis-gated store tests ran, none skipped
+        run: |
+          if grep -q -- '--- SKIP' /tmp/ax-deploy-ci-test.log; then
+            echo "::error::internal/store/redis tests were skipped; the Redis service was not reachable"
+            grep -- '--- SKIP' /tmp/ax-deploy-ci-test.log
+            exit 1
+          fi
+          if ! grep -q -- '--- PASS' /tmp/ax-deploy-ci-test.log; then
+            echo "::error::no --- PASS lines found in the test log; the Redis-gated tests likely did not run"
+            exit 1
+          fi
+          echo "Redis-gated store tests ran with no SKIP."
