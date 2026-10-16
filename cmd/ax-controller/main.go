@@ -17,17 +17,131 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/google/ax/internal/controller"
 	"github.com/google/ax/internal/store/redis"
 	"github.com/google/ax/internal/substrate"
 	"github.com/google/ax/pkg/apis/v1alpha1"
 	goredis "github.com/redis/go-redis/v9"
+	"k8s.io/apimachinery/pkg/api/resource"
 )
+
+// defaultTaskMemoryDefault is the value of --default-task-memory and
+// AX_DEFAULT_TASK_MEMORY when a user sets neither one.
+//
+// ax-9qu raised this value from 4Gi. A Claude Code session plus a Go or Node
+// build needs more memory than 4Gi. 7680Mi still fits 2 tasks on each 16Gi
+// worker. The sum is 2*7680Mi plus about 400Mi for ateom overhead. The total,
+// 15760Mi, stays under the 16384Mi limit. See
+// deploy/stigenai/workerpool.yaml for the full sizing math.
+const defaultTaskMemoryDefault = "7680Mi"
+
+// sandboxCheckIntervalDefault is the --sandbox-check-interval /
+// AX_SANDBOX_CHECK_INTERVAL value used when neither is set: a Go duration
+// string.
+//
+// ax-9qu.9 renamed this flag and env var from --liveness-interval /
+// AX_LIVENESS_INTERVAL. The old names collided in meaning with the
+// pre-existing --task-liveness-interval / AX_TASK_LIVENESS_INTERVAL, which
+// controls a different check (LivenessChecker's stale-routing sweep, not
+// TaskMonitor's actor-and-runner sweep).
+const sandboxCheckIntervalDefault = "30s"
+
+// resolveMaxTaskMemory parses the --max-task-memory / AX_MAX_TASK_MEMORY value.
+// The result is the cap Reconcile enforces.
+//
+// Empty or "0" disables the check and returns a zero Quantity.
+//
+// Any other value must parse as a Kubernetes resource.Quantity greater than zero.
+// If it does not, the controller must not start.
+func resolveMaxTaskMemory(value string) (resource.Quantity, error) {
+	if value == "0" || value == "" {
+		return resource.Quantity{}, nil
+	}
+	q, err := resource.ParseQuantity(value)
+	if err != nil {
+		return resource.Quantity{}, err
+	}
+	if q.Sign() <= 0 {
+		return resource.Quantity{}, fmt.Errorf("%q must be greater than zero", value)
+	}
+	return q, nil
+}
+
+// checkDefaultWithinMax reports an error when defaultTaskMemory, the memory
+// booked for a task that names no limit, would itself exceed max. A
+// deployment with this mismatch would fail every default-sized task on its
+// first reconcile, so the controller refuses to start instead. An empty
+// defaultTaskMemory or a zero max always passes.
+func checkDefaultWithinMax(defaultTaskMemory string, max resource.Quantity) error {
+	if defaultTaskMemory == "" || max.IsZero() {
+		return nil
+	}
+	q, err := resource.ParseQuantity(defaultTaskMemory)
+	if err != nil {
+		return err
+	}
+	if q.Cmp(max) > 0 {
+		return fmt.Errorf("default task memory %q exceeds max task memory %q", defaultTaskMemory, max.String())
+	}
+	return nil
+}
+
+// resolveDefaultTaskMemory applies the AX_DEFAULT_TASK_MEMORY override (the
+// caller does that before calling this) and validates the result. "0"
+// disables the default and returns "". Any other value must parse as a
+// Kubernetes resource.Quantity greater than zero, like a task's own
+// spec.resources.limits.memory (pkg/apis/v1alpha1/types.go
+// validateQuantity), or the controller must not start.
+func resolveDefaultTaskMemory(value string) (string, error) {
+	if value == "0" || value == "" {
+		return "", nil
+	}
+	q, err := resource.ParseQuantity(value)
+	if err != nil {
+		return "", err
+	}
+	if q.Sign() <= 0 {
+		return "", fmt.Errorf("%q must be greater than zero", value)
+	}
+	return value, nil
+}
+
+// resolveSandboxCheckInterval parses the --sandbox-check-interval /
+// AX_SANDBOX_CHECK_INTERVAL value as a Go duration (for example "30s"). The
+// caller treats zero or a negative result as disabled, instead of as an
+// error. So "0", "0s" and "-1s" all disable the monitor.
+func resolveSandboxCheckInterval(value string) (time.Duration, error) {
+	return time.ParseDuration(value)
+}
+
+// resolveTaskLivenessInterval reads the AX_TASK_LIVENESS_INTERVAL override
+// for the --task-liveness-interval flag. The caller passes the env value.
+// An empty envValue keeps flagValue. The value "0" turns off the sweep.
+func resolveTaskLivenessInterval(flagValue time.Duration, envValue string) (time.Duration, error) {
+	if envValue == "" {
+		return flagValue, nil
+	}
+	d, err := time.ParseDuration(envValue)
+	if err != nil {
+		return 0, fmt.Errorf("invalid duration %q: %w", envValue, err)
+	}
+	return d, nil
+}
+
+// taskLivenessSweepEnabled reports whether main must start the LivenessChecker
+// sweep goroutine. The sweep needs a router address to probe through
+// (atenet-router, read from ATENET_ROUTER_ADDR) and an interval greater than
+// zero. If either is missing, the sweep stays off.
+func taskLivenessSweepEnabled(routerAddr string, interval time.Duration) bool {
+	return routerAddr != "" && interval > 0
+}
 
 func main() {
 	var (
@@ -39,11 +153,16 @@ func main() {
 		substratePlaintext      bool
 		defaultTemplate         string
 		defaultTemplateAtespace string
+		defaultTaskMemory       string
+		maxTaskMemory           string
+		sandboxCheckInterval    string
 		redisAddr               string
 		redisPassword           string
 		redisGroup              string
 		redisConsumer           string
 		nativeTLSDestination    string
+		taskLivenessInterval    time.Duration
+		taskLivenessThreshold   int
 	)
 
 	flag.StringVar(&redisAddr, "redis-addr", "localhost:6379", "Redis server address (e.g. localhost:6379)")
@@ -58,7 +177,12 @@ func main() {
 	flag.BoolVar(&substratePlaintext, "substrate-plaintext", false, "Use insecure plaintext gRPC connection to Substrate")
 	flag.StringVar(&defaultTemplate, "template", "default-template", "Default Substrate ActorTemplate name")
 	flag.StringVar(&defaultTemplateAtespace, "template-atespace", "ax-system", "Default Substrate ActorTemplate atespace")
+	flag.StringVar(&defaultTaskMemory, "default-task-memory", defaultTaskMemoryDefault, "Memory limit booked for a task that names none (Substrate quantity, e.g. 7680Mi); 0 disables")
+	flag.StringVar(&maxTaskMemory, "max-task-memory", "", "Largest memory limit any worker can hold (Kubernetes quantity, e.g. 16Gi); Reconcile fails a task above it instead of waiting for capacity. Empty or 0 disables the check")
+	flag.StringVar(&sandboxCheckInterval, "sandbox-check-interval", sandboxCheckIntervalDefault, "How often TaskMonitor checks each Running task's actor and runner (Go duration, e.g. 30s); 0 disables it (env AX_SANDBOX_CHECK_INTERVAL)")
 	flag.StringVar(&nativeTLSDestination, "native-tls-destination", "", "Private protected-actor TLS destination; install or verify exact policy before resume")
+	flag.DurationVar(&taskLivenessInterval, "task-liveness-interval", time.Minute, "How often to probe each Running task's actor through atenet-router; 0 turns off the sweep (env AX_TASK_LIVENESS_INTERVAL)")
+	flag.IntVar(&taskLivenessThreshold, "task-liveness-threshold", controller.DefaultLivenessThreshold, "Consecutive stale probes that mark a Running task Failed")
 	flag.Parse()
 
 	if envRedis := os.Getenv("REDIS_ADDR"); envRedis != "" {
@@ -69,6 +193,39 @@ func main() {
 	}
 	if envImage := os.Getenv("AX_DEFAULT_TASK_IMAGE"); envImage != "" {
 		v1alpha1.DefaultTaskImage = envImage
+	}
+	if envMemory := os.Getenv("AX_DEFAULT_TASK_MEMORY"); envMemory != "" {
+		defaultTaskMemory = envMemory
+	}
+	if envSandboxCheck := os.Getenv("AX_SANDBOX_CHECK_INTERVAL"); envSandboxCheck != "" {
+		sandboxCheckInterval = envSandboxCheck
+	}
+	defaultTaskMemory, err := resolveDefaultTaskMemory(defaultTaskMemory)
+	if err != nil {
+		slog.Error("invalid --default-task-memory / AX_DEFAULT_TASK_MEMORY", "error", err)
+		os.Exit(1)
+	}
+	if envMax := os.Getenv("AX_MAX_TASK_MEMORY"); envMax != "" {
+		maxTaskMemory = envMax
+	}
+	maxTaskMemoryQuantity, err := resolveMaxTaskMemory(maxTaskMemory)
+	if err != nil {
+		slog.Error("invalid --max-task-memory / AX_MAX_TASK_MEMORY", "error", err)
+		os.Exit(1)
+	}
+	if err := checkDefaultWithinMax(defaultTaskMemory, maxTaskMemoryQuantity); err != nil {
+		slog.Error("default task memory cannot exceed max task memory", "error", err)
+		os.Exit(1)
+	}
+	sandboxCheckIntervalDuration, err := resolveSandboxCheckInterval(sandboxCheckInterval)
+	if err != nil {
+		slog.Error("invalid --sandbox-check-interval / AX_SANDBOX_CHECK_INTERVAL", "error", err)
+		os.Exit(1)
+	}
+	taskLivenessInterval, err = resolveTaskLivenessInterval(taskLivenessInterval, os.Getenv("AX_TASK_LIVENESS_INTERVAL"))
+	if err != nil {
+		slog.Error("invalid --task-liveness-interval / AX_TASK_LIVENESS_INTERVAL", "error", err)
+		os.Exit(1)
 	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -81,6 +238,9 @@ func main() {
 		"authority", substrateAuthority,
 		"templateAtespace", defaultTemplateAtespace,
 		"template", defaultTemplate,
+		"defaultTaskMemory", defaultTaskMemory,
+		"maxTaskMemory", maxTaskMemoryQuantity.String(),
+		"sandboxCheckInterval", sandboxCheckIntervalDuration,
 	)
 
 	subClient, err := substrate.NewClientWithOptions(substrate.ClientOptions{
@@ -98,6 +258,8 @@ func main() {
 	defer subClient.Close()
 
 	reconciler := controller.NewTaskReconciler(subClient, defaultTemplate, defaultTemplateAtespace)
+	reconciler.DefaultTaskMemory = defaultTaskMemory
+	reconciler.MaxTaskMemory = maxTaskMemoryQuantity
 	if nativeTLSDestination != "" {
 		if err := reconciler.ConfigureNativeTLS(nativeTLSDestination, os.Getenv("POD_NAMESPACE"), substrateEndpoint, substrateAuthority, substrateInsecureTLS || substratePlaintext); err != nil {
 			slog.Error("invalid native TLS configuration", "error", err)
@@ -115,6 +277,40 @@ func main() {
 	defer rClient.Close()
 
 	rStore := redis.NewStore(rClient, redis.Options{})
+
+	routerAddr := os.Getenv("ATENET_ROUTER_ADDR")
+	monitor := controller.NewTaskMonitor(rStore, reconciler, sandboxCheckIntervalDuration)
+	slog.Info("sandbox check monitor",
+		"interval", sandboxCheckIntervalDuration,
+		"routerAddr", routerAddr,
+		"note", "SandboxUnresponsive stays off until ATENET_ROUTER_ADDR is set (ax-9qu.10)",
+	)
+	go monitor.Run(ctx)
+
+	if taskLivenessSweepEnabled(routerAddr, taskLivenessInterval) {
+		checker := controller.NewLivenessChecker(rStore, subClient, routerAddr)
+		checker.Threshold = taskLivenessThreshold
+		slog.Info("task liveness sweep",
+			"interval", taskLivenessInterval,
+			"threshold", taskLivenessThreshold,
+			"routerAddr", routerAddr,
+		)
+		go func() {
+			ticker := time.NewTicker(taskLivenessInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					checker.SweepOnce(ctx)
+				}
+			}
+		}()
+	} else {
+		slog.Info("task liveness sweep disabled", "routerAddr", routerAddr, "interval", taskLivenessInterval)
+	}
+
 	worker := controller.NewWorker(rStore, reconciler, redisGroup, redisConsumer)
 	if err := worker.Run(ctx); err != nil && err != context.Canceled {
 		slog.Error("redis worker stopped with error", "error", err)

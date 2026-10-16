@@ -19,6 +19,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -30,6 +31,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
+	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 func TestProtectedDeleteRequiresRetainedIdentity(t *testing.T) {
@@ -297,5 +299,51 @@ func TestUpdateTask_ValidatesWorkspaceBindings(t *testing.T) {
 	}})
 	if err != nil {
 		t.Fatalf("expected a valid multi-workspace task to be accepted, got %v", err)
+	}
+}
+
+func TestUpdateTask_RejectsMemoryAboveMax(t *testing.T) {
+	ctx := context.Background()
+	memStore := memory.NewStore()
+	srv := server.NewServer(memStore)
+	srv.MaxTaskMemory = resource.MustParse("16Gi")
+
+	// UpdateTask rejects a task that asks for more memory than any worker can
+	// hold, and the store never gets a record of it.
+	_, err := srv.UpdateTask(ctx, &v1alpha1.UpdateTaskRequest{Task: &v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{Name: "too-big"},
+		Spec:     &v1alpha1.TaskSpec{Resources: &v1alpha1.ResourceReqs{Limits: &v1alpha1.ResourceList{Memory: "32Gi"}}},
+	}})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("expected InvalidArgument for a task over the memory cap, got %v", err)
+	}
+	if !strings.Contains(err.Error(), `spec.resources.limits.memory: "32Gi"`) || !strings.Contains(err.Error(), "16Gi") {
+		t.Fatalf("error does not name the limit and the cap: %v", err)
+	}
+	if _, serr := memStore.GetTask(ctx, "default", "too-big"); serr == nil {
+		t.Fatalf("rejected task was saved anyway")
+	}
+
+	// A task at or under the cap still saves.
+	if _, err := srv.UpdateTask(ctx, &v1alpha1.UpdateTaskRequest{Task: &v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{Name: "at-cap"},
+		Spec:     &v1alpha1.TaskSpec{Resources: &v1alpha1.ResourceReqs{Limits: &v1alpha1.ResourceList{Memory: "16Gi"}}},
+	}}); err != nil {
+		t.Fatalf("expected a task at the cap to be accepted, got %v", err)
+	}
+	if _, err := srv.UpdateTask(ctx, &v1alpha1.UpdateTaskRequest{Task: &v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{Name: "under-cap"},
+		Spec:     &v1alpha1.TaskSpec{Resources: &v1alpha1.ResourceReqs{Limits: &v1alpha1.ResourceList{Memory: "4Gi"}}},
+	}}); err != nil {
+		t.Fatalf("expected a task under the cap to be accepted, got %v", err)
+	}
+
+	// With no cap configured, UpdateTask keeps the old behavior: it rejects nothing.
+	unbounded := server.NewServer(memory.NewStore())
+	if _, err := unbounded.UpdateTask(ctx, &v1alpha1.UpdateTaskRequest{Task: &v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{Name: "no-cap"},
+		Spec:     &v1alpha1.TaskSpec{Resources: &v1alpha1.ResourceReqs{Limits: &v1alpha1.ResourceList{Memory: "32Gi"}}},
+	}}); err != nil {
+		t.Fatalf("expected an unbounded server to accept any memory limit, got %v", err)
 	}
 }

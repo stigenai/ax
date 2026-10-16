@@ -21,10 +21,8 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"sort"
-	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -1021,6 +1019,64 @@ func runTunnel(args []string) error {
 	}
 }
 
+// taskGetter fetches the current state of one task.
+//
+// Production code closes over the real AX client and the task's atespace
+// and name. A test can give a fake taskGetter instead. The fake lets the
+// test check routing with no live ax-server and no cluster.
+type taskGetter func(ctx context.Context) (*v1alpha1.Task, error)
+
+// routerDialer connects to the Substrate atenet-router.
+//
+// It returns the dial endpoint and a cleanup function. The cleanup function
+// is nil when the dialer needs no cleanup.
+//
+// Production code port-forwards to svc/atenet-router in the ate-system
+// namespace. A test can give a fake routerDialer backed by a local listener
+// instead. The fake lets the test prove routing with no kubectl call.
+type routerDialer func() (endpoint string, cleanup func(), err error)
+
+// sshRetryDelay is the wait before runSSHExec's one retry on a 421 stale
+// assignment. sshStartTimeout bounds the wait for the guest to start the
+// command. sshGetTaskTimeout bounds each getTask call: the initial fetch
+// and the re-fetch after a 421 alike. This stops a server that never
+// answers from hanging ax ssh (ax-lox.9). Tests override all three, to run
+// fast.
+var (
+	sshRetryDelay     = 2 * time.Second
+	sshStartTimeout   = 30 * time.Second
+	sshGetTaskTimeout = 10 * time.Second
+)
+
+// staleAssignment421 is the exact substring in grpc-go's error for an HTTP
+// 421 response (http.StatusText(421) == "Misdirected Request"). atunnel
+// sends this status when a worker's activation map no longer holds the
+// target actor, for example after its container restarts and loses the
+// actor. The response has no body and no metadata the grpc client keeps.
+// Classify on this text, not on a header: grpc-go does not pass response
+// headers to the caller for a headers-only reply like this one.
+const staleAssignment421 = "421 (Misdirected Request)"
+
+// isStaleAssignment reports whether err is the grpc-go error for atunnel's
+// 421 stale-assignment rejection.
+func isStaleAssignment(err error) bool {
+	return err != nil && strings.Contains(err.Error(), staleAssignment421)
+}
+
+// readyCondition returns the Ready condition's reason and message from
+// task's status, or ("", "") when task has none.
+func readyCondition(task *v1alpha1.Task) (reason, message string) {
+	if task == nil || task.Status == nil {
+		return "", ""
+	}
+	for _, c := range task.Status.Conditions {
+		if c.Type == "Ready" {
+			return c.Reason, c.Message
+		}
+	}
+	return "", ""
+}
+
 func runSSH(serverURL, atespace, kubeContext string, args []string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("usage: ax ssh <task-name> [-- command...]")
@@ -1047,13 +1103,33 @@ func runSSH(serverURL, atespace, kubeContext string, args []string) error {
 	}
 	defer conn.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	getTask := func(ctx context.Context) (*v1alpha1.Task, error) {
+		return client.GetTask(ctx, &v1alpha1.GetTaskRequest{
+			Atespace: atespace,
+			Name:     taskName,
+		})
+	}
+	dialRouter := func() (string, func(), error) {
+		localPort, pfCleanup, err := tunnel.PortForward(context.Background(), kubeContext, "ate-system", "svc/atenet-router", 80)
+		if err != nil {
+			return "", nil, err
+		}
+		return fmt.Sprintf("127.0.0.1:%d", localPort), pfCleanup, nil
+	}
+
+	return runSSHExec(taskName, cmdToRun, getTask, dialRouter, sshRetryDelay, sshStartTimeout, os.Stdout, os.Stderr)
+}
+
+// runSSHExec connects to taskName's guest and runs cmdToRun, streaming output
+// to stdout and stderr. getTask and dialRouter are the only two seams: every
+// other dependency (argument parsing, process exit) stays in runSSH.
+// retryDelay and startTimeout let a test run the 421-retry and start-timeout
+// paths fast; production uses sshRetryDelay and sshStartTimeout.
+func runSSHExec(taskName string, cmdToRun []string, getTask taskGetter, dialRouter routerDialer, retryDelay, startTimeout time.Duration, stdout, stderr io.Writer) error {
+	ctx, cancel := context.WithTimeout(context.Background(), sshGetTaskTimeout)
 	defer cancel()
 
-	task, err := client.GetTask(ctx, &v1alpha1.GetTaskRequest{
-		Atespace: atespace,
-		Name:     taskName,
-	})
+	task, err := getTask(ctx)
 	if err != nil {
 		return fmt.Errorf("fetching task %q: %w", taskName, err)
 	}
@@ -1070,62 +1146,70 @@ func runSSH(serverURL, atespace, kubeContext string, args []string) error {
 		return fmt.Errorf("task %q does not expose guest services; set spec.debug: true and re-apply to enable ax ssh", taskName)
 	}
 
-	workerIP := task.Status.WorkerIp
-	if workerIP == "" {
-		return fmt.Errorf("task %q has no worker IP assigned", taskName)
+	if task.Status.Actor == "" {
+		return fmt.Errorf("task %q has no actor assigned", taskName)
 	}
 
-	// The runner serves guest services on port 80 unless the worker IP says otherwise.
-	host := workerIP
-	port := 80
-	if h, p, err := net.SplitHostPort(workerIP); err == nil {
-		host = h
-		if parsedPort, err := strconv.Atoi(p); err == nil {
-			port = parsedPort
-		}
-	}
-
+	// Routing never reads task.Status.WorkerIp: a worker can restart its
+	// container in place, keeping the same pod IP but losing every actor it
+	// held, so a cached IP cannot prove the actor still lives there.
+	// atenet-router resolves the actor's current worker on every request
+	// instead.
 	targetActor := fmt.Sprintf("%s/%s", task.Metadata.Atespace, task.Status.Actor)
-	var (
-		guestClient *guest.Client
-		cleanup     func()
-	)
 
-	// 1. First, check if worker IP is directly reachable (e.g. within cluster or local mesh)
-	d := net.Dialer{Timeout: 500 * time.Millisecond}
-	guestEndpoint := net.JoinHostPort(host, fmt.Sprint(port))
-	if testConn, dialErr := d.Dial("tcp", guestEndpoint); dialErr == nil {
-		_ = testConn.Close()
-		guestClient, err = guest.Dial(guestEndpoint)
-		if err != nil {
-			return fmt.Errorf("connecting to guest at %s: %w", guestEndpoint, err)
-		}
-	} else {
-		// 2. Connect via the Substrate atenet-router service in ate-system (port 80)
-		localPort, pfCleanup, err := tunnel.PortForward(context.Background(), kubeContext, "ate-system", "svc/atenet-router", 80)
-		if err != nil {
-			return fmt.Errorf("establishing port-forward to atenet-router: %w", err)
-		}
-		cleanup = pfCleanup
-		routerEndpoint := fmt.Sprintf("127.0.0.1:%d", localPort)
-		guestClient, err = guest.DialTarget(routerEndpoint, targetActor)
-		if err != nil {
-			return fmt.Errorf("connecting to guest via atenet-router at %s: %w", routerEndpoint, err)
-		}
+	routerEndpoint, cleanup, err := dialRouter()
+	if err != nil {
+		return fmt.Errorf("establishing port-forward to atenet-router: %w", err)
 	}
-
 	if cleanup != nil {
 		defer cleanup()
 	}
+	guestClient, err := guest.DialTarget(routerEndpoint, targetActor)
+	if err != nil {
+		return fmt.Errorf("connecting to guest via atenet-router at %s: %w", routerEndpoint, err)
+	}
 	defer guestClient.Close()
 
-	exitCode, err := guestClient.Exec(context.Background(), guest.ExecOptions{
-		Command: cmdToRun,
-		Stdout:  os.Stdout,
-		Stderr:  os.Stderr,
-	})
+	runCmd := func() (int, error) {
+		return guestClient.Exec(context.Background(), guest.ExecOptions{
+			Command:      cmdToRun,
+			Stdout:       stdout,
+			Stderr:       stderr,
+			StartTimeout: startTimeout,
+		})
+	}
+
+	exitCode, err := runCmd()
 	if err != nil {
-		return err
+		if !isStaleAssignment(err) {
+			return fmt.Errorf("task %q: %w", taskName, err)
+		}
+
+		// atunnel rejected the request before the actor ran anything. No
+		// process started, so a retry is safe. Re-fetch the task first: the
+		// controller's liveness sweep may have failed it between the dial
+		// and this error. Bound this call like the initial fetch. This
+		// stops a server that never answers from hanging ax ssh (ax-lox.9).
+		refetchCtx, refetchCancel := context.WithTimeout(context.Background(), sshGetTaskTimeout)
+		refetched, gerr := getTask(refetchCtx)
+		refetchCancel()
+		if gerr != nil {
+			return fmt.Errorf("task %q: actor %q has a stale assignment (HTTP 421), and re-fetching the task failed: %w", taskName, task.Status.Actor, gerr)
+		}
+		if refetched == nil || refetched.Status == nil || refetched.Status.Phase != "Running" {
+			phase := "unknown"
+			if refetched != nil && refetched.Status != nil {
+				phase = refetched.Status.Phase
+			}
+			reason, message := readyCondition(refetched)
+			return fmt.Errorf("task %q is no longer Running (phase %q, Ready reason %q: %s)", taskName, phase, reason, message)
+		}
+
+		time.Sleep(retryDelay)
+		exitCode, err = runCmd()
+		if err != nil {
+			return fmt.Errorf("task %q: actor %q has a stale assignment (HTTP 421) after 1 retry; delete and re-create the task: %w", taskName, task.Status.Actor, err)
+		}
 	}
 
 	if exitCode != 0 {

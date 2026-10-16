@@ -16,9 +16,11 @@ package controller_test
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -31,6 +33,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
+	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 type mockControlServer struct {
@@ -49,6 +52,21 @@ type mockControlServer struct {
 	existingActor     *ateapipb.Actor
 	deleteUID         string
 	expectedDeleteUID string
+	// resumeErr makes ResumeActor fail, as Substrate does when it has no free
+	// worker (codes.ResourceExhausted) or for any other reason.
+	resumeErr      error
+	resumeAttempts atomic.Int32
+	// getActorActor and getActorErr, when set, override GetActor's reply.
+	// getActorErr takes priority; getActorActor is checked next; with
+	// neither set, GetActor falls back to existingActor, so every test
+	// written before these fields existed keeps its original behavior.
+	getActorActor *ateapipb.Actor
+	getActorErr   error
+	// getActorDelay, when positive, makes GetActor wait this long, or until
+	// the caller's context is done, before replying. This proves a caller
+	// bounds the call with its own timeout instead of hanging forever
+	// (ax-9qu.11).
+	getActorDelay time.Duration
 }
 
 // noSecrets is a SecretResolver for tests: it never finds a key and never touches a cluster.
@@ -89,7 +107,20 @@ func (m *mockControlServer) CreateAtespace(ctx context.Context, req *ateapipb.Cr
 	return &ateapipb.Atespace{Metadata: &ateapipb.ResourceMetadata{Name: name}}, nil
 }
 
-func (m *mockControlServer) GetActor(context.Context, *ateapipb.GetActorRequest) (*ateapipb.Actor, error) {
+func (m *mockControlServer) GetActor(ctx context.Context, _ *ateapipb.GetActorRequest) (*ateapipb.Actor, error) {
+	if m.getActorDelay > 0 {
+		select {
+		case <-time.After(m.getActorDelay):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	if m.getActorErr != nil {
+		return nil, m.getActorErr
+	}
+	if m.getActorActor != nil {
+		return m.getActorActor, nil
+	}
 	return m.existingActor, nil
 }
 
@@ -111,6 +142,10 @@ func (m *mockControlServer) CreateActor(ctx context.Context, req *ateapipb.Creat
 }
 
 func (m *mockControlServer) ResumeActor(ctx context.Context, req *ateapipb.ResumeActorRequest) (*ateapipb.ResumeActorResponse, error) {
+	m.resumeAttempts.Add(1)
+	if m.resumeErr != nil {
+		return nil, m.resumeErr
+	}
 	name := ""
 	if req.Actor != nil {
 		name = req.Actor.Name
@@ -150,6 +185,14 @@ func (m *mockControlServer) DeleteActor(ctx context.Context, req *ateapipb.Delet
 		return nil, status.Error(codes.Aborted, "actor UID differs")
 	}
 	name := req.GetActor().GetName()
+	for _, deleted := range m.deletedActors {
+		if deleted == name {
+			// Substrate returns NotFound for an actor already gone. The ax
+			// client treats that as a successful no-op, so a retried delete
+			// stays idempotent.
+			return nil, status.Error(codes.NotFound, "actor not found")
+		}
+	}
 	m.deletedActors = append(m.deletedActors, name)
 	return &ateapipb.Actor{Metadata: &ateapipb.ResourceMetadata{Name: name}}, nil
 }
@@ -596,6 +639,113 @@ func TestTaskReconciler_Capabilities(t *testing.T) {
 	}
 }
 
+// taskTopLevelMemory returns the top-level memory limit quantity the mock
+// server captured, or "" if the template carries no top-level Resources.
+func taskTopLevelMemory(tmpl *ateapipb.ActorTemplate) string {
+	for _, l := range tmpl.GetResources().GetLimits() {
+		if l.GetName() == "memory" {
+			return l.GetQuantity()
+		}
+	}
+	return ""
+}
+
+// A task with no memory limit gets the controller's default booked at the
+// top level, so Substrate's scheduler sees it. An explicit task limit wins
+// over the default, and disabling the default (empty DefaultTaskMemory)
+// leaves the task with no top-level memory booking, as before this field
+// existed.
+func TestTaskReconciler_DefaultTaskMemory(t *testing.T) {
+	t.Run("no task limit gets the controller default", func(t *testing.T) {
+		mockSrv := &mockControlServer{}
+		r := newTestReconciler(t, mockSrv)
+		r.DefaultTaskMemory = "7680Mi"
+		if _, err := r.Reconcile(context.Background(), envTask("x")); err != nil {
+			t.Fatalf("Reconcile failed: %v", err)
+		}
+		if got := taskTopLevelMemory(mockSrv.lastTemplate); got != "7680Mi" {
+			t.Errorf("top-level memory = %q, want 7680Mi", got)
+		}
+	})
+
+	t.Run("an explicit task limit wins over the default", func(t *testing.T) {
+		mockSrv := &mockControlServer{}
+		r := newTestReconciler(t, mockSrv)
+		r.DefaultTaskMemory = "4Gi"
+		task := envTask("x")
+		task.Spec.Resources = &v1alpha1.ResourceReqs{Limits: &v1alpha1.ResourceList{Memory: "8Gi"}}
+		if _, err := r.Reconcile(context.Background(), task); err != nil {
+			t.Fatalf("Reconcile failed: %v", err)
+		}
+		if got := taskTopLevelMemory(mockSrv.lastTemplate); got != "8Gi" {
+			t.Errorf("top-level memory = %q, want 8Gi (the task's own limit)", got)
+		}
+	})
+
+	t.Run("an empty default disables the booking", func(t *testing.T) {
+		mockSrv := &mockControlServer{}
+		r := newTestReconciler(t, mockSrv)
+		r.DefaultTaskMemory = ""
+		if _, err := r.Reconcile(context.Background(), envTask("x")); err != nil {
+			t.Fatalf("Reconcile failed: %v", err)
+		}
+		if mockSrv.lastTemplate.GetResources() != nil {
+			t.Errorf("want nil top-level Resources with the default disabled, got %v", mockSrv.lastTemplate.GetResources())
+		}
+	})
+
+	t.Run("the default does not change the task's template digest or AX_TASK_YAML", func(t *testing.T) {
+		withoutDefault := &mockControlServer{}
+		r := newTestReconciler(t, withoutDefault)
+		r.DefaultTaskMemory = ""
+		if _, err := r.Reconcile(context.Background(), envTask("x")); err != nil {
+			t.Fatalf("Reconcile failed: %v", err)
+		}
+
+		withDefault := &mockControlServer{}
+		r2 := newTestReconciler(t, withDefault)
+		r2.DefaultTaskMemory = "7680Mi"
+		if _, err := r2.Reconcile(context.Background(), envTask("x")); err != nil {
+			t.Fatalf("Reconcile failed: %v", err)
+		}
+
+		if withoutDefault.lastTemplate.GetMetadata().GetName() != withDefault.lastTemplate.GetMetadata().GetName() {
+			t.Errorf("template name changed: %q vs %q", withoutDefault.lastTemplate.GetMetadata().GetName(), withDefault.lastTemplate.GetMetadata().GetName())
+		}
+		yamlWithout, yamlWith := "", ""
+		for _, e := range withoutDefault.lastTemplate.GetContainers()[0].GetEnv() {
+			if e.GetName() == "AX_TASK_YAML" {
+				yamlWithout = e.GetValue()
+			}
+		}
+		for _, e := range withDefault.lastTemplate.GetContainers()[0].GetEnv() {
+			if e.GetName() == "AX_TASK_YAML" {
+				yamlWith = e.GetValue()
+			}
+		}
+		if yamlWithout != yamlWith {
+			t.Errorf("AX_TASK_YAML changed with the default applied:\nwithout: %q\nwith:    %q", yamlWithout, yamlWith)
+		}
+	})
+
+	t.Run("a supervisor task keeps its own memory limit, never the default", func(t *testing.T) {
+		// validateSupervisorTask (pkg/apis/v1alpha1/types.go) already requires
+		// a supervisor task to name explicit cpu and memory limits, so the
+		// default-booking branch (guarded by SupervisorProfile == "") must
+		// never run for one. This proves it leaves the supervisor's own
+		// 512Mi in place rather than the 4Gi default.
+		mockSrv := &mockControlServer{}
+		r := newTestReconciler(t, mockSrv)
+		r.DefaultTaskMemory = "4Gi"
+		if _, err := r.Reconcile(context.Background(), supervisorTask()); err != nil {
+			t.Fatalf("Reconcile failed: %v", err)
+		}
+		if got := taskTopLevelMemory(mockSrv.lastTemplate); got != "512Mi" {
+			t.Errorf("top-level memory = %q, want the supervisor's own 512Mi, not the 4Gi default", got)
+		}
+	})
+}
+
 // A template Substrate refuses fails the task with Substrate's reason, rather
 // than an actor made from a default template that is not this task.
 func TestTaskReconciler_TemplateRefusedFailsTask(t *testing.T) {
@@ -618,6 +768,121 @@ func TestTaskReconciler_TemplateRefusedFailsTask(t *testing.T) {
 	}
 	if len(mockSrv.createdActors) != 0 {
 		t.Errorf("an actor was created from another template: %v", mockSrv.createdActors)
+	}
+}
+
+// A full Substrate worker pool must not fail the task: it must wait and retry.
+func TestTaskReconciler_ResumeResourceExhaustedWaitsForCapacity(t *testing.T) {
+	mockSrv := &mockControlServer{resumeErr: status.Error(codes.ResourceExhausted, "no free workers available")}
+	task, err := newTestReconciler(t, mockSrv).Reconcile(context.Background(), envTask("x"))
+	if !errors.Is(err, controller.ErrWaitingForCapacity) {
+		t.Fatalf("expected ErrWaitingForCapacity, got %v", err)
+	}
+	if task.Status.Phase != "Pending" {
+		t.Errorf("expected phase Pending, got %q", task.Status.Phase)
+	}
+	var reason, message string
+	for _, c := range task.Status.Conditions {
+		if c.Type == "Ready" {
+			reason, message = c.Reason, c.Message
+		}
+	}
+	if reason != "WaitingForCapacity" || !strings.Contains(message, "no free workers") {
+		t.Errorf("expected WaitingForCapacity naming Substrate's reason, got %q: %q", reason, message)
+	}
+}
+
+// Any other resume failure still fails the task, as before.
+func TestTaskReconciler_ResumeOtherErrorFailsTask(t *testing.T) {
+	mockSrv := &mockControlServer{resumeErr: status.Error(codes.Internal, "boom")}
+	task, err := newTestReconciler(t, mockSrv).Reconcile(context.Background(), envTask("x"))
+	if err == nil || errors.Is(err, controller.ErrWaitingForCapacity) {
+		t.Fatalf("expected a plain resume failure, got %v", err)
+	}
+	if task.Status.Phase != "Failed" {
+		t.Errorf("expected phase Failed, got %q", task.Status.Phase)
+	}
+}
+
+// A task's own memory limit can exceed MaxTaskMemory. Reconcile must fail it
+// at once, before any Substrate call. It must not retry forever like a
+// capacity wait (ax-9gp).
+func TestTaskReconciler_MemoryAboveMaxFailsTask(t *testing.T) {
+	mockSrv := &mockControlServer{}
+	r := newTestReconciler(t, mockSrv)
+	r.MaxTaskMemory = resource.MustParse("16Gi")
+
+	task := envTask("x")
+	task.Spec.Resources = &v1alpha1.ResourceReqs{Limits: &v1alpha1.ResourceList{Memory: "32Gi"}}
+	reconciled, err := r.Reconcile(context.Background(), task)
+	if err == nil || errors.Is(err, controller.ErrWaitingForCapacity) {
+		t.Fatalf("expected a plain memory-cap failure, got %v", err)
+	}
+	if reconciled.Status.Phase != "Failed" {
+		t.Errorf("expected phase Failed, got %q", reconciled.Status.Phase)
+	}
+	var reason, message string
+	for _, c := range reconciled.Status.Conditions {
+		if c.Type == "Ready" {
+			reason, message = c.Reason, c.Message
+		}
+	}
+	if reason != "MemoryExceedsCapacity" || !strings.Contains(message, "32Gi") || !strings.Contains(message, "16Gi") {
+		t.Errorf("expected MemoryExceedsCapacity naming both sizes, got %q: %q", reason, message)
+	}
+	if len(mockSrv.createdAtespaces) != 0 || len(mockSrv.createdActors) != 0 || mockSrv.resumeAttempts.Load() != 0 {
+		t.Errorf("expected zero Substrate calls, got atespaces=%v actors=%v resumeAttempts=%d", mockSrv.createdAtespaces, mockSrv.createdActors, mockSrv.resumeAttempts.Load())
+	}
+}
+
+// A task that names no memory limit falls back to DefaultTaskMemory.
+// Reconcile must check that default against the cap too.
+func TestTaskReconciler_DefaultMemoryAboveMaxFailsTask(t *testing.T) {
+	mockSrv := &mockControlServer{}
+	r := newTestReconciler(t, mockSrv)
+	r.MaxTaskMemory = resource.MustParse("16Gi")
+	r.DefaultTaskMemory = "32Gi"
+
+	reconciled, err := r.Reconcile(context.Background(), envTask("x"))
+	if err == nil || errors.Is(err, controller.ErrWaitingForCapacity) {
+		t.Fatalf("expected a plain memory-cap failure from the default, got %v", err)
+	}
+	if reconciled.Status.Phase != "Failed" {
+		t.Errorf("expected phase Failed, got %q", reconciled.Status.Phase)
+	}
+	if len(mockSrv.createdAtespaces) != 0 {
+		t.Errorf("expected zero Substrate calls, got atespaces=%v", mockSrv.createdAtespaces)
+	}
+}
+
+// A supervisor task ignores DefaultTaskMemory. It always sets its own
+// explicit limit; validateSupervisorTask enforces that. So an oversized
+// default must not fail it.
+func TestTaskReconciler_SupervisorIgnoresDefaultMemoryCap(t *testing.T) {
+	mockSrv := &mockControlServer{}
+	r := newTestReconciler(t, mockSrv)
+	r.MaxTaskMemory = resource.MustParse("16Gi")
+	r.DefaultTaskMemory = "32Gi"
+
+	if _, err := r.Reconcile(context.Background(), supervisorTask()); err != nil {
+		t.Fatalf("supervisor task with its own 512Mi limit should not be affected by an oversized default: %v", err)
+	}
+}
+
+// With no cap configured, Reconcile keeps the existing WaitingForCapacity
+// path (A6): a task waits for capacity instead of failing, even above a
+// size that would exceed a configured cap.
+func TestTaskReconciler_NoMaxLeavesCapacityWaitUnchanged(t *testing.T) {
+	mockSrv := &mockControlServer{resumeErr: status.Error(codes.ResourceExhausted, "no free workers available")}
+	r := newTestReconciler(t, mockSrv)
+	task := envTask("x")
+	task.Spec.Resources = &v1alpha1.ResourceReqs{Limits: &v1alpha1.ResourceList{Memory: "32Gi"}}
+	reconciled, err := r.Reconcile(context.Background(), task)
+	if !errors.Is(err, controller.ErrWaitingForCapacity) {
+		t.Fatalf("expected ErrWaitingForCapacity, got %v", err)
+	}
+	if reconciled.Status.Phase != "Pending" {
+		t.Errorf("expected phase Pending, got %q", reconciled.Status.Phase)
 	}
 }
 

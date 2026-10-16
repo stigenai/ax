@@ -55,6 +55,38 @@ spec:
     # The 8Gi (8192Mi) request equals the average load per worker at 20
     # tasks. The calculation is 20/6*2200+400=7733Mi. This lets the scheduler
     # place workers by their real need.
+    #
+    # ax-768: the sizing above bounds the risk of random placement. That
+    # was the worst case this pool ever saw.
+    #
+    # Placement is no longer random. For each task, Substrate books a specified
+    # quantity against the reported memory limit of its worker.
+    # The env var AX_DEFAULT_TASK_MEMORY, in deploy/stigenai/kustomization.yaml,
+    # sets this quantity.
+    #
+    # ax-9qu increased this quantity from 4Gi to 7680Mi. A Claude Code session
+    # plus a Go or Node build must have more than 4Gi.
+    #
+    # At this time, a 16Gi (16384Mi) worker accepts at most 2 tasks.
+    # 2*7680Mi=15360Mi is less than 16384Mi. 3*7680Mi=23040Mi is more than
+    # 16384Mi.
+    #
+    # 6 workers accept 12 tasks in total. A 13th task on a full pool waits.
+    # Its phase is Pending, with reason WaitingForCapacity. It is not put
+    # on a full worker.
+    #
+    # This same booked quantity is also the hard cgroup memory cap of the task
+    # (ax-768). ax-j8u tells Substrate to divide booking from cap.
+    #
+    # 2*7680Mi plus about 400Mi for ateom itself is 15760Mi. That is less than
+    # the 16384Mi pod limit. So 2 tasks at their own cap do not also cause an
+    # OOM in the pod around them.
+    #
+    # ax-9gp: AX_MAX_TASK_MEMORY is set in
+    # deploy/stigenai/kustomization.yaml, on both ax-server and
+    # ax-controller. It must equal this limits.memory value.
+    # A task that asks for more gets a clear Failed status.
+    # It does not wait forever for a worker that can never fit it.
     resources:
       limits:
         cpu: "4"

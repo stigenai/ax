@@ -291,6 +291,48 @@ func (s *Store) UpdateTaskStatus(ctx context.Context, atespace, name string, sta
 	}, key)
 }
 
+// UpdateTaskStatusIf writes status only when expect reports true for the
+// task's current status. See store.Store for the full contract. The read
+// and the write happen in the same WATCH transaction as UpdateTaskStatus,
+// so a concurrent write between the check and this one aborts the
+// transaction instead of silently winning.
+func (s *Store) UpdateTaskStatusIf(ctx context.Context, atespace, name string, expect func(*v1alpha1.TaskStatus) bool, status *v1alpha1.TaskStatus) (bool, error) {
+	if atespace == "" {
+		atespace = "default"
+	}
+	key := s.taskKey(atespace, name)
+	applied := false
+	err := s.client.Watch(ctx, func(tx *redis.Tx) error {
+		applied = false
+		task, err := taskForDelete(ctx, tx, key)
+		if err != nil {
+			return err
+		}
+		if !expect(task.Status) {
+			return nil
+		}
+		if task.GetSpec().GetSupervisorProfile() != "" && task.GetStatus().GetPhase() == v1alpha1.PhaseTerminating {
+			return nil
+		}
+		task.Status = status
+		data, err := jsonMarshalOpts.Marshal(task)
+		if err != nil {
+			return err
+		}
+		_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+			pipe.Set(ctx, key, data, s.opts.TTL)
+			pipe.Publish(ctx, s.taskPubSubChannel(atespace, name), data)
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		applied = true
+		return nil
+	}, key)
+	return applied, err
+}
+
 // MarkTaskDeleting flips the task to the Terminating phase, notifies watchers, and
 // publishes a delete event for the controller. The record stays until DeleteTask.
 func (s *Store) MarkTaskDeleting(ctx context.Context, atespace, name string, preconditions ...store.TaskDeletePreconditions) error {
@@ -379,6 +421,43 @@ func (s *Store) DeleteTask(ctx context.Context, atespace, name string, precondit
 		})
 		return err
 	}, key)
+}
+
+// RequeueTask publishes a new reconcile event for an existing task, without
+// touching the stored record. The stream entry is the same shape SaveTask
+// publishes, so a worker handles it the same way.
+func (s *Store) RequeueTask(ctx context.Context, atespace, name string) error {
+	if atespace == "" {
+		atespace = "default"
+	}
+	return s.client.XAdd(ctx, &redis.XAddArgs{
+		Stream: s.opts.StreamName,
+		Values: map[string]interface{}{
+			"action":   "reconcile",
+			"atespace": atespace,
+			"name":     name,
+		},
+	}).Err()
+}
+
+// RequeueTaskDeletion publishes a new delete event carrying p, marked
+// retry=1, without touching the stored task record. The stream entry has the
+// same shape MarkTaskDeleting publishes, so a worker handles it the same way.
+func (s *Store) RequeueTaskDeletion(ctx context.Context, atespace, name string, p store.TaskDeletePreconditions) error {
+	if atespace == "" {
+		atespace = "default"
+	}
+	return s.client.XAdd(ctx, &redis.XAddArgs{
+		Stream: s.opts.StreamName,
+		Values: map[string]interface{}{
+			"action":             "delete",
+			"atespace":           atespace,
+			"name":               name,
+			"actor_uid":          p.ActorUID,
+			"creation_timestamp": p.CreationTimestamp,
+			"retry":              "1",
+		},
+	}).Err()
 }
 
 // SaveModel stores a model.
@@ -726,6 +805,9 @@ func eventFromMessage(msg redis.XMessage) store.TaskEvent {
 	}
 	ev.Deletion.ActorUID, _ = msg.Values["actor_uid"].(string)
 	ev.Deletion.CreationTimestamp, _ = msg.Values["creation_timestamp"].(string)
+	if retry, ok := msg.Values["retry"].(string); ok {
+		ev.Retry = retry == "1"
+	}
 	return ev
 }
 

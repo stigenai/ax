@@ -66,6 +66,10 @@ type TaskEvent struct {
 	Name     string
 	Action   string // "reconcile", "delete"
 	Deletion TaskDeletePreconditions
+	// Retry marks a delete event republished after an earlier delivery of the
+	// same deletion failed to reconcile. A worker uses it to tell a stale
+	// replay (the task is no longer Terminating) from a fresh request.
+	Retry bool
 }
 
 // EventQueue delivers task events to groups of cooperating workers. Every event
@@ -95,6 +99,16 @@ type Store interface {
 	GetTask(ctx context.Context, atespace, name string) (*v1alpha1.Task, error)
 	ListTasks(ctx context.Context, atespace string, limit, offset int64) ([]*v1alpha1.Task, error)
 	UpdateTaskStatus(ctx context.Context, atespace, name string, status *v1alpha1.TaskStatus) error
+	// UpdateTaskStatusIf writes status only when expect reports true for the
+	// task's current stored status. It reads and writes in one transaction.
+	// This stops a stale caller from overwriting a status change that
+	// landed in between. When expect returns false, it returns applied=false
+	// and a nil error: it leaves the task unchanged and notifies no watcher.
+	// It returns ErrNotFound when the task does not exist. A caller uses it
+	// to mark a task Failed only when it is still in the phase the caller
+	// last observed, for example the liveness sweep's ActorLost write racing
+	// a concurrent SaveTask.
+	UpdateTaskStatusIf(ctx context.Context, atespace, name string, expect func(*v1alpha1.TaskStatus) bool, status *v1alpha1.TaskStatus) (applied bool, err error)
 	// MarkTaskDeleting begins a two-phase delete: the task's phase becomes
 	// "Terminating" and a delete event is published for the controller, which
 	// removes the actor and then calls DeleteTask. Returns ErrNotFound if the
@@ -103,6 +117,18 @@ type Store interface {
 	// DeleteTask removes the task record. It publishes no event; callers are
 	// expected to have cleaned up the task's actor first.
 	DeleteTask(ctx context.Context, atespace, name string, preconditions ...TaskDeletePreconditions) error
+	// RequeueTask publishes a new reconcile event for an existing task without
+	// changing its stored record. A worker calls it to retry a task that found
+	// Substrate out of capacity, and at startup to retry every task a previous
+	// process left waiting for capacity.
+	RequeueTask(ctx context.Context, atespace, name string) error
+	// RequeueTaskDeletion publishes a new delete event for atespace/name. The
+	// event carries p, the same preconditions as the original MarkTaskDeleting
+	// call. It marks the event Retry. It does not change the stored task
+	// record. A worker calls it after a failed ReconcileDelete, after a
+	// backoff. A worker also calls it at startup, to retry each task a
+	// previous process left Terminating.
+	RequeueTaskDeletion(ctx context.Context, atespace, name string, p TaskDeletePreconditions) error
 
 	SaveWorkspace(ctx context.Context, ws *v1alpha1.Workspace) error
 	GetWorkspace(ctx context.Context, atespace, name string) (*v1alpha1.Workspace, error)
