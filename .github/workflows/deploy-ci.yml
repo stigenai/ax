@@ -43,7 +43,9 @@ jobs:
           --health-retries 10
 
     env:
-      AX_DELETE_TEST_REDIS_ADDRESS: 127.0.0.1:6379
+      # ax-kky.3 gate proof: DO NOT MERGE. Emptied on purpose so the
+      # Redis-gated store tests skip and the guard step below fails.
+      AX_DELETE_TEST_REDIS_ADDRESS: ""
 
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
