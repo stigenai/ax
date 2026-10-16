@@ -147,6 +147,52 @@ func TestSuspendTaskSurvivesMarkTaskDeletingRace(t *testing.T) {
 	}
 }
 
+// ax-bsl.11: SuspendTask must make the store emit a reconcile TaskEvent, the
+// same way the old SaveTask-based SuspendTask did. Without it, the worker
+// never reconciles the task, so SuspendActor never runs on Substrate: the
+// task's Spec.Suspend flips, but the actor keeps running.
+func TestSuspendTaskEmitsReconcileEvent(t *testing.T) {
+	ctx := context.Background()
+	memStore := memory.NewStore()
+	if err := memStore.SaveTask(ctx, &v1alpha1.Task{Metadata: &v1alpha1.ObjectMeta{Name: "job", Atespace: "default"}}); err != nil {
+		t.Fatal(err)
+	}
+	sub, err := memStore.Subscribe(ctx, "ax-controllers", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	drainCtx, drainCancel := context.WithTimeout(ctx, time.Second)
+	if _, err := sub.Next(drainCtx); err != nil {
+		drainCancel()
+		t.Fatalf("did not see SaveTask's own reconcile event: %v", err)
+	}
+	drainCancel()
+
+	srv := server.NewServer(memStore)
+	if _, err := srv.SuspendTask(ctx, &v1alpha1.SuspendTaskRequest{Atespace: "default", Name: "job"}); err != nil {
+		t.Fatal(err)
+	}
+
+	nextCtx, nextCancel := context.WithTimeout(ctx, time.Second)
+	ev, err := sub.Next(nextCtx)
+	nextCancel()
+	if err != nil {
+		t.Fatalf("SuspendTask emitted no reconcile event: %v", err)
+	}
+	if ev.Action != "reconcile" || ev.Name != "job" {
+		t.Fatalf("SuspendTask emitted the wrong event: %+v", ev)
+	}
+
+	emptyCtx, emptyCancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	if _, err := sub.Next(emptyCtx); err == nil {
+		emptyCancel()
+		t.Fatal("SuspendTask emitted a second event")
+	}
+	emptyCancel()
+}
+
 func TestServerHealthzHTTP(t *testing.T) {
 	memStore := memory.NewStore()
 	srv := server.NewServer(memStore)
