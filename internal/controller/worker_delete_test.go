@@ -337,6 +337,22 @@ func (s *gateRequeueStore) RequeueTaskDeletion(ctx context.Context, atespace, na
 	return err
 }
 
+// notifyRequeueStore wraps a store.Store and reports each RequeueTaskDeletion
+// call on notify, right after forwarding it to the real store. A test uses
+// it to learn, without a sleep, that a delete-retry goroutine reached its
+// republish call, which always runs after that goroutine's own clearOwnMark
+// (ax-706.10).
+type notifyRequeueStore struct {
+	store.Store
+	notify chan struct{}
+}
+
+func (s *notifyRequeueStore) RequeueTaskDeletion(ctx context.Context, atespace, name string, p store.TaskDeletePreconditions) error {
+	err := s.Store.RequeueTaskDeletion(ctx, atespace, name, p)
+	s.notify <- struct{}{}
+	return err
+}
+
 // TestDeleteRetryChainSurvivesFastFailureOnRepublishedEvent covers
 // ax-706.10: a retry chain's republished delete event can reach
 // processEvent and fail again before the chain's own goroutine finishes its
@@ -352,7 +368,11 @@ func TestDeleteRetryChainSurvivesFastFailureOnRepublishedEvent(t *testing.T) {
 	}
 	client := newDeletionTestClient(t, control)
 
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	// Chain 2's deleteAfter channel never fires. The test asserts before
+	// chain 2 needs to wake. Cleanup cancels ctx, which ends its goroutine.
+	t.Cleanup(cancel)
+
 	base := memory.NewStore()
 	created := time.Now().UTC()
 	task := &v1alpha1.Task{Metadata: &v1alpha1.ObjectMeta{Name: "stuck", Atespace: "default", CreationTimestamp: timestamppb.New(created)}}
@@ -372,8 +392,20 @@ func TestDeleteRetryChainSurvivesFastFailureOnRepublishedEvent(t *testing.T) {
 
 	gs := &gateRequeueStore{Store: base, published: make(chan struct{}, 4), release: make(chan struct{})}
 	worker := NewWorker(gs, NewTaskReconciler(client, "default-template", "ax-system"), "", "")
-	worker.DeleteBackoffBase = 10 * time.Millisecond
-	worker.DeleteBackoffMax = 10 * time.Millisecond
+
+	// Chain 1 wakes on wake1, which this test closes by hand. Chain 2 (the
+	// republished event's own retry chain) gets a channel that never fires,
+	// so it stays asleep for the rest of this test: no sleep can race it.
+	wake1 := make(chan time.Time)
+	never := make(chan time.Time)
+	var calls int
+	worker.deleteAfter = func(time.Duration) <-chan time.Time {
+		calls++
+		if calls == 1 {
+			return wake1
+		}
+		return never
+	}
 
 	next := func() store.TaskEvent {
 		c, cancel := context.WithTimeout(ctx, 2*time.Second)
@@ -385,12 +417,13 @@ func TestDeleteRetryChainSurvivesFastFailureOnRepublishedEvent(t *testing.T) {
 		return ev
 	}
 
-	// First delivery fails. Chain 1 starts and sleeps on its backoff.
+	// First delivery fails. Chain 1 starts and waits on wake1.
 	if err := worker.processEvent(ctx, next()); err != nil {
 		t.Fatalf("first delivery: %v", err)
 	}
 
-	<-gs.published // Chain 1 woke and is republishing; its RequeueTaskDeletion call is gated.
+	close(wake1)   // Let chain 1 wake, clear its own mark, and republish.
+	<-gs.published // Chain 1 is republishing; its RequeueTaskDeletion call is gated.
 
 	// The republished event reaches processEvent and fails again, while
 	// chain 1's own call is still blocked in the gate.
@@ -398,19 +431,18 @@ func TestDeleteRetryChainSurvivesFastFailureOnRepublishedEvent(t *testing.T) {
 		t.Fatalf("republished delivery: %v", err)
 	}
 
-	close(gs.release) // Let chain 1's call return.
-	time.Sleep(50 * time.Millisecond)
-
 	worker.deleteMu.Lock()
+	attempts := worker.deleteAttempts["default/stuck"]
 	_, pending := worker.deletePending["default/stuck"]
 	worker.deleteMu.Unlock()
-	if !pending {
-		c, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
-		defer cancel()
-		if _, err := sub.Next(c); err != nil {
-			t.Fatalf("retry chain lost: no pending chain and no further delete event after a failed republish (err=%v)", err)
-		}
+	if attempts != 2 {
+		t.Fatalf("want deleteAttempts=2 right after the second failure, got %d: the second failure found chain 1's mark still pending and dropped its own retry", attempts)
 	}
+	if !pending {
+		t.Fatal("want a chain 2 pending mark right after the second processEvent call")
+	}
+
+	close(gs.release) // Let chain 1's call return; nothing further depends on it.
 }
 
 // TestClearDeleteBackoffDoesNotLoseANewerChainsMark covers ax-706.10's
@@ -418,39 +450,64 @@ func TestDeleteRetryChainSurvivesFastFailureOnRepublishedEvent(t *testing.T) {
 // goroutine still sleeps on a stale backoff. That old goroutine must not
 // clear a newer chain's pending mark when it later wakes.
 func TestClearDeleteBackoffDoesNotLoseANewerChainsMark(t *testing.T) {
-	ctx := context.Background()
-	w := &Worker{store: memory.NewStore()}
+	ctx, cancel := context.WithCancel(context.Background())
+	// Chain 2's deleteAfter channel never fires. The test asserts before
+	// chain 2 needs to wake. Cleanup cancels ctx, which ends its goroutine.
+	t.Cleanup(cancel)
 
-	// Chain 1 starts with a short backoff and sleeps.
-	w.DeleteBackoffBase = 20 * time.Millisecond
-	w.DeleteBackoffMax = 20 * time.Millisecond
+	woke := make(chan struct{}, 1)
+	w := &Worker{store: &notifyRequeueStore{Store: memory.NewStore(), notify: woke}}
+
+	// Chain 1 wakes on wake1, which this test closes by hand. Chain 2 gets
+	// a channel that never fires, so it stays asleep for the rest of this
+	// test: no sleep can race it.
+	wake1 := make(chan time.Time)
+	never := make(chan time.Time)
+	var calls int
+	w.deleteAfter = func(time.Duration) <-chan time.Time {
+		calls++
+		if calls == 1 {
+			return wake1
+		}
+		return never
+	}
+
+	// Chain 1 starts and waits on wake1.
 	w.scheduleDeleteRetry(ctx, "private", "job", store.TaskDeletePreconditions{}, errors.New("boom"))
+	w.deleteMu.Lock()
+	chain1Seq := w.deletePending["private/job"]
+	w.deleteMu.Unlock()
 
 	// The delete succeeds through a separate path before chain 1 wakes.
 	w.clearDeleteBackoff("private", "job")
 
-	// Chain 2 starts right away, for a fresh failure of the same key, with a
-	// backoff long enough to still be asleep when chain 1 wakes.
-	w.DeleteBackoffBase = 300 * time.Millisecond
-	w.DeleteBackoffMax = 300 * time.Millisecond
+	// Chain 2 starts right away, for a fresh failure of the same key.
 	w.scheduleDeleteRetry(ctx, "private", "job", store.TaskDeletePreconditions{}, errors.New("boom again"))
 
 	w.deleteMu.Lock()
-	chain2Gen, ok := w.deletePending["private/job"]
+	chain2Seq, ok := w.deletePending["private/job"]
 	w.deleteMu.Unlock()
-	if !ok || chain2Gen == 0 {
+	if !ok || chain2Seq == 0 {
 		t.Fatal("chain 2 did not mark itself pending")
 	}
+	if chain1Seq == chain2Seq {
+		t.Fatalf("chain 1 and chain 2 got the same sequence number: %d", chain1Seq)
+	}
 
-	// Wait past chain 1's 20ms backoff, well short of chain 2's 300ms one:
-	// chain 1 wakes first and must not touch chain 2's mark.
-	time.Sleep(80 * time.Millisecond)
+	// Let chain 1 wake. Wait for its republish, past its own clearOwnMark
+	// call, instead of a fixed sleep.
+	close(wake1)
+	select {
+	case <-woke:
+	case <-time.After(2 * time.Second):
+		t.Fatal("chain 1 never woke and republished")
+	}
 
 	w.deleteMu.Lock()
-	gen, pending := w.deletePending["private/job"]
+	seq, pending := w.deletePending["private/job"]
 	w.deleteMu.Unlock()
-	if !pending || gen != chain2Gen {
-		t.Fatalf("chain 1 cleared chain 2's mark on waking: pending=%v gen=%d want chain 2's gen %d", pending, gen, chain2Gen)
+	if !pending || seq != chain2Seq {
+		t.Fatalf("chain 1 cleared chain 2's mark on waking: pending=%v seq=%d want chain 2's seq %d", pending, seq, chain2Seq)
 	}
 }
 
