@@ -109,8 +109,20 @@ type Store interface {
 	// It returns ErrNotFound when the task does not exist. A caller uses it
 	// to mark a task Failed only when it is still in the phase the caller
 	// last observed, for example the liveness sweep's ActorLost write racing
-	// a concurrent SaveTask.
+	// a concurrent SaveTask. Like UpdateTaskStatus, it returns applied=false
+	// on any task whose stored phase is already "Terminating" (ax-bsl.7),
+	// for every task, not only a supervisor task.
 	UpdateTaskStatusIf(ctx context.Context, atespace, name string, expect func(*v1alpha1.TaskStatus) bool, status *v1alpha1.TaskStatus) (applied bool, err error)
+	// UpdateTaskSuspend sets task.Spec.Suspend in one atomic write and
+	// returns the updated task. It does not read the task's status into
+	// a copy, then write that copy back. So a status snapshot taken
+	// before a concurrent MarkTaskDeleting call cannot overwrite the new
+	// "Terminating" phase. SuspendTask and ResumeTask use this method,
+	// not the old GetTask-then-SaveTask sequence. That old sequence
+	// raced MarkTaskDeleting and could clear Terminating back to the
+	// earlier status (ax-bsl.9). This method returns ErrNotFound when
+	// the task does not exist.
+	UpdateTaskSuspend(ctx context.Context, atespace, name string, suspend bool) (*v1alpha1.Task, error)
 	// MarkTaskDeleting begins a two-phase delete: the task's phase becomes
 	// "Terminating" and a delete event is published for the controller, which
 	// removes the actor and then calls DeleteTask. Returns ErrNotFound if the
