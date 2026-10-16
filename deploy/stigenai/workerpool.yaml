@@ -90,6 +90,9 @@ spec:
     # A task that asks for more gets a clear Failed status.
     # It does not wait forever for a worker that can never fit it.
     #
+    # ax-6cj: AX_MAX_TASK_CPU is the cpu twin of AX_MAX_TASK_MEMORY above.
+    # It is set the same way. It must equal this limits.cpu value (6).
+    #
     # ax-1iw: The cpu request of 500m and the limit of 4 throttled the workers.
     # The workers ran 2 tasks at once.
     #

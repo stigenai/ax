@@ -48,6 +48,15 @@ patches:
                   # See the reverse note there.
                   - name: AX_MAX_TASK_MEMORY
                     value: 16Gi
+                  #
+                  # ax-6cj: the cpu twin of AX_MAX_TASK_MEMORY above.
+                  # Reconcile fails a task above this value with reason
+                  # CPUExceedsCapacity, instead of a WaitingForCapacity loop.
+                  # This value must equal limits.cpu in
+                  # deploy/stigenai/workerpool.yaml (6); see the reverse
+                  # note there.
+                  - name: AX_MAX_TASK_CPU
+                    value: "6"
   - patch: |-
       apiVersion: apps/v1
       kind: Deployment
@@ -67,3 +76,12 @@ patches:
                   # note there.
                   - name: AX_MAX_TASK_MEMORY
                     value: 16Gi
+                  #
+                  # ax-6cj: the cpu twin of AX_MAX_TASK_MEMORY above.
+                  # UpdateTask rejects a task above this value at
+                  # create/update time, before it ever reaches ax-controller.
+                  # This must equal limits.cpu in
+                  # deploy/stigenai/workerpool.yaml (6); see the reverse
+                  # note there.
+                  - name: AX_MAX_TASK_CPU
+                    value: "6"
