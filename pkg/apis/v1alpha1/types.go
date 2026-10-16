@@ -309,6 +309,43 @@ func validateResourceReqs(spec *TaskSpec) error {
 	return nil
 }
 
+// ValidateTaskMemoryCap rejects a task whose effective memory limit exceeds
+// max. The max value is the largest task that any worker can hold.
+// A zero max disables the check.
+// If max is zero, a deployment without a cap behaves as it did before this
+// check existed.
+//
+// The effective memory is spec.resources.limits.memory.
+// If a non-supervisor task sets no limit, the function uses defaultMemory instead.
+// The defaultMemory value is the caller's AX_DEFAULT_TASK_MEMORY.
+// A supervisor task ignores defaultMemory.
+// This matches how ax-controller books memory for a supervisor task.
+//
+// A limit equal to max passes.
+// ValidateTask rejects a limit that does not parse before this function runs.
+// If parsing fails here, the function treats the task as having no limit.
+func ValidateTaskMemoryCap(t *Task, defaultMemory string, max resource.Quantity) error {
+	if max.IsZero() {
+		return nil
+	}
+	spec := t.GetSpec()
+	memory := spec.GetResources().GetLimits().GetMemory()
+	if memory == "" && spec.GetSupervisorProfile() == "" {
+		memory = defaultMemory
+	}
+	if memory == "" {
+		return nil
+	}
+	q, err := resource.ParseQuantity(memory)
+	if err != nil {
+		return nil
+	}
+	if q.Cmp(max) > 0 {
+		return fmt.Errorf("spec.resources.limits.memory: %q exceeds the largest task a worker can hold (%s)", memory, max.String())
+	}
+	return nil
+}
+
 func validateQuantity(field, value string) error {
 	if value == "" {
 		return nil

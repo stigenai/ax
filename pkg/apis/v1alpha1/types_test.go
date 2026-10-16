@@ -24,6 +24,7 @@ import (
 	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"gopkg.in/yaml.v3"
+	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 // fullTask returns a Task with every field populated so round trips exercise
@@ -450,6 +451,49 @@ func TestValidateTaskResources(t *testing.T) {
 				Resources: &v1alpha1.ResourceReqs{Limits: &v1alpha1.ResourceList{Cpu: tt.cpu, Memory: tt.memory}},
 			}
 			err := v1alpha1.ValidateTask(&v1alpha1.Task{Spec: spec})
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("error = %v, want containing %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateTaskMemoryCap(t *testing.T) {
+	tests := []struct {
+		name          string
+		memory        string
+		supervisor    bool
+		defaultMemory string
+		max           string
+		wantErr       string
+	}{
+		{name: "no max set disables the check", memory: "32Gi", max: ""},
+		{name: "equal to max passes", memory: "16Gi", max: "16Gi"},
+		{name: "one Mi over max fails", memory: "16385Mi", max: "16Gi", wantErr: `spec.resources.limits.memory: "16385Mi" exceeds the largest task a worker can hold (16Gi)`},
+		{name: "well over max fails", memory: "32Gi", max: "16Gi", wantErr: `spec.resources.limits.memory: "32Gi" exceeds the largest task a worker can hold (16Gi)`},
+		{name: "no own limit falls back to the default, which fails", defaultMemory: "32Gi", max: "16Gi", wantErr: `exceeds the largest task a worker can hold (16Gi)`},
+		{name: "a supervisor task ignores the default", supervisor: true, defaultMemory: "32Gi", max: "16Gi"},
+		{name: "no limit and no default passes", max: "16Gi"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			spec := &v1alpha1.TaskSpec{
+				Resources: &v1alpha1.ResourceReqs{Limits: &v1alpha1.ResourceList{Memory: tt.memory}},
+			}
+			if tt.supervisor {
+				spec.SupervisorProfile = v1alpha1.FabriekSupervisorProfile
+			}
+			var max resource.Quantity
+			if tt.max != "" {
+				max = resource.MustParse(tt.max)
+			}
+			err := v1alpha1.ValidateTaskMemoryCap(&v1alpha1.Task{Spec: spec}, tt.defaultMemory, max)
 			if tt.wantErr == "" {
 				if err != nil {
 					t.Fatalf("unexpected error: %v", err)
