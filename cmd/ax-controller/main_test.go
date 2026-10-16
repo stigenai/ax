@@ -320,3 +320,50 @@ func TestResolveDeleteSweepMinAge(t *testing.T) {
 		})
 	}
 }
+
+// TestClaimMinIdleFlagDefault pins --stream-claim-min-idle's default at 5
+// minutes (ax-bsl AC7), matching the redis store's own default.
+func TestClaimMinIdleFlagDefault(t *testing.T) {
+	if claimMinIdleDefault != 5*time.Minute {
+		t.Fatalf("claimMinIdleDefault = %v, want 5m", claimMinIdleDefault)
+	}
+	got, err := resolveClaimMinIdle(claimMinIdleDefault, "")
+	if err != nil {
+		t.Fatalf("resolveClaimMinIdle(%v, \"\") returned an unexpected error: %v", claimMinIdleDefault, err)
+	}
+	if got != 5*time.Minute {
+		t.Fatalf("resolveClaimMinIdle(%v, \"\") = %v, want 5m", claimMinIdleDefault, got)
+	}
+}
+
+func TestResolveClaimMinIdle(t *testing.T) {
+	cases := []struct {
+		name      string
+		flagValue time.Duration
+		envValue  string
+		want      time.Duration
+		wantErr   bool
+	}{
+		{name: "no env keeps the flag default", flagValue: 5 * time.Minute, envValue: "", want: 5 * time.Minute},
+		{name: "an env override parses and replaces the flag value", flagValue: 5 * time.Minute, envValue: "2m", want: 2 * time.Minute},
+		{name: "a negative env value turns reclaim off", flagValue: 5 * time.Minute, envValue: "-1s", want: -1 * time.Second},
+		{name: "an env value that does not parse as a duration is an error", flagValue: 5 * time.Minute, envValue: "not-a-duration", wantErr: true},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := resolveClaimMinIdle(tt.flagValue, tt.envValue)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("resolveClaimMinIdle(%v, %q) = %v, nil; want an error", tt.flagValue, tt.envValue, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolveClaimMinIdle(%v, %q) returned an unexpected error: %v", tt.flagValue, tt.envValue, err)
+			}
+			if got != tt.want {
+				t.Fatalf("resolveClaimMinIdle(%v, %q) = %v, want %v", tt.flagValue, tt.envValue, got, tt.want)
+			}
+		})
+	}
+}
