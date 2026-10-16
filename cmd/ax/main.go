@@ -1021,6 +1021,23 @@ func runTunnel(args []string) error {
 	}
 }
 
+// taskGetter fetches the current state of one task.
+//
+// Production code closes over the real AX client and the task's atespace
+// and name. A test can give a fake taskGetter instead. The fake lets the
+// test check routing with no live ax-server and no cluster.
+type taskGetter func(ctx context.Context) (*v1alpha1.Task, error)
+
+// routerDialer connects to the Substrate atenet-router.
+//
+// It returns the dial endpoint and a cleanup function. The cleanup function
+// is nil when the dialer needs no cleanup.
+//
+// Production code port-forwards to svc/atenet-router in the ate-system
+// namespace. A test can give a fake routerDialer backed by a local listener
+// instead. The fake lets the test prove routing with no kubectl call.
+type routerDialer func() (endpoint string, cleanup func(), err error)
+
 func runSSH(serverURL, atespace, kubeContext string, args []string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("usage: ax ssh <task-name> [-- command...]")
@@ -1047,13 +1064,31 @@ func runSSH(serverURL, atespace, kubeContext string, args []string) error {
 	}
 	defer conn.Close()
 
+	getTask := func(ctx context.Context) (*v1alpha1.Task, error) {
+		return client.GetTask(ctx, &v1alpha1.GetTaskRequest{
+			Atespace: atespace,
+			Name:     taskName,
+		})
+	}
+	dialRouter := func() (string, func(), error) {
+		localPort, pfCleanup, err := tunnel.PortForward(context.Background(), kubeContext, "ate-system", "svc/atenet-router", 80)
+		if err != nil {
+			return "", nil, err
+		}
+		return fmt.Sprintf("127.0.0.1:%d", localPort), pfCleanup, nil
+	}
+
+	return runSSHExec(taskName, cmdToRun, getTask, dialRouter, os.Stdout, os.Stderr)
+}
+
+// runSSHExec connects to taskName's guest and runs cmdToRun, streaming output
+// to stdout and stderr. getTask and dialRouter are the only two seams: every
+// other dependency (argument parsing, process exit) stays in runSSH.
+func runSSHExec(taskName string, cmdToRun []string, getTask taskGetter, dialRouter routerDialer, stdout, stderr io.Writer) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	task, err := client.GetTask(ctx, &v1alpha1.GetTaskRequest{
-		Atespace: atespace,
-		Name:     taskName,
-	})
+	task, err := getTask(ctx)
 	if err != nil {
 		return fmt.Errorf("fetching task %q: %w", taskName, err)
 	}
@@ -1102,12 +1137,11 @@ func runSSH(serverURL, atespace, kubeContext string, args []string) error {
 		}
 	} else {
 		// 2. Connect via the Substrate atenet-router service in ate-system (port 80)
-		localPort, pfCleanup, err := tunnel.PortForward(context.Background(), kubeContext, "ate-system", "svc/atenet-router", 80)
+		routerEndpoint, pfCleanup, err := dialRouter()
 		if err != nil {
 			return fmt.Errorf("establishing port-forward to atenet-router: %w", err)
 		}
 		cleanup = pfCleanup
-		routerEndpoint := fmt.Sprintf("127.0.0.1:%d", localPort)
 		guestClient, err = guest.DialTarget(routerEndpoint, targetActor)
 		if err != nil {
 			return fmt.Errorf("connecting to guest via atenet-router at %s: %w", routerEndpoint, err)
@@ -1121,8 +1155,8 @@ func runSSH(serverURL, atespace, kubeContext string, args []string) error {
 
 	exitCode, err := guestClient.Exec(context.Background(), guest.ExecOptions{
 		Command: cmdToRun,
-		Stdout:  os.Stdout,
-		Stderr:  os.Stderr,
+		Stdout:  stdout,
+		Stderr:  stderr,
 	})
 	if err != nil {
 		return err
