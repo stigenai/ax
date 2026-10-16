@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -32,6 +33,15 @@ const (
 	defaultStreamName    = "ax:stream:tasks"
 	defaultReadBatchSize = 10
 	defaultReadBlock     = 2 * time.Second
+	// defaultClaimMinIdle is how long a pending entry sits unacknowledged
+	// before another consumer in the group may reclaim it.
+	defaultClaimMinIdle = 5 * time.Minute
+	// defaultClaimInterval is the minimum time between XAUTOCLAIM calls from
+	// one subscription when a scan finds nothing to claim.
+	defaultClaimInterval = 30 * time.Second
+	// defaultMaxDeliveries is how many times a task event may be delivered
+	// before a subscription drops it as poison.
+	defaultMaxDeliveries = 5
 )
 
 var (
@@ -50,6 +60,23 @@ type Options struct {
 	// ReadBlock is how long one XREADGROUP call waits for events before returning
 	// empty. Shorter values make shutdown more responsive at the cost of more calls.
 	ReadBlock time.Duration
+
+	// ClaimMinIdle sets the idle time before a subscription may steal a
+	// pending entry from its consumer, with XAUTOCLAIM.
+	// Zero uses the default: 5 minutes.
+	// A negative value turns reclaim off.
+	// Then a dead consumer's pending entries stay pending forever.
+	ClaimMinIdle time.Duration
+	// ClaimInterval sets the least time between XAUTOCLAIM scans.
+	// A subscription waits this long after a scan finds nothing to claim.
+	// Zero uses the default: 30 seconds.
+	// This field has no effect when reclaim is off.
+	ClaimInterval time.Duration
+	// MaxDeliveries caps how many times a subscription may deliver the same
+	// event. A subscription acks and drops a claimed event past this count,
+	// so a poison event cannot crash-loop the process that reads it forever.
+	// Zero uses the default: 5.
+	MaxDeliveries int64
 }
 
 // Store is a Redis-backed implementation of store.Store.
@@ -71,6 +98,15 @@ func NewStore(client *redis.Client, opts Options) *Store {
 	}
 	if opts.ReadBlock <= 0 {
 		opts.ReadBlock = defaultReadBlock
+	}
+	if opts.ClaimMinIdle == 0 {
+		opts.ClaimMinIdle = defaultClaimMinIdle
+	}
+	if opts.ClaimInterval <= 0 {
+		opts.ClaimInterval = defaultClaimInterval
+	}
+	if opts.MaxDeliveries <= 0 {
+		opts.MaxDeliveries = defaultMaxDeliveries
 	}
 	return &Store{
 		client: client,
@@ -723,17 +759,29 @@ func (s *Store) Subscribe(ctx context.Context, group, consumer string) (store.Su
 	if err != nil && !strings.Contains(err.Error(), "BUSYGROUP") {
 		return nil, fmt.Errorf("creating consumer group %q: %w", group, err)
 	}
-	return &subscription{store: s, group: group, consumer: consumer}, nil
+	return &subscription{store: s, group: group, consumer: consumer, claimCursor: "0-0"}, nil
 }
 
-// subscription reads from a consumer group in batches and hands events out one
-// at a time. Delivery is at-least-once: an event stays in the group's pending
-// list until Ack is called for it.
+// subscription reads from a consumer group in batches.
+// It hands events out one at a time.
+// Delivery is at-least-once. An event stays in the group's pending list
+// until a caller acks it.
+// Another subscription in the group can also reclaim the event with
+// XAUTOCLAIM, once the event sits idle for ClaimMinIdle.
+// This can happen, for example, when the consumer that read the event dies
+// before it acks the event.
 type subscription struct {
 	store    *Store
 	group    string
 	consumer string
 	pending  []store.TaskEvent
+
+	// claimCursor is the XAUTOCLAIM scan cursor. "0-0" means the previous
+	// scan finished a full pass over the pending list.
+	claimCursor string
+	// lastClaim is the time claimCursor last returned to "0-0". It throttles
+	// how often an empty scan repeats.
+	lastClaim time.Time
 }
 
 func (sub *subscription) Next(ctx context.Context) (store.TaskEvent, error) {
@@ -752,9 +800,22 @@ func (sub *subscription) Next(ctx context.Context) (store.TaskEvent, error) {
 	return ev, nil
 }
 
-// read performs one blocking XREADGROUP call. It returns an empty slice, not an
-// error, when the block time elapses without events.
+// read returns the next batch of events. When reclaim is on (ClaimMinIdle >
+// 0), it first tries an XAUTOCLAIM scan for entries idle longer than
+// ClaimMinIdle; this picks up entries a dead consumer read but never acked.
+// Only when that finds nothing does it fall back to one blocking XREADGROUP
+// call for fresh entries. It returns an empty slice, not an error, when the
+// block time elapses without events.
 func (sub *subscription) read(ctx context.Context) ([]store.TaskEvent, error) {
+	if sub.store.opts.ClaimMinIdle > 0 {
+		events, err := sub.claim(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if len(events) > 0 {
+			return events, nil
+		}
+	}
 	streams, err := sub.store.client.XReadGroup(ctx, &redis.XReadGroupArgs{
 		Group:    sub.group,
 		Consumer: sub.consumer,
@@ -778,12 +839,90 @@ func (sub *subscription) read(ctx context.Context) ([]store.TaskEvent, error) {
 	return events, nil
 }
 
+// claim scans the group's pending list for entries idle longer than
+// ClaimMinIdle and reassigns them to this consumer with XAUTOCLAIM. It
+// resumes the scan from sub.claimCursor, so repeated calls walk the whole
+// pending list over several calls instead of rescanning it each time. Once a
+// scan completes a full pass (the returned cursor is "0-0"), claim waits at
+// least ClaimInterval before scanning again, so an idle group does not poll
+// XAUTOCLAIM in a tight loop.
+func (sub *subscription) claim(ctx context.Context) ([]store.TaskEvent, error) {
+	if sub.claimCursor == "0-0" && time.Since(sub.lastClaim) < sub.store.opts.ClaimInterval {
+		return nil, nil
+	}
+	msgs, cursor, err := sub.store.client.XAutoClaim(ctx, &redis.XAutoClaimArgs{
+		Stream:   sub.store.opts.StreamName,
+		Group:    sub.group,
+		Consumer: sub.consumer,
+		MinIdle:  sub.store.opts.ClaimMinIdle,
+		Start:    sub.claimCursor,
+		Count:    sub.store.opts.ReadBatchSize,
+	}).Result()
+	if err != nil {
+		return nil, fmt.Errorf("reclaiming idle task events: %w", err)
+	}
+	sub.claimCursor = cursor
+	if cursor == "0-0" {
+		sub.lastClaim = time.Now()
+	}
+	if len(msgs) == 0 {
+		return nil, nil
+	}
+
+	events := make([]store.TaskEvent, 0, len(msgs))
+	ids := make([]string, 0, len(msgs))
+	for _, msg := range msgs {
+		ev := eventFromMessage(msg)
+		dropped, err := sub.dropIfPoison(ctx, ev)
+		if err != nil {
+			return nil, err
+		}
+		if dropped {
+			continue
+		}
+		events = append(events, ev)
+		ids = append(ids, ev.ID)
+	}
+	if len(events) > 0 {
+		slog.Info("reclaimed idle task events", "consumer", sub.consumer, "count", len(events), "ids", ids)
+	}
+	return events, nil
+}
+
+// dropIfPoison checks ev's delivery count and, when it is past
+// Options.MaxDeliveries, acks and drops ev instead of returning it. This
+// stops an event that always crashes its processor from cycling between
+// consumers forever: it caps a poison event's cost at MaxDeliveries tries.
+func (sub *subscription) dropIfPoison(ctx context.Context, ev store.TaskEvent) (bool, error) {
+	pending, err := sub.store.client.XPendingExt(ctx, &redis.XPendingExtArgs{
+		Stream: sub.store.opts.StreamName,
+		Group:  sub.group,
+		Start:  ev.ID,
+		End:    ev.ID,
+		Count:  1,
+	}).Result()
+	if err != nil {
+		return false, fmt.Errorf("checking delivery count for task event %s: %w", ev.ID, err)
+	}
+	if len(pending) == 0 || pending[0].RetryCount <= sub.store.opts.MaxDeliveries {
+		return false, nil
+	}
+	deliveries := pending[0].RetryCount
+	if err := sub.store.client.XAck(ctx, sub.store.opts.StreamName, sub.group, ev.ID).Err(); err != nil {
+		return false, fmt.Errorf("acking poison task event %s: %w", ev.ID, err)
+	}
+	slog.Error("dropping task event after too many deliveries",
+		"id", ev.ID, "atespace", ev.Atespace, "name", ev.Name, "action", ev.Action, "deliveries", deliveries)
+	return true, nil
+}
+
 func (sub *subscription) Ack(ctx context.Context, ev store.TaskEvent) error {
 	return sub.store.client.XAck(ctx, sub.store.opts.StreamName, sub.group, ev.ID).Err()
 }
 
-// Close releases the subscription. The consumer is deliberately left registered
-// so that any events it had claimed but not acknowledged remain claimable.
+// Close releases the subscription. It deliberately leaves the consumer
+// registered, so another subscription in the group can reclaim with
+// XAUTOCLAIM any event this consumer read but did not ack.
 func (sub *subscription) Close() error {
 	return nil
 }

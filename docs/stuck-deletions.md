@@ -126,10 +126,42 @@ Follow these steps if one of these conditions is true:
    empty-precondition requeue fails `TaskDeletePreconditions.Check` for a
    supervisor task. Re-run `ax delete` with that task's identity by hand.
 
+## 5. Pending stream entries
+
+`ax-controller` reads the task event stream (`ax:stream:tasks`) through the
+Redis consumer group `ax-controllers`. A pod reads an event and dies before it
+acks the event. The entry stays pending under the consumer name of that pod,
+which is now dead. Since ax-bsl, another consumer reclaims the entry with
+`XAUTOCLAIM`. This happens after the entry is idle for more than
+`--stream-claim-min-idle` / `AX_STREAM_CLAIM_MIN_IDLE` (default 5 minutes).
+
+Check for stuck pending entries:
+
+```bash
+kubectl --context gtr -n ax-system exec -it deploy/ax-redis -- \
+  redis-cli XPENDING ax:stream:tasks ax-controllers - + 20
+```
+
+Each row lists `id`, `consumer`, `idle` (ms) and `deliveries`. After a rollout,
+wait for `--stream-claim-min-idle` (default 5 minutes) plus a little more time.
+Then read the result:
+
+- 0 entries, or only entries that belong to a consumer still in `XINFO CONSUMERS
+  ax:stream:tasks ax-controllers`: reclaim works as expected.
+- An entry is older than the threshold and still belongs to a dead consumer.
+  Reclaim is off (`AX_STREAM_CLAIM_MIN_IDLE` set to a negative value), or
+  `ax-controller` has not run long enough yet to scan it. Check the pod's
+  `starting ax-controller` startup log line for its `claimMinIdle` value.
+- A `level=error` line `dropping task event after too many deliveries`: a
+  poison event reached the retry cap (`MaxDeliveries`, default 5). The event
+  was dropped. It was not reclaimed again. The id, atespace, name and action
+  fields name the event.
+
 ## What the sweep does not do
 
 - The sweep never calls `DeleteActor` on a `DELETING` actor.
 - The sweep only lists actors (`internal/substrate/client.go` `Client.ListActors`).
 - The sweep has no actor UID or ownership check. A person makes that call.
-- The sweep does not fix lost Redis stream events from an `ax-controller`
-  rolling update (tracked separately as ax-bsl).
+- The sweep itself does not reclaim a lost Redis stream event from an
+  `ax-controller` rolling update. `XAUTOCLAIM` reclaim (ax-bsl) does that.
+  See "Pending stream entries" above.

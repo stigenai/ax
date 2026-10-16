@@ -72,9 +72,11 @@ type TaskEvent struct {
 	Retry bool
 }
 
-// EventQueue delivers task events to groups of cooperating workers. Every event
-// is delivered to exactly one member of a group, and stays pending until that
-// member acknowledges it, so a crashed worker's events can be picked up again.
+// EventQueue delivers task events to groups of cooperating workers. Every
+// event goes to exactly one member of a group. It stays pending until that
+// member acks it, or until another member reclaims it once it has sat
+// pending and unacked past the implementation's idle threshold. This lets a
+// surviving member pick up events a crashed worker read but never acked.
 type EventQueue interface {
 	// Subscribe joins group as consumer, creating the group if it does not exist.
 	// All members of a group share one stream of events.
