@@ -27,6 +27,7 @@ import (
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 	"gopkg.in/yaml.v3"
+	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 // DefaultTaskImage runs a Task that names no image. It is a var so
@@ -254,6 +255,9 @@ func ValidateTask(t *Task) error {
 	if spec == nil {
 		return nil
 	}
+	if err := validateResourceReqs(spec); err != nil {
+		return err
+	}
 	if err := validateSupervisorTask(spec); err != nil {
 		return err
 	}
@@ -290,6 +294,34 @@ var (
 	fabriekDigest  = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 	fabriekAttempt = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 )
+
+// validateResourceReqs rejects a resource limit that does not parse as a
+// Kubernetes quantity, or that parses to zero or less. An empty limit is
+// allowed: it means the caller set no limit for that dimension.
+func validateResourceReqs(spec *TaskSpec) error {
+	limits := spec.GetResources().GetLimits()
+	if err := validateQuantity("spec.resources.limits.cpu", limits.GetCpu()); err != nil {
+		return err
+	}
+	if err := validateQuantity("spec.resources.limits.memory", limits.GetMemory()); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateQuantity(field, value string) error {
+	if value == "" {
+		return nil
+	}
+	q, err := resource.ParseQuantity(value)
+	if err != nil {
+		return fmt.Errorf("%s: %q is not a valid quantity: %w", field, value, err)
+	}
+	if q.Sign() <= 0 {
+		return fmt.Errorf("%s: %q must be greater than zero", field, value)
+	}
+	return nil
+}
 
 func validateSupervisorTask(spec *TaskSpec) error {
 	if spec.GetSupervisorProfile() == "" {
