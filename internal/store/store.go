@@ -99,6 +99,16 @@ type Store interface {
 	GetTask(ctx context.Context, atespace, name string) (*v1alpha1.Task, error)
 	ListTasks(ctx context.Context, atespace string, limit, offset int64) ([]*v1alpha1.Task, error)
 	UpdateTaskStatus(ctx context.Context, atespace, name string, status *v1alpha1.TaskStatus) error
+	// UpdateTaskStatusIf writes status only when expect reports true for the
+	// task's current stored status. It reads and writes in one transaction.
+	// This stops a stale caller from overwriting a status change that
+	// landed in between. When expect returns false, it returns applied=false
+	// and a nil error: it leaves the task unchanged and notifies no watcher.
+	// It returns ErrNotFound when the task does not exist. A caller uses it
+	// to mark a task Failed only when it is still in the phase the caller
+	// last observed, for example the liveness sweep's ActorLost write racing
+	// a concurrent SaveTask.
+	UpdateTaskStatusIf(ctx context.Context, atespace, name string, expect func(*v1alpha1.TaskStatus) bool, status *v1alpha1.TaskStatus) (applied bool, err error)
 	// MarkTaskDeleting begins a two-phase delete: the task's phase becomes
 	// "Terminating" and a delete event is published for the controller, which
 	// removes the actor and then calls DeleteTask. Returns ErrNotFound if the
