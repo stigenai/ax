@@ -107,6 +107,28 @@ func (s *failNRequeueStore) RequeueTaskDeletion(ctx context.Context, atespace, n
 	return s.Store.RequeueTaskDeletion(ctx, atespace, name, p)
 }
 
+// failOnCallListTasksStore wraps a store.Store and fails exactly the call
+// numbered failOnCall (1-indexed) to ListTasks. It stands in for one bad
+// page, or one transient store outage, landing on a single sweep tick
+// (ax-706.7).
+type failOnCallListTasksStore struct {
+	store.Store
+	mu         sync.Mutex
+	calls      int
+	failOnCall int
+}
+
+func (s *failOnCallListTasksStore) ListTasks(ctx context.Context, atespace string, limit, offset int64) ([]*v1alpha1.Task, error) {
+	s.mu.Lock()
+	s.calls++
+	fail := s.calls == s.failOnCall
+	s.mu.Unlock()
+	if fail {
+		return nil, errors.New("simulated list tasks failure")
+	}
+	return s.Store.ListTasks(ctx, atespace, limit, offset)
+}
+
 // newDeletionTestClient starts an in-process Substrate control server and
 // returns a client dialed to it, mirroring worker_delete_test.go.
 func newDeletionTestClient(t *testing.T, control *deletionControlServer) *substrate.Client {
@@ -211,6 +233,87 @@ func TestDeleteSweepRequeuesAfterDroppedWorkerRetry(t *testing.T) {
 	}
 	if got := control.Attempts(); got != 2 {
 		t.Fatalf("want 2 DeleteActor attempts (1 failure + 1 success), got %d", got)
+	}
+}
+
+// TestDeleteSweepDoesNotMultiplyRetryChainsOnRepeatedFailure covers review
+// finding ax-706.6: a Substrate failure that outlasts several sweep ticks
+// must not grow one new scheduleDeleteRetry chain per tick. Each sweep
+// republish that lands while the worker's own chain still sleeps on its
+// backoff must join that chain, not start another one of its own.
+func TestDeleteSweepDoesNotMultiplyRetryChainsOnRepeatedFailure(t *testing.T) {
+	control := &deletionControlServer{
+		deletions:      make(chan *ateapipb.DeleteActorRequest, 16),
+		templates:      make(chan *ateapipb.ListActorTemplatesRequest, 16),
+		remainingFails: 1000, // DeleteActor never succeeds during this test.
+	}
+	client := newDeletionTestClient(t, control)
+
+	ctx := context.Background()
+	s := memory.NewStore()
+	created := time.Now().UTC()
+	task := &v1alpha1.Task{Metadata: &v1alpha1.ObjectMeta{Name: "stuck", Atespace: "default", CreationTimestamp: timestamppb.New(created)}}
+	if err := s.SaveTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+
+	sub, err := s.Subscribe(ctx, "test-group", "test-consumer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	drainN(t, sub, 1) // SaveTask's own reconcile event.
+
+	deletion := store.TaskDeletePreconditions{ActorUID: "actor-1", CreationTimestamp: created.Format(time.RFC3339Nano)}
+	if err := s.MarkTaskDeleting(ctx, "default", "stuck", deletion); err != nil {
+		t.Fatal(err)
+	}
+
+	worker := NewWorker(s, NewTaskReconciler(client, "default-template", "ax-system"), "", "")
+	// A backoff far longer than this test's own run time, so the worker's
+	// first chain is still sleeping (pending) when later sweep ticks land.
+	worker.DeleteBackoffBase = time.Minute
+	worker.DeleteBackoffMax = time.Minute
+
+	readCtx, readCancel := context.WithTimeout(ctx, 2*time.Second)
+	ev, err := sub.Next(readCtx)
+	readCancel()
+	if err != nil {
+		t.Fatalf("no initial delete event: %v", err)
+	}
+	if err := worker.processEvent(context.Background(), ev); err != nil {
+		t.Fatalf("processEvent on the first delivery: %v", err)
+	}
+
+	now := time.Now()
+	sweeper := &DeletionSweeper{Store: s, MinAge: 15 * time.Minute, Now: func() time.Time { return now }}
+	sweeper.SweepOnce(ctx) // seeds tracking for "default/stuck" at age 0.
+
+	// 3 more sweep ticks, each past MinAge, each landing while the first
+	// chain still sleeps on its 1-minute backoff.
+	for i := 0; i < 3; i++ {
+		now = now.Add(16 * time.Minute)
+		sweeper.SweepOnce(ctx)
+
+		tickCtx, tickCancel := context.WithTimeout(ctx, 2*time.Second)
+		tickEv, err := sub.Next(tickCtx)
+		tickCancel()
+		if err != nil {
+			t.Fatalf("tick %d: sweep did not requeue the stuck delete: %v", i, err)
+		}
+		if err := worker.processEvent(context.Background(), tickEv); err != nil {
+			t.Fatalf("tick %d: processEvent: %v", i, err)
+		}
+	}
+
+	worker.deleteMu.Lock()
+	chains := worker.deleteAttempts["default/stuck"]
+	pending := worker.deletePending["default/stuck"]
+	worker.deleteMu.Unlock()
+	if chains != 1 {
+		t.Fatalf("want 1 retry chain total despite 3 extra sweep-driven failures, got %d (each extra failure started its own chain)", chains)
+	}
+	if !pending {
+		t.Fatal("want the one chain still marked pending (its 1-minute backoff has not fired)")
 	}
 }
 
@@ -407,6 +510,63 @@ func TestDeleteSweepActorListErrorStillLogsTaskCounts(t *testing.T) {
 	}
 	if !strings.Contains(output, "actor_list_error=true") {
 		t.Fatalf("want actor_list_error=true, got: %s", output)
+	}
+}
+
+// TestDeleteSweepListTasksErrorKeepsAgeAndFlagsLine covers review finding
+// ax-706.7: a ListTasks failure on one tick must not reset the ages this
+// process already tracked, and must not make that tick's summary line read
+// as a false all-clear. The task still counts as stuck once a later tick
+// lists tasks again, at the age it had before the failed tick, and the
+// failed tick's own line must carry task_list_error=true.
+func TestDeleteSweepListTasksErrorKeepsAgeAndFlagsLine(t *testing.T) {
+	ctx := context.Background()
+	base := memory.NewStore()
+	task := &v1alpha1.Task{Metadata: &v1alpha1.ObjectMeta{Name: "stuck", Atespace: "default"}, Status: &v1alpha1.TaskStatus{Phase: v1alpha1.PhaseTerminating}}
+	if err := base.SaveTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	if err := base.UpdateTaskStatus(ctx, "default", "stuck", task.Status); err != nil {
+		t.Fatal(err)
+	}
+	sub, err := base.Subscribe(ctx, "g", "c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	drainN(t, sub, 1)
+
+	// Call 1 seeds the age (tick 1). Call 2 fails (tick 2). Call 3 lists
+	// again (tick 3).
+	wrapped := &failOnCallListTasksStore{Store: base, failOnCall: 2}
+	now := time.Now()
+	sweeper := &DeletionSweeper{Store: wrapped, MinAge: 15 * time.Minute, Now: func() time.Time { return now }}
+
+	sweeper.SweepOnce(ctx) // tick 1: seeds age for "default/stuck" at 0.
+
+	now = now.Add(16 * time.Minute)
+	tick2 := captureSweepLogs(t, func() { sweeper.SweepOnce(ctx) }) // tick 2: ListTasks fails.
+	if !strings.Contains(tick2, "task_list_error=true") {
+		t.Fatalf("want task_list_error=true on the failed tick, got: %s", tick2)
+	}
+	if !strings.Contains(tick2, "stuck_tasks=0") {
+		t.Fatalf("want stuck_tasks=0 on the failed tick (it listed no tasks), got: %s", tick2)
+	}
+	assertNoEvent(t, sub) // the failed tick requeued nothing.
+
+	// Same wall clock: if the failed tick had reset the age, this tick
+	// would see age 0 and not count the task as stuck.
+	tick3 := captureSweepLogs(t, func() { sweeper.SweepOnce(ctx) })
+	if !strings.Contains(tick3, "task_list_error=false") {
+		t.Fatalf("want task_list_error=false once listing recovers, got: %s", tick3)
+	}
+	if !strings.Contains(tick3, "stuck_tasks=1") {
+		t.Fatalf("want the task still counted stuck at its original age, got: %s", tick3)
+	}
+
+	readCtx, readCancel := context.WithTimeout(ctx, 2*time.Second)
+	defer readCancel()
+	if _, err := sub.Next(readCtx); err != nil {
+		t.Fatalf("want the recovered tick to requeue the stuck delete: %v", err)
 	}
 }
 
