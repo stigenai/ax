@@ -148,6 +148,45 @@ func TestSSHReportsFailedTaskAfterStaleAssignment(t *testing.T) {
 	}
 }
 
+// TestSSHReFetchBoundedByTimeout covers ax-lox.9. The re-fetch after a 421
+// must not hang when ax-server never answers it. getTask blocks on its
+// context on the second call; runSSHExec must still return within a few
+// multiples of sshGetTaskTimeout, not hang forever.
+func TestSSHReFetchBoundedByTimeout(t *testing.T) {
+	oldTimeout := sshGetTaskTimeout
+	sshGetTaskTimeout = 50 * time.Millisecond
+	defer func() { sshGetTaskTimeout = oldTimeout }()
+
+	router := newStaleRouter(t)
+	defer router.close()
+
+	task := runningTask("task1")
+	getCalls := 0
+	getTask := func(ctx context.Context) (*v1alpha1.Task, error) {
+		getCalls++
+		if getCalls == 1 {
+			return task, nil
+		}
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	dialRouter := func() (string, func(), error) { return router.addr(), nil, nil }
+
+	start := time.Now()
+	err := runSSHExec("task1", []string{"true"}, getTask, dialRouter, time.Millisecond, time.Second, &bytes.Buffer{}, &bytes.Buffer{})
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("got no error for a re-fetch that never answers")
+	}
+	if getCalls != 2 {
+		t.Fatalf("got %d getTask calls, want exactly 2 (initial + one re-fetch)", getCalls)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("runSSHExec took %s to fail; the re-fetch must respect sshGetTaskTimeout (50ms here) and not hang", elapsed)
+	}
+}
+
 // TestSSHRetriesOnceThenFailsOnPersistentStaleAssignment covers AC2(b): the
 // task stays Running (the controller has not yet caught the lost actor), so
 // ssh retries once after retryDelay, then fails naming 421, stale
