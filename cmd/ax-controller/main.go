@@ -27,6 +27,7 @@ import (
 	"github.com/google/ax/internal/substrate"
 	"github.com/google/ax/pkg/apis/v1alpha1"
 	goredis "github.com/redis/go-redis/v9"
+	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 func main() {
@@ -39,6 +40,7 @@ func main() {
 		substratePlaintext      bool
 		defaultTemplate         string
 		defaultTemplateAtespace string
+		defaultTaskMemory       string
 		redisAddr               string
 		redisPassword           string
 		redisGroup              string
@@ -58,6 +60,7 @@ func main() {
 	flag.BoolVar(&substratePlaintext, "substrate-plaintext", false, "Use insecure plaintext gRPC connection to Substrate")
 	flag.StringVar(&defaultTemplate, "template", "default-template", "Default Substrate ActorTemplate name")
 	flag.StringVar(&defaultTemplateAtespace, "template-atespace", "ax-system", "Default Substrate ActorTemplate atespace")
+	flag.StringVar(&defaultTaskMemory, "default-task-memory", "4Gi", "Memory limit booked for a task that names none (Substrate quantity, e.g. 4Gi); 0 disables")
 	flag.StringVar(&nativeTLSDestination, "native-tls-destination", "", "Private protected-actor TLS destination; install or verify exact policy before resume")
 	flag.Parse()
 
@@ -70,6 +73,19 @@ func main() {
 	if envImage := os.Getenv("AX_DEFAULT_TASK_IMAGE"); envImage != "" {
 		v1alpha1.DefaultTaskImage = envImage
 	}
+	if envMemory := os.Getenv("AX_DEFAULT_TASK_MEMORY"); envMemory != "" {
+		defaultTaskMemory = envMemory
+	}
+	if defaultTaskMemory == "0" {
+		// "0" disables the default: an ordinary task then books no memory,
+		// as it did before this flag existed.
+		defaultTaskMemory = ""
+	} else if defaultTaskMemory != "" {
+		if _, err := resource.ParseQuantity(defaultTaskMemory); err != nil {
+			slog.Error("invalid --default-task-memory / AX_DEFAULT_TASK_MEMORY", "value", defaultTaskMemory, "error", err)
+			os.Exit(1)
+		}
+	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
@@ -81,6 +97,7 @@ func main() {
 		"authority", substrateAuthority,
 		"templateAtespace", defaultTemplateAtespace,
 		"template", defaultTemplate,
+		"defaultTaskMemory", defaultTaskMemory,
 	)
 
 	subClient, err := substrate.NewClientWithOptions(substrate.ClientOptions{
@@ -98,6 +115,7 @@ func main() {
 	defer subClient.Close()
 
 	reconciler := controller.NewTaskReconciler(subClient, defaultTemplate, defaultTemplateAtespace)
+	reconciler.DefaultTaskMemory = defaultTaskMemory
 	if nativeTLSDestination != "" {
 		if err := reconciler.ConfigureNativeTLS(nativeTLSDestination, os.Getenv("POD_NAMESPACE"), substrateEndpoint, substrateAuthority, substrateInsecureTLS || substratePlaintext); err != nil {
 			slog.Error("invalid native TLS configuration", "error", err)
