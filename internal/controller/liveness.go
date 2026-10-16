@@ -89,6 +89,12 @@ func (l *LivenessChecker) SweepOnce(ctx context.Context) {
 	if threshold <= 0 {
 		threshold = DefaultLivenessThreshold
 	}
+	// seenRunning holds the key of every Running task this sweep probes.
+	// pruneMisses drops a miss count for any key not in this set below. A
+	// key falls out of the set when its task leaves Running, or when
+	// someone deletes the task so ListTasks no longer lists it. This stops
+	// a re-created same-name task from inheriting old misses (ax-lox.8).
+	seenRunning := make(map[string]bool)
 	var offset int64
 	for {
 		tasks, err := l.Store.ListTasks(ctx, "*", strandedTasksPageSize, offset)
@@ -97,12 +103,29 @@ func (l *LivenessChecker) SweepOnce(ctx context.Context) {
 			return
 		}
 		for _, task := range tasks {
+			if task.GetStatus().GetPhase() == "Running" {
+				seenRunning[fmt.Sprintf("%s/%s", task.GetMetadata().GetAtespace(), task.GetMetadata().GetName())] = true
+			}
 			l.probeOne(ctx, task, threshold)
 		}
 		if int64(len(tasks)) < strandedTasksPageSize {
-			return
+			break
 		}
 		offset += strandedTasksPageSize
+	}
+	l.pruneMisses(seenRunning)
+}
+
+// pruneMisses drops every miss count whose key is not in seenRunning: a task
+// this sweep did not see as Running, whether it moved to another phase or
+// was deleted and no longer appears in ListTasks at all.
+func (l *LivenessChecker) pruneMisses(seenRunning map[string]bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for key := range l.misses {
+		if !seenRunning[key] {
+			delete(l.misses, key)
+		}
 	}
 }
 

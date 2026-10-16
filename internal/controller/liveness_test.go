@@ -320,6 +320,64 @@ func TestLivenessSweepSkipsNonRunningTasks(t *testing.T) {
 	}
 }
 
+// TestLivenessSweepPrunesMissesOnDeleteAndRecreate covers ax-lox.8. A
+// person deletes a task, then creates a new task with the same name. The
+// new task must not inherit the old task's miss count. Without the fix,
+// the new task fails after 1 more stale sweep, not after
+// DefaultLivenessThreshold sweeps.
+func TestLivenessSweepPrunesMissesOnDeleteAndRecreate(t *testing.T) {
+	ctx := context.Background()
+	s := memory.NewStore()
+	task := runningTaskWithActor("default", "task1", "task1", "10.244.3.47")
+	if err := s.SaveTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+
+	mockSrv := &mockControlServer{existingActor: &ateapipb.Actor{
+		Status: &ateapipb.ActorStatus{
+			State:            ateapipb.ActorState_ACTOR_STATE_RUNNING,
+			WorkerAssignment: &ateapipb.WorkerAssignment{WorkerPodIp: "10.244.3.47"},
+		},
+	}}
+	router := newLivenessRouter(t)
+	router.set("default", "task1", "stale")
+	checker := newLivenessChecker(t, s, mockSrv, router)
+
+	// 2 stale sweeps: 1 short of DefaultLivenessThreshold (3).
+	checker.SweepOnce(ctx)
+	checker.SweepOnce(ctx)
+	got, err := s.GetTask(ctx, "default", "task1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.GetStatus().GetPhase() != "Running" {
+		t.Fatalf("phase is %q after 2 misses, want Running", got.GetStatus().GetPhase())
+	}
+
+	// Delete the task, then re-create a same-name task fresh. A sweep with
+	// nothing listed must drop the old task's miss count.
+	if err := s.DeleteTask(ctx, "default", "task1"); err != nil {
+		t.Fatal(err)
+	}
+	checker.SweepOnce(ctx)
+
+	fresh := runningTaskWithActor("default", "task1", "task1", "10.244.3.47")
+	if err := s.SaveTask(ctx, fresh); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1 stale sweep on the re-created task: it must stay Running. Before
+	// the fix, it inherits the old task's 2 misses and fails on this sweep.
+	checker.SweepOnce(ctx)
+	got, err = s.GetTask(ctx, "default", "task1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.GetStatus().GetPhase() != "Running" {
+		t.Fatalf("phase is %q after 1 miss on the re-created task, want Running: it must not inherit the deleted task's miss count", got.GetStatus().GetPhase())
+	}
+}
+
 // raceStore wraps a store.Store and runs hook immediately before every
 // UpdateTaskStatusIf call, so a test can simulate a concurrent write that
 // lands between a liveness probe and its conditional write.
