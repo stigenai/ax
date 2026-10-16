@@ -83,3 +83,42 @@ func TestOrdinaryDeleteKeepsExistingBehavior(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// ax-bsl.7: UpdateTaskStatus must keep Terminating for an ordinary task too,
+// not only a supervisor task. A stale write that still thinks the task is
+// Running must not clear Terminating.
+func TestOrdinaryUpdateTaskStatusKeepsTerminating(t *testing.T) {
+	ctx := context.Background()
+	s := NewStore()
+	if err := s.SaveTask(ctx, &v1alpha1.Task{Metadata: &v1alpha1.ObjectMeta{Name: "ordinary"}}); err != nil {
+		t.Fatal(err)
+	}
+	<-s.events
+	if err := s.MarkTaskDeleting(ctx, "", "ordinary"); err != nil {
+		t.Fatal(err)
+	}
+	<-s.events
+
+	if err := s.UpdateTaskStatus(ctx, "", "ordinary", &v1alpha1.TaskStatus{Phase: "Running"}); err != nil {
+		t.Fatal(err)
+	}
+	current, err := s.GetTask(ctx, "", "ordinary")
+	if err != nil || current.GetStatus().GetPhase() != v1alpha1.PhaseTerminating {
+		t.Fatalf("UpdateTaskStatus cleared Terminating for an ordinary task: %v, phase=%q", err, current.GetStatus().GetPhase())
+	}
+
+	applied, err := s.UpdateTaskStatusIf(ctx, "", "ordinary",
+		func(*v1alpha1.TaskStatus) bool { return true },
+		&v1alpha1.TaskStatus{Phase: "Running"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if applied {
+		t.Fatal("UpdateTaskStatusIf cleared Terminating for an ordinary task")
+	}
+	current, err = s.GetTask(ctx, "", "ordinary")
+	if err != nil || current.GetStatus().GetPhase() != v1alpha1.PhaseTerminating {
+		t.Fatalf("UpdateTaskStatusIf cleared Terminating for an ordinary task: %v, phase=%q", err, current.GetStatus().GetPhase())
+	}
+}

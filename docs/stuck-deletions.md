@@ -192,7 +192,8 @@ remains with the live pod names above:
 - If the name without the suffix matches no live pod, and `idle` is past `--stream-claim-min-idle`, reclaim must have already run. Check these causes:
   - Reclaim is off. `AX_STREAM_CLAIM_MIN_IDLE` is set to a negative value.
   - `ax-controller` has not run long enough yet to scan the entry.
-  - Check the pod's `starting ax-controller` startup log line for its `claimMinIdle` value.
+
+  To find which cause applies, read `claimMinIdle` in the pod's `starting ax-controller` startup log line.
 
 - A `level=error` line says `dropping task event after too many deliveries`. This means that a poison event reached the retry cap (`MaxDeliveries`, default 5). The controller drops the event and does not reclaim it again. The id, atespace, name and action fields name the event.
 

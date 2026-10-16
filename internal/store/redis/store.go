@@ -310,7 +310,12 @@ func (s *Store) UpdateTaskStatus(ctx context.Context, atespace, name string, sta
 		if err != nil {
 			return err
 		}
-		if task.GetSpec().GetSupervisorProfile() != "" && task.GetStatus().GetPhase() == v1alpha1.PhaseTerminating {
+		// ax-bsl.7: keep Terminating for every task, not only a
+		// supervisor task. A write that started before MarkTaskDeleting
+		// can land after it and clear Terminating back to Running. A
+		// queued delete event then sees Running, skips as stale, and
+		// never deletes the task.
+		if task.GetStatus().GetPhase() == v1alpha1.PhaseTerminating {
 			return nil
 		}
 		task.Status = status
@@ -347,7 +352,9 @@ func (s *Store) UpdateTaskStatusIf(ctx context.Context, atespace, name string, e
 		if !expect(task.Status) {
 			return nil
 		}
-		if task.GetSpec().GetSupervisorProfile() != "" && task.GetStatus().GetPhase() == v1alpha1.PhaseTerminating {
+		// ax-bsl.7: same Terminating guard as UpdateTaskStatus, for every
+		// task, not only a supervisor task.
+		if task.GetStatus().GetPhase() == v1alpha1.PhaseTerminating {
 			return nil
 		}
 		task.Status = status
