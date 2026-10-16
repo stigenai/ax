@@ -196,6 +196,42 @@ func TestUpdateTaskSuspendKeepsTerminatingForOrdinaryTaskRedis(t *testing.T) {
 	}
 }
 
+// ax-bsl.11: UpdateTaskSuspend must XAdd a reconcile event, the same way
+// SaveTask does. Without it, the worker never reconciles the task, and
+// SuspendActor/ResumeActor never run.
+func TestUpdateTaskSuspendEmitsReconcileEventRedis(t *testing.T) {
+	address := os.Getenv("AX_DELETE_TEST_REDIS_ADDRESS")
+	if address == "" {
+		t.Skip("requires explicit disposable AX_DELETE_TEST_REDIS_ADDRESS")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	client := redisclient.NewClient(&redisclient.Options{Addr: address})
+	defer client.Close()
+	if err := client.Ping(ctx).Err(); err != nil {
+		t.Fatal(err)
+	}
+	prefix := fmt.Sprintf("ax-suspend-event-test-%d", time.Now().UnixNano())
+	s := NewStore(client, Options{KeyPrefix: prefix, StreamName: prefix + ":events"})
+	task := &v1alpha1.Task{Metadata: &v1alpha1.ObjectMeta{Name: "job", Atespace: "private"}}
+	if err := s.SaveTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.UpdateTaskSuspend(ctx, "private", "job", true); err != nil {
+		t.Fatal(err)
+	}
+
+	events, err := client.XRange(ctx, s.opts.StreamName, "-", "+").Result()
+	if err != nil || len(events) != 2 {
+		t.Fatalf("expected exactly 2 stream events (SaveTask + UpdateTaskSuspend), got %d: %v", len(events), err)
+	}
+	ev := eventFromMessage(events[1])
+	if ev.Action != "reconcile" || ev.Name != "job" || ev.Atespace != "private" {
+		t.Fatalf("UpdateTaskSuspend emitted the wrong event: %+v", ev)
+	}
+}
+
 func TestProtectedDeleteRedisConcurrentReplacement(t *testing.T) {
 	address := os.Getenv("AX_DELETE_TEST_REDIS_ADDRESS")
 	if address == "" {

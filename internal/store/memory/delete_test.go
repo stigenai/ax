@@ -155,3 +155,35 @@ func TestUpdateTaskSuspendKeepsTerminatingForOrdinaryTask(t *testing.T) {
 		t.Fatalf("UpdateTaskSuspend cleared Terminating for an ordinary task: %v, phase=%q", err, current.GetStatus().GetPhase())
 	}
 }
+
+// ax-bsl.11: UpdateTaskSuspend must emit a reconcile TaskEvent, the same way
+// SaveTask does. Without it, the worker never reconciles the task, and
+// SuspendActor/ResumeActor never run: Spec.Suspend changes but the actor
+// keeps running or stays suspended until some unrelated event arrives.
+func TestUpdateTaskSuspendEmitsReconcileEvent(t *testing.T) {
+	ctx := context.Background()
+	s := NewStore()
+	if err := s.SaveTask(ctx, &v1alpha1.Task{Metadata: &v1alpha1.ObjectMeta{Name: "ordinary"}}); err != nil {
+		t.Fatal(err)
+	}
+	<-s.events // drain SaveTask's own reconcile event
+
+	if _, err := s.UpdateTaskSuspend(ctx, "", "ordinary", true); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case ev := <-s.events:
+		if ev.Action != "reconcile" || ev.Name != "ordinary" {
+			t.Fatalf("UpdateTaskSuspend emitted the wrong event: %+v", ev)
+		}
+	default:
+		t.Fatal("UpdateTaskSuspend emitted no reconcile event")
+	}
+
+	select {
+	case ev := <-s.events:
+		t.Fatalf("UpdateTaskSuspend emitted a second event: %+v", ev)
+	default:
+	}
+}

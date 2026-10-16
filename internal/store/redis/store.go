@@ -377,7 +377,13 @@ func (s *Store) UpdateTaskStatusIf(ctx context.Context, atespace, name string, e
 }
 
 // UpdateTaskSuspend sets task.Spec.Suspend inside a WATCH transaction on the
-// task key, and leaves the stored status untouched. See store.Store for the
+// task key. It does not change the stored status.
+//
+// It also adds a reconcile event to the stream, in the same pipeline, in
+// the shape SaveTask uses. The old code called SaveTask instead. SaveTask's
+// reconcile event made the worker reconcile the task and call SuspendActor
+// or ResumeActor. Without this event, Spec.Suspend changes. But the actor
+// keeps running until some other reconcile happens. See store.Store for the
 // full contract.
 func (s *Store) UpdateTaskSuspend(ctx context.Context, atespace, name string, suspend bool) (*v1alpha1.Task, error) {
 	if atespace == "" {
@@ -400,6 +406,14 @@ func (s *Store) UpdateTaskSuspend(ctx context.Context, atespace, name string, su
 		}
 		_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
 			pipe.Set(ctx, key, data, s.opts.TTL)
+			pipe.XAdd(ctx, &redis.XAddArgs{
+				Stream: s.opts.StreamName,
+				Values: map[string]interface{}{
+					"action":   "reconcile",
+					"atespace": atespace,
+					"name":     name,
+				},
+			})
 			pipe.Publish(ctx, s.taskPubSubChannel(atespace, name), data)
 			return nil
 		})

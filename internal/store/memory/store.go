@@ -220,16 +220,21 @@ func (s *MemoryStore) UpdateTaskStatusIf(ctx context.Context, atespace, name str
 	return true, nil
 }
 
-// UpdateTaskSuspend sets task.Spec.Suspend under the store lock and leaves
-// the stored status untouched. See store.Store for the full contract.
+// UpdateTaskSuspend sets task.Spec.Suspend under the store lock. It does not
+// change the stored status.
+//
+// After it releases the lock, it sends a reconcile TaskEvent on s.events,
+// the same way SaveTask does. The worker needs that event to reconcile the
+// task and call SuspendActor or ResumeActor. Without the event, the actor
+// keeps running on the old Spec.Suspend value until some other event
+// arrives. See store.Store for the full contract.
 func (s *MemoryStore) UpdateTaskSuspend(ctx context.Context, atespace, name string, suspend bool) (*v1alpha1.Task, error) {
 	key := taskKey(atespace, name)
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	t, ok := s.tasks[key]
 	if !ok {
+		s.mu.Unlock()
 		return nil, store.ErrNotFound
 	}
 	if t.Spec == nil {
@@ -246,6 +251,18 @@ func (s *MemoryStore) UpdateTaskSuspend(ctx context.Context, atespace, name stri
 			}
 		}
 	}
+	s.mu.Unlock()
+
+	select {
+	case s.events <- store.TaskEvent{
+		ID:       fmt.Sprintf("%d", time.Now().UnixNano()),
+		Atespace: atespace,
+		Name:     name,
+		Action:   "reconcile",
+	}:
+	default:
+	}
+
 	return cp, nil
 }
 
