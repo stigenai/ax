@@ -38,9 +38,6 @@ import (
 // ax-9qu raised this value from 4Gi. A Claude Code session needs more
 // memory than 4Gi. A Go or Node build also needs more than 4Gi.
 //
-// The person set this value by hand at 8Gi, live, on 2026-10-16 03:20Z.
-// This commit matches the repo to that live value.
-//
 // 2*8192Mi equals the 16384Mi (16Gi) limit of each worker exactly. 2 tasks
 // fit. No margin is left for ateom's own overhead (about 400Mi). See
 // deploy/stigenai/workerpool.yaml for the full sizing math.

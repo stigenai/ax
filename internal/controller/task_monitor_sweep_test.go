@@ -380,6 +380,115 @@ func TestTaskMonitorRouterTransportErrorStaysInconclusive(t *testing.T) {
 	}
 }
 
+// TestTaskMonitorRouterConnectedButTimedOutCountsAsMiss covers ax-9qu.18,
+// PR #16 review finding 1.
+//
+// The router accepts the probe's connection (httptrace's GotConn fires),
+// but its handler never answers. The reconciler's httpClient.Timeout (2s,
+// reconciler.go) cuts the probe short with a client-timeout error. This
+// differs from TestTaskMonitorRouterTransportErrorStaysInconclusive: there,
+// no connection ever forms. Here, the router is reachable; the runner
+// behind it is not answering. The probe must count as a miss.
+//
+// Without this fix, every client timeout was inconclusive. A hung runner
+// never grew the miss count, so the task stayed Running forever: the
+// ax-9qu symptom this whole bead chain exists to fix.
+//
+// This test runs 3 sweeps spanning at least 90s. The task must end Failed
+// with reason SandboxUnresponsive.
+func TestTaskMonitorRouterConnectedButTimedOutCountsAsMiss(t *testing.T) {
+	ctx := context.Background()
+	s := memory.NewStore()
+	task := taskWithWorker("default", "task1", "task1", deadRunnerAddr(t), "id-1")
+	if err := s.SaveTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	t.Cleanup(srv.Close)
+	mockSrv := &mockControlServer{getActorActor: runningActor()}
+	reconciler := newTestReconciler(t, mockSrv)
+	monitor := controller.NewTaskMonitor(s, reconciler, 0)
+	monitor.RouterAddr = strings.TrimPrefix(srv.URL, "http://")
+
+	start := time.Now()
+	for _, d := range []time.Duration{0, 45 * time.Second, 95 * time.Second} {
+		sweepWithClock(ctx, monitor, start.Add(d))
+	}
+
+	got, err := s.GetTask(ctx, "default", "task1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.GetStatus().GetPhase() != "Failed" {
+		t.Fatalf("phase = %q, want Failed: a probe that connects to the router but gets no response in time must count as a miss", got.GetStatus().GetPhase())
+	}
+	if reason := readyReason(got); reason != "SandboxUnresponsive" {
+		t.Fatalf("Ready reason = %q, want SandboxUnresponsive", reason)
+	}
+}
+
+// TestTaskMonitorRouterTransportErrorThenRecoveryKeepsMissStreak covers
+// ax-9qu.19, PR #16 review finding 2.
+//
+// A transport error (no connection to the router at all) must leave an
+// already-running miss streak untouched: it must not clear it and must not
+// add to it. This test interleaves 2 dead router responses, 1 transport
+// error, then 1 more dead response, spanning at least 90s from the first
+// dead response. Without ax-9qu.18's fix clearing the streak on a transport
+// error, this sequence would reset the window and the task would stay
+// Running. The fix must still end the task Failed.
+func TestTaskMonitorRouterTransportErrorThenRecoveryKeepsMissStreak(t *testing.T) {
+	ctx := context.Background()
+	s := memory.NewStore()
+	task := taskWithWorker("default", "task1", "task1", deadRunnerAddr(t), "id-1")
+	if err := s.SaveTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	router := newSandboxRouter(t)
+	router.set("default", "task1", "dead")
+	mockSrv := &mockControlServer{getActorActor: runningActor()}
+	reconciler := newTestReconciler(t, mockSrv)
+	monitor := controller.NewTaskMonitor(s, reconciler, 0)
+	deadListener := deadRunnerAddr(t)
+	routerAddr := router.addr()
+
+	start := time.Now()
+	// Miss 1: a real dead response from the router.
+	setRouterAddr(monitor, router)
+	sweepWithClock(ctx, monitor, start)
+	// Miss 2: a real dead response from the router.
+	sweepWithClock(ctx, monitor, start.Add(45*time.Second))
+	// A transport error: the router itself is unreachable. This must not
+	// clear the 2 misses already recorded, and must not count as a 3rd.
+	monitor.RouterAddr = deadListener
+	sweepWithClock(ctx, monitor, start.Add(60*time.Second))
+	got, err := s.GetTask(ctx, "default", "task1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.GetStatus().GetPhase() != "Running" {
+		t.Fatalf("phase = %q, want Running after only 2 misses plus 1 transport error", got.GetStatus().GetPhase())
+	}
+	// Miss 3: a real dead response from the router again, spanning >=90s
+	// from the first miss. The earlier transport error must not have
+	// cleared the streak.
+	monitor.RouterAddr = routerAddr
+	sweepWithClock(ctx, monitor, start.Add(95*time.Second))
+
+	got, err = s.GetTask(ctx, "default", "task1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.GetStatus().GetPhase() != "Failed" {
+		t.Fatalf("phase = %q, want Failed: a transport error in the middle of a miss streak must not clear it", got.GetStatus().GetPhase())
+	}
+	if reason := readyReason(got); reason != "SandboxUnresponsive" {
+		t.Fatalf("Ready reason = %q, want SandboxUnresponsive", reason)
+	}
+}
+
 // TestTaskMonitorReadyz503WorkspaceInitializingStaysRunning covers AC5's
 // alive predicate: a 503 naming workspace setup counts as alive, so the task
 // stays Running even after many sweeps.
