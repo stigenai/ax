@@ -17,6 +17,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -29,6 +30,26 @@ import (
 	goredis "github.com/redis/go-redis/v9"
 	"k8s.io/apimachinery/pkg/api/resource"
 )
+
+// resolveDefaultTaskMemory applies the AX_DEFAULT_TASK_MEMORY override (the
+// caller does that before calling this) and validates the result. "0"
+// disables the default and returns "". Any other value must parse as a
+// Kubernetes resource.Quantity greater than zero, like a task's own
+// spec.resources.limits.memory (pkg/apis/v1alpha1/types.go
+// validateQuantity), or the controller must not start.
+func resolveDefaultTaskMemory(value string) (string, error) {
+	if value == "0" || value == "" {
+		return "", nil
+	}
+	q, err := resource.ParseQuantity(value)
+	if err != nil {
+		return "", err
+	}
+	if q.Sign() <= 0 {
+		return "", fmt.Errorf("%q must be greater than zero", value)
+	}
+	return value, nil
+}
 
 func main() {
 	var (
@@ -76,15 +97,10 @@ func main() {
 	if envMemory := os.Getenv("AX_DEFAULT_TASK_MEMORY"); envMemory != "" {
 		defaultTaskMemory = envMemory
 	}
-	if defaultTaskMemory == "0" {
-		// "0" disables the default: an ordinary task then books no memory,
-		// as it did before this flag existed.
-		defaultTaskMemory = ""
-	} else if defaultTaskMemory != "" {
-		if _, err := resource.ParseQuantity(defaultTaskMemory); err != nil {
-			slog.Error("invalid --default-task-memory / AX_DEFAULT_TASK_MEMORY", "value", defaultTaskMemory, "error", err)
-			os.Exit(1)
-		}
+	defaultTaskMemory, err := resolveDefaultTaskMemory(defaultTaskMemory)
+	if err != nil {
+		slog.Error("invalid --default-task-memory / AX_DEFAULT_TASK_MEMORY", "error", err)
+		os.Exit(1)
 	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
