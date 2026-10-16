@@ -22,6 +22,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"os"
 	"regexp"
 	"strings"
@@ -181,55 +182,81 @@ func (r *TaskReconciler) probeReadyz(ctx context.Context, workerIP, atespace, ac
 	return last, false
 }
 
-// errRouterAddrEmpty marks the defensive routerAddr == "" case in
+// errRouterAddrEmpty marks the defensive case where routerAddr is "" in
 // probeSandboxViaRouter. checkTask checks TaskMonitor.RouterAddr first.
 // This path must not run in production.
 var errRouterAddrEmpty = errors.New("router address is empty")
 
-// probeSandboxViaRouter checks a runner's /readyz through atenet-router
-// only. It never dials a worker directly.
+// routerProbeMissError wraps a transport error from probeSandboxViaRouter
+// that happened after httptrace reported a connection to atenet-router
+// (GotConn fired). checkTask uses errors.As to find this type and count the
+// failure as a miss, the same as a dead HTTP response (ax-9qu.18). Any
+// other error from probeSandboxViaRouter is a plain error: a failure
+// before a connection formed. checkTask leaves that case inconclusive.
+type routerProbeMissError struct {
+	err error
+}
+
+func (e *routerProbeMissError) Error() string { return e.err.Error() }
+
+func (e *routerProbeMissError) Unwrap() error { return e.err }
+
+// probeSandboxViaRouter checks a runner's /readyz only through atenet-router.
+// It never dials a worker directly.
 //
-// Substrate's atunnel ingress needs the ate-target-actor header on every
-// request (internal/atunnel/ingress.go:519-531). A direct dial has no such
-// header. It always gets a 421 response.
+// The Substrate atunnel ingress needs the ate-target-actor header on every
+// request (internal/atunnel/ingress.go:519-531).
+//
+// A direct dial has no such header. It always gets a 421 response.
 //
 // Earlier, the monitor tried a direct dial first, through probeReadyz.
-// That 421 counted as a dead probe. As a result, every RUNNING task failed
-// SandboxUnresponsive after 3 sweeps, even when its sandbox was alive.
+// The 421 response counted as a dead probe.
+// As a result, every RUNNING task failed SandboxUnresponsive after 3 sweeps.
+// This happened even when its sandbox was alive.
 //
-// probeSandboxViaRouter fixes this. It either goes through the router, which
-// supplies the header, or it does not probe at all (ax-9qu.10).
+// probeSandboxViaRouter fixes the bug. It goes through the router, which
+// adds the header. Or it does not probe at all (ax-9qu.10).
 //
-// The returned error is non-nil only for a transport-level failure. These
-// failures are:
+// The returned error is one of two kinds when it is not nil (ax-9qu.18).
+// The caller must tell them apart:
 //
-//   - The probe cannot build the request.
-//   - The probe cannot send the request.
-//   - The probe gets no response. Examples are a refused dial, a timeout,
-//     and the router itself being down.
+//   - No connection to atenet-router forms.
+//     Causes are a request-build error or a dial failure.
+//     This result is inconclusive, so the caller must not change the miss count.
+//     The probe never reached the router, so it does not prove the sandbox died
+//     (ax-9qu.15).
+//     The error is a plain error, not a *routerProbeMissError.
 //
-// This result is inconclusive. It does not prove that the sandbox died
-// (ax-9qu.15).
+//   - A connection to atenet-router forms, and the httptrace GotConn event
+//     fires.
+//     The probe still gets no response, because of a timeout or a reset.
+//     The router is reachable, but the runner behind it does not answer in time.
+//     This result counts the same as a dead HTTP response (ax-9qu.18),
+//     so the caller must count it as a miss.
+//     The error is a *routerProbeMissError.
 //
-// The caller must leave the miss count unchanged. It must not clear the
-// count or increase it.
-//
-// When the probe gets a real HTTP response, the error is nil. The status
-// code, body and alive bool of the probe carry the result. This includes a
-// 502 or another dead response. The caller must count each of these as a
-// miss.
+// When the probe gets a real HTTP response, the error is nil.
+// The statusCode, body and alive fields of readyzProbe carry the result.
+// A 502 or another dead response counts as a miss too.
 func (r *TaskReconciler) probeSandboxViaRouter(ctx context.Context, routerAddr, atespace, actorName string) (readyzProbe, bool, error) {
 	if routerAddr == "" {
 		return readyzProbe{}, false, errRouterAddrEmpty
 	}
 	url := fmt.Sprintf("http://%s/readyz?check=workspace", routerAddr)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	var connEstablished bool
+	trace := &httptrace.ClientTrace{
+		GotConn: func(httptrace.GotConnInfo) { connEstablished = true },
+	}
+	req, err := http.NewRequestWithContext(httptrace.WithClientTrace(ctx, trace), http.MethodGet, url, nil)
 	if err != nil {
 		return readyzProbe{}, false, err
 	}
 	req.Header.Set("ate-target-actor", fmt.Sprintf("%s/%s", atespace, actorName))
 	resp, err := r.httpClient.Do(req)
 	if err != nil {
+		if connEstablished {
+			return readyzProbe{}, false, &routerProbeMissError{err: err}
+		}
 		return readyzProbe{}, false, err
 	}
 	body, _ := io.ReadAll(resp.Body)
@@ -465,18 +492,23 @@ func (m *TaskMonitor) checkTask(ctx context.Context, task *v1alpha1.Task) {
 	}
 	probe, alive, probeErr := m.reconciler.probeSandboxViaRouter(ctx, m.RouterAddr, atespace, actorName)
 	if probeErr != nil {
-		// A transport-level failure to reach atenet-router itself, not a
-		// response from it. This is inconclusive, not proof the sandbox
-		// died (ax-9qu.15). Leave the miss count as is: an outage must not
-		// fail every RUNNING task, but a real dead response (handled
-		// below) still must.
-		return
-	}
-	if alive {
+		var missErr *routerProbeMissError
+		if !errors.As(probeErr, &missErr) {
+			// No connection to atenet-router formed yet. The cause is a
+			// dial failure or a request-build error. This result is
+			// inconclusive. It does not prove the sandbox died (ax-9qu.15).
+			// Leave the miss count as is. An outage must not fail every
+			// RUNNING task.
+			return
+		}
+		// A connection to atenet-router formed. But the probe still got no
+		// response in time. The cause is a timeout or a reset. The router
+		// is reachable. The runner behind it is not answering. Count this
+		// the same as a dead HTTP response, below (ax-9qu.18).
+	} else if alive {
 		m.clearMiss(key)
 		return
-	}
-	if probe.staleAssignment {
+	} else if probe.staleAssignment {
 		if m.DeferStaleAssignment {
 			// A 421 with X-Ate-Assignment-Stale is LivenessChecker's
 			// signal, on its own threshold and timeline

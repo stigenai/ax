@@ -119,7 +119,9 @@ TaskMonitor probes the runner's `/readyz` only when Substrate still reports the 
 
 A 200 response means the runner is alive. A 503 that names workspace setup as the cause also means alive. Both results reset the miss count.
 
-Some failures do not reach atenet-router. Examples are a refused dial, a timeout, and a router that is down. The check can also fail to build or send the request. These are transport failures, not responses from the router. TaskMonitor treats a transport failure as inconclusive and does not change the miss count. A router outage must not count as proof that every RUNNING task's sandbox died.
+Some failures never reach atenet-router at all. Examples are a refused dial and a router that is down. The check can also have a request-build error. TaskMonitor treats these failures as inconclusive. It does not change the miss count. A router outage must not count as proof that every RUNNING task's sandbox died (ax-9qu.15).
+
+A different failure happens after a connection to atenet-router exists. The probe hits a timeout, or a connection reset, with no HTTP response. The router itself answered the connection, but the runner behind it did not answer the request. TaskMonitor counts this the same as a dead HTTP response, below (ax-9qu.18). Before this fix, every such timeout was inconclusive too. A hung runner then never grew the miss count, and the task stayed `Running` forever.
 
 Any other result is a real HTTP response from the router. Each such response counts as a miss. The only exception is a 421 with `X-Ate-Assignment-Stale: true`. That 421 is neither alive nor a miss (see "Which sweep fails a task first" below). After 3 consecutive misses that span at least 90s, the task fails with reason `SandboxUnresponsive`.
 
