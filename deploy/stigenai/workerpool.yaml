@@ -11,17 +11,32 @@ metadata:
   labels:
     workload: ax
 spec:
-  replicas: 2
+  replicas: 6
   workerImage: ghcr.io/stigenai/substrate/ateom-gvisor:v0.3.0-stigenai.2@sha256:9c4721241aaf7da1dd8832467c0e6bf472a1c8a18233ac206d3b7535f44c6dc1
   template:
     nodeSelector:
       ate.dev/substrate-version: v0.3.0-stigenai.2
-    # Sized for AX's Task defaults (up to 2 CPU / 4Gi per task) with room for
-    # a second actor; the pool multiplexes many more over time.
+    # Each pod runs one ateom container. The worker shares its memory limit
+    # between all tasks placed on it. One OOM kills every task on that
+    # worker.
+    #
+    # Tests on 2026-10-15 measured the memory each task needs. Each task
+    # needs about 2200Mi. An idle worker needs about 400Mi.
+    #
+    # Six workers at 16Gi (16384Mi) hold 7 tasks per worker: math is
+    # 7*2200+400=15800Mi. A test with 200,000 trials placed 20 tasks at
+    # random across 6 workers. The test shows a 16Gi worker goes over its
+    # limit in about 7 of 100 trials. This is the lowest risk among the
+    # options sized for 20 tasks.
+    #
+    # The 8Gi (8192Mi) request equals the average load per worker at 20
+    # tasks: math is 20/6*2200+400=7733Mi. This lets the scheduler place
+    # workers by their real need. See ax-ci8 for the full placement model,
+    # the node headroom check and the rejected options.
     resources:
       limits:
         cpu: "4"
-        memory: 8Gi
+        memory: 16Gi
       requests:
         cpu: 500m
-        memory: 2Gi
+        memory: 8Gi
