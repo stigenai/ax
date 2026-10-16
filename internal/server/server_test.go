@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/google/ax/internal/server"
+	"github.com/google/ax/internal/store"
 	"github.com/google/ax/internal/store/memory"
 	"github.com/google/ax/pkg/apis/v1alpha1"
 	"google.golang.org/grpc"
@@ -54,6 +55,95 @@ func TestProtectedDeleteRequiresRetainedIdentity(t *testing.T) {
 	}
 	if _, err := srv.DeleteTask(ctx, &v1alpha1.DeleteTaskRequest{Atespace: "private", Name: "job", ActorUid: "observed-actor", CreationTimestamp: created.Format(time.RFC3339Nano)}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// ax-bsl.9: SuspendTask and ResumeTask must report NotFound for a missing
+// task, exactly as they did when they called GetTask first. UpdateTaskSuspend
+// is the only store call they make now, so its own ErrNotFound mapping is
+// the one guard left on this path.
+func TestSuspendResumeTaskReportsNotFoundForMissingTask(t *testing.T) {
+	ctx := context.Background()
+	srv := server.NewServer(memory.NewStore())
+
+	if _, err := srv.SuspendTask(ctx, &v1alpha1.SuspendTaskRequest{Atespace: "default", Name: "missing"}); status.Code(err) != codes.NotFound {
+		t.Fatalf("SuspendTask on a missing task: want NotFound, got %v", err)
+	}
+	if _, err := srv.ResumeTask(ctx, &v1alpha1.ResumeTaskRequest{Atespace: "default", Name: "missing"}); status.Code(err) != codes.NotFound {
+		t.Fatalf("ResumeTask on a missing task: want NotFound, got %v", err)
+	}
+}
+
+// raceDuringSuspendStore wraps a store.Store and pauses inside the one
+// store call SuspendTask/ResumeTask makes, so a test can run a concurrent
+// MarkTaskDeleting call while that store call is still in flight. The old
+// GetTask implementation paused after its real read returned a stale
+// snapshot, standing in for a read that ran before the mark landed.
+type raceDuringSuspendStore struct {
+	store.Store
+	reached chan struct{}
+	release chan struct{}
+}
+
+func (s *raceDuringSuspendStore) GetTask(ctx context.Context, atespace, name string) (*v1alpha1.Task, error) {
+	task, err := s.Store.GetTask(ctx, atespace, name)
+	s.reached <- struct{}{}
+	<-s.release
+	return task, err
+}
+
+func (s *raceDuringSuspendStore) UpdateTaskSuspend(ctx context.Context, atespace, name string, suspend bool) (*v1alpha1.Task, error) {
+	s.reached <- struct{}{}
+	<-s.release
+	return s.Store.UpdateTaskSuspend(ctx, atespace, name, suspend)
+}
+
+// ax-bsl.9: a SuspendTask call must not clear a Terminating phase that a
+// MarkTaskDeleting call sets while SuspendTask's own store call is still in
+// flight. The old code read the task with GetTask, set Spec.Suspend, and
+// wrote the result back with SaveTask. A read that ran before the mark,
+// paired with a write that landed after it, replayed the pre-mark status
+// and cleared Terminating.
+func TestSuspendTaskSurvivesMarkTaskDeletingRace(t *testing.T) {
+	ctx := context.Background()
+	inner := memory.NewStore()
+	if err := inner.SaveTask(ctx, &v1alpha1.Task{Metadata: &v1alpha1.ObjectMeta{Name: "raced", Atespace: "default"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	raced := &raceDuringSuspendStore{Store: inner, reached: make(chan struct{}), release: make(chan struct{})}
+	srv := server.NewServer(raced)
+
+	type suspendResult struct {
+		task *v1alpha1.Task
+		err  error
+	}
+	done := make(chan suspendResult, 1)
+	go func() {
+		task, err := srv.SuspendTask(ctx, &v1alpha1.SuspendTaskRequest{Atespace: "default", Name: "raced"})
+		done <- suspendResult{task, err}
+	}()
+
+	<-raced.reached
+	if err := inner.MarkTaskDeleting(ctx, "default", "raced"); err != nil {
+		t.Fatal(err)
+	}
+	close(raced.release)
+
+	res := <-done
+	if res.err != nil {
+		t.Fatal(res.err)
+	}
+	if !res.task.GetSpec().GetSuspend() {
+		t.Fatal("SuspendTask did not set Spec.Suspend")
+	}
+
+	current, err := inner.GetTask(ctx, "default", "raced")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.GetStatus().GetPhase() != v1alpha1.PhaseTerminating {
+		t.Fatalf("a GetTask read before a concurrent MarkTaskDeleting call, replayed by a later write, cleared Terminating: phase %q", current.GetStatus().GetPhase())
 	}
 }
 

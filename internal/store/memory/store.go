@@ -220,6 +220,35 @@ func (s *MemoryStore) UpdateTaskStatusIf(ctx context.Context, atespace, name str
 	return true, nil
 }
 
+// UpdateTaskSuspend sets task.Spec.Suspend under the store lock and leaves
+// the stored status untouched. See store.Store for the full contract.
+func (s *MemoryStore) UpdateTaskSuspend(ctx context.Context, atespace, name string, suspend bool) (*v1alpha1.Task, error) {
+	key := taskKey(atespace, name)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	t, ok := s.tasks[key]
+	if !ok {
+		return nil, store.ErrNotFound
+	}
+	if t.Spec == nil {
+		t.Spec = &v1alpha1.TaskSpec{}
+	}
+	t.Spec.Suspend = suspend
+	cp := clone(t)
+
+	if chs, ok := s.watchers[key]; ok {
+		for _, ch := range chs {
+			select {
+			case ch <- clone(t):
+			default:
+			}
+		}
+	}
+	return cp, nil
+}
+
 func (s *MemoryStore) MarkTaskDeleting(ctx context.Context, atespace, name string, preconditions ...store.TaskDeletePreconditions) error {
 	precondition, err := store.DeletePreconditions(preconditions)
 	if err != nil {
