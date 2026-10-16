@@ -85,8 +85,12 @@ type ExecOptions struct {
 	Command []string
 	Cwd     string
 	Env     map[string]string
-	Stdout  io.Writer
-	Stderr  io.Writer
+	// StartTimeout bounds only the StartProcess call. It does not apply to
+	// the output stream that follows: a long-running command must keep
+	// streaming after it starts. Zero means no timeout.
+	StartTimeout time.Duration
+	Stdout       io.Writer
+	Stderr       io.Writer
 }
 
 // Exec runs a command inside the task container and streams stdout/stderr until completion.
@@ -96,7 +100,14 @@ func (c *Client) Exec(ctx context.Context, opts ExecOptions) (int, error) {
 		return 1, errors.New("exec: command cannot be empty")
 	}
 
-	proc, err := c.process.StartProcess(ctx, &ateenvv1alpha.StartProcessRequest{
+	startCtx := ctx
+	if opts.StartTimeout > 0 {
+		var cancel context.CancelFunc
+		startCtx, cancel = context.WithTimeout(ctx, opts.StartTimeout)
+		defer cancel()
+	}
+
+	proc, err := c.process.StartProcess(startCtx, &ateenvv1alpha.StartProcessRequest{
 		Command: opts.Command,
 		Cwd:     opts.Cwd,
 		Env:     opts.Env,

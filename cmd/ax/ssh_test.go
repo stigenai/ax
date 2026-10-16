@@ -23,6 +23,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	ateenvv1alpha "github.com/agent-substrate/env/proto/ateenv/v1alpha"
 	"github.com/google/ax/pkg/apis/v1alpha1"
@@ -151,7 +152,7 @@ func TestSSHFollowsRouterNotCachedWorkerIP(t *testing.T) {
 	dialRouter := func() (string, func(), error) { return lis.Addr().String(), nil, nil }
 
 	var stdout bytes.Buffer
-	if err := runSSHExec("task1", []string{"true"}, getTask, dialRouter, &stdout, &bytes.Buffer{}); err != nil {
+	if err := runSSHExec("task1", []string{"true"}, getTask, dialRouter, time.Millisecond, time.Second, &stdout, &bytes.Buffer{}); err != nil {
 		t.Fatalf("call 1: runSSHExec returned an error: %v", err)
 	}
 	if got := stdout.String(); got != "worker-a" {
@@ -160,7 +161,7 @@ func TestSSHFollowsRouterNotCachedWorkerIP(t *testing.T) {
 
 	router.setWorker("task1", "worker-b")
 	stdout.Reset()
-	if err := runSSHExec("task1", []string{"true"}, getTask, dialRouter, &stdout, &bytes.Buffer{}); err != nil {
+	if err := runSSHExec("task1", []string{"true"}, getTask, dialRouter, time.Millisecond, time.Second, &stdout, &bytes.Buffer{}); err != nil {
 		t.Fatalf("call 2: runSSHExec returned an error: %v", err)
 	}
 	if got := stdout.String(); got != "worker-b" {
@@ -185,7 +186,7 @@ func TestSSHRejectsTaskWithNoActor(t *testing.T) {
 		t.Fatal("dialRouter must not be called for a task with no actor")
 		return "", nil, nil
 	}
-	err := runSSHExec("task1", []string{"true"}, getTask, dialRouter, &bytes.Buffer{}, &bytes.Buffer{})
+	err := runSSHExec("task1", []string{"true"}, getTask, dialRouter, time.Millisecond, time.Second, &bytes.Buffer{}, &bytes.Buffer{})
 	if err == nil || !strings.Contains(err.Error(), "actor") {
 		t.Fatalf("got err %v, want an error naming the missing actor", err)
 	}

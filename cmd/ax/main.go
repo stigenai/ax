@@ -1036,6 +1036,43 @@ type taskGetter func(ctx context.Context) (*v1alpha1.Task, error)
 // instead. The fake lets the test prove routing with no kubectl call.
 type routerDialer func() (endpoint string, cleanup func(), err error)
 
+// sshRetryDelay is the wait before runSSHExec's one retry on a 421 stale
+// assignment. sshStartTimeout bounds the wait for the guest to start the
+// command. Tests override both, to run fast.
+var (
+	sshRetryDelay   = 2 * time.Second
+	sshStartTimeout = 30 * time.Second
+)
+
+// staleAssignment421 is the exact substring in grpc-go's error for an HTTP
+// 421 response (http.StatusText(421) == "Misdirected Request"). atunnel
+// sends this status when a worker's activation map no longer holds the
+// target actor, for example after its container restarts and loses the
+// actor. The response has no body and no metadata the grpc client keeps.
+// Classify on this text, not on a header: grpc-go does not pass response
+// headers to the caller for a headers-only reply like this one.
+const staleAssignment421 = "421 (Misdirected Request)"
+
+// isStaleAssignment reports whether err is the grpc-go error for atunnel's
+// 421 stale-assignment rejection.
+func isStaleAssignment(err error) bool {
+	return err != nil && strings.Contains(err.Error(), staleAssignment421)
+}
+
+// readyCondition returns the Ready condition's reason and message from
+// task's status, or ("", "") when task has none.
+func readyCondition(task *v1alpha1.Task) (reason, message string) {
+	if task == nil || task.Status == nil {
+		return "", ""
+	}
+	for _, c := range task.Status.Conditions {
+		if c.Type == "Ready" {
+			return c.Reason, c.Message
+		}
+	}
+	return "", ""
+}
+
 func runSSH(serverURL, atespace, kubeContext string, args []string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("usage: ax ssh <task-name> [-- command...]")
@@ -1076,13 +1113,15 @@ func runSSH(serverURL, atespace, kubeContext string, args []string) error {
 		return fmt.Sprintf("127.0.0.1:%d", localPort), pfCleanup, nil
 	}
 
-	return runSSHExec(taskName, cmdToRun, getTask, dialRouter, os.Stdout, os.Stderr)
+	return runSSHExec(taskName, cmdToRun, getTask, dialRouter, sshRetryDelay, sshStartTimeout, os.Stdout, os.Stderr)
 }
 
 // runSSHExec connects to taskName's guest and runs cmdToRun, streaming output
 // to stdout and stderr. getTask and dialRouter are the only two seams: every
 // other dependency (argument parsing, process exit) stays in runSSH.
-func runSSHExec(taskName string, cmdToRun []string, getTask taskGetter, dialRouter routerDialer, stdout, stderr io.Writer) error {
+// retryDelay and startTimeout let a test run the 421-retry and start-timeout
+// paths fast; production uses sshRetryDelay and sshStartTimeout.
+func runSSHExec(taskName string, cmdToRun []string, getTask taskGetter, dialRouter routerDialer, retryDelay, startTimeout time.Duration, stdout, stderr io.Writer) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -1127,13 +1166,43 @@ func runSSHExec(taskName string, cmdToRun []string, getTask taskGetter, dialRout
 	}
 	defer guestClient.Close()
 
-	exitCode, err := guestClient.Exec(context.Background(), guest.ExecOptions{
-		Command: cmdToRun,
-		Stdout:  stdout,
-		Stderr:  stderr,
-	})
+	runCmd := func() (int, error) {
+		return guestClient.Exec(context.Background(), guest.ExecOptions{
+			Command:      cmdToRun,
+			Stdout:       stdout,
+			Stderr:       stderr,
+			StartTimeout: startTimeout,
+		})
+	}
+
+	exitCode, err := runCmd()
 	if err != nil {
-		return err
+		if !isStaleAssignment(err) {
+			return fmt.Errorf("task %q: %w", taskName, err)
+		}
+
+		// atunnel rejected the request before the actor ran anything, so no
+		// process started: a retry is safe. Re-fetch the task first, since
+		// the actor may already be gone for good (the controller's liveness
+		// sweep can have failed it between the dial and this error).
+		refetched, gerr := getTask(context.Background())
+		if gerr != nil {
+			return fmt.Errorf("task %q: actor %q has a stale assignment (HTTP 421), and re-fetching the task failed: %w", taskName, task.Status.Actor, gerr)
+		}
+		if refetched == nil || refetched.Status == nil || refetched.Status.Phase != "Running" {
+			phase := "unknown"
+			if refetched != nil && refetched.Status != nil {
+				phase = refetched.Status.Phase
+			}
+			reason, message := readyCondition(refetched)
+			return fmt.Errorf("task %q is no longer Running (phase %q, Ready reason %q: %s)", taskName, phase, reason, message)
+		}
+
+		time.Sleep(retryDelay)
+		exitCode, err = runCmd()
+		if err != nil {
+			return fmt.Errorf("task %q: actor %q has a stale assignment (HTTP 421) after 1 retry; delete and re-create the task: %w", taskName, task.Status.Actor, err)
+		}
 	}
 
 	if exitCode != 0 {
