@@ -39,3 +39,31 @@ patches:
                   # See deploy/stigenai/workerpool.yaml for the sizing math.
                   - name: AX_DEFAULT_TASK_MEMORY
                     value: 7680Mi
+                  # ax-9gp: a task's own (or default) memory limit can
+                  # exceed this value. Such a task can never fit any worker.
+                  # Reconcile fails it with reason MemoryExceedsCapacity.
+                  # It does not loop through WaitingForCapacity/Pending.
+                  # This value must equal limits.memory in
+                  # deploy/stigenai/workerpool.yaml (16Gi).
+                  # See the reverse note there.
+                  - name: AX_MAX_TASK_MEMORY
+                    value: 16Gi
+  - patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: ax-server
+        namespace: ax-system
+      spec:
+        template:
+          spec:
+            containers:
+              - name: ax-server
+                env:
+                  # ax-9gp: UpdateTask rejects a task above this value at
+                  # create/update time, before it ever reaches ax-controller.
+                  # This must equal limits.memory in
+                  # deploy/stigenai/workerpool.yaml (16Gi); see the reverse
+                  # note there.
+                  - name: AX_MAX_TASK_MEMORY
+                    value: 16Gi

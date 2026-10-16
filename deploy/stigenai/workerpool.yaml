@@ -81,6 +81,12 @@ spec:
     # 2*7680Mi plus about 400Mi for ateom itself is 15760Mi. That is less than
     # the 16384Mi pod limit. So 2 tasks at their own cap do not also cause an
     # OOM in the pod around them.
+    #
+    # ax-9gp: AX_MAX_TASK_MEMORY is set in
+    # deploy/stigenai/kustomization.yaml, on both ax-server and
+    # ax-controller. It must equal this limits.memory value.
+    # A task that asks for more gets a clear Failed status.
+    # It does not wait forever for a worker that can never fit it.
     resources:
       limits:
         cpu: "4"

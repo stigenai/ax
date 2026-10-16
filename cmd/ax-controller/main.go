@@ -46,6 +46,46 @@ const defaultTaskMemoryDefault = "7680Mi"
 // value used when neither is set: a Go duration string.
 const livenessIntervalDefault = "30s"
 
+// resolveMaxTaskMemory parses the --max-task-memory / AX_MAX_TASK_MEMORY value.
+// The result is the cap Reconcile enforces.
+//
+// Empty or "0" disables the check and returns a zero Quantity.
+//
+// Any other value must parse as a Kubernetes resource.Quantity greater than zero.
+// If it does not, the controller must not start.
+func resolveMaxTaskMemory(value string) (resource.Quantity, error) {
+	if value == "0" || value == "" {
+		return resource.Quantity{}, nil
+	}
+	q, err := resource.ParseQuantity(value)
+	if err != nil {
+		return resource.Quantity{}, err
+	}
+	if q.Sign() <= 0 {
+		return resource.Quantity{}, fmt.Errorf("%q must be greater than zero", value)
+	}
+	return q, nil
+}
+
+// checkDefaultWithinMax reports an error when defaultTaskMemory, the memory
+// booked for a task that names no limit, would itself exceed max. A
+// deployment with this mismatch would fail every default-sized task on its
+// first reconcile, so the controller refuses to start instead. An empty
+// defaultTaskMemory or a zero max always passes.
+func checkDefaultWithinMax(defaultTaskMemory string, max resource.Quantity) error {
+	if defaultTaskMemory == "" || max.IsZero() {
+		return nil
+	}
+	q, err := resource.ParseQuantity(defaultTaskMemory)
+	if err != nil {
+		return err
+	}
+	if q.Cmp(max) > 0 {
+		return fmt.Errorf("default task memory %q exceeds max task memory %q", defaultTaskMemory, max.String())
+	}
+	return nil
+}
+
 // resolveDefaultTaskMemory applies the AX_DEFAULT_TASK_MEMORY override (the
 // caller does that before calling this) and validates the result. "0"
 // disables the default and returns "". Any other value must parse as a
@@ -107,6 +147,7 @@ func main() {
 		defaultTemplate         string
 		defaultTemplateAtespace string
 		defaultTaskMemory       string
+		maxTaskMemory           string
 		livenessInterval        string
 		redisAddr               string
 		redisPassword           string
@@ -130,6 +171,7 @@ func main() {
 	flag.StringVar(&defaultTemplate, "template", "default-template", "Default Substrate ActorTemplate name")
 	flag.StringVar(&defaultTemplateAtespace, "template-atespace", "ax-system", "Default Substrate ActorTemplate atespace")
 	flag.StringVar(&defaultTaskMemory, "default-task-memory", defaultTaskMemoryDefault, "Memory limit booked for a task that names none (Substrate quantity, e.g. 7680Mi); 0 disables")
+	flag.StringVar(&maxTaskMemory, "max-task-memory", "", "Largest memory limit any worker can hold (Kubernetes quantity, e.g. 16Gi); Reconcile fails a task above it instead of waiting for capacity. Empty or 0 disables the check")
 	flag.StringVar(&livenessInterval, "liveness-interval", livenessIntervalDefault, "How often the liveness monitor checks each Running task's actor and runner (Go duration, e.g. 30s); 0 disables it")
 	flag.StringVar(&nativeTLSDestination, "native-tls-destination", "", "Private protected-actor TLS destination; install or verify exact policy before resume")
 	flag.DurationVar(&taskLivenessInterval, "task-liveness-interval", time.Minute, "How often to probe each Running task's actor through atenet-router; 0 turns off the sweep (env AX_TASK_LIVENESS_INTERVAL)")
@@ -156,6 +198,18 @@ func main() {
 		slog.Error("invalid --default-task-memory / AX_DEFAULT_TASK_MEMORY", "error", err)
 		os.Exit(1)
 	}
+	if envMax := os.Getenv("AX_MAX_TASK_MEMORY"); envMax != "" {
+		maxTaskMemory = envMax
+	}
+	maxTaskMemoryQuantity, err := resolveMaxTaskMemory(maxTaskMemory)
+	if err != nil {
+		slog.Error("invalid --max-task-memory / AX_MAX_TASK_MEMORY", "error", err)
+		os.Exit(1)
+	}
+	if err := checkDefaultWithinMax(defaultTaskMemory, maxTaskMemoryQuantity); err != nil {
+		slog.Error("default task memory cannot exceed max task memory", "error", err)
+		os.Exit(1)
+	}
 	livenessIntervalDuration, err := resolveLivenessInterval(livenessInterval)
 	if err != nil {
 		slog.Error("invalid --liveness-interval / AX_LIVENESS_INTERVAL", "error", err)
@@ -178,6 +232,7 @@ func main() {
 		"templateAtespace", defaultTemplateAtespace,
 		"template", defaultTemplate,
 		"defaultTaskMemory", defaultTaskMemory,
+		"maxTaskMemory", maxTaskMemoryQuantity.String(),
 		"livenessInterval", livenessIntervalDuration,
 	)
 
@@ -197,6 +252,7 @@ func main() {
 
 	reconciler := controller.NewTaskReconciler(subClient, defaultTemplate, defaultTemplateAtespace)
 	reconciler.DefaultTaskMemory = defaultTaskMemory
+	reconciler.MaxTaskMemory = maxTaskMemoryQuantity
 	if nativeTLSDestination != "" {
 		if err := reconciler.ConfigureNativeTLS(nativeTLSDestination, os.Getenv("POD_NAMESPACE"), substrateEndpoint, substrateAuthority, substrateInsecureTLS || substratePlaintext); err != nil {
 			slog.Error("invalid native TLS configuration", "error", err)

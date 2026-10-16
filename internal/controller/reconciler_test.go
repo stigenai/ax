@@ -33,6 +33,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
+	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 type mockControlServer struct {
@@ -788,6 +789,88 @@ func TestTaskReconciler_ResumeOtherErrorFailsTask(t *testing.T) {
 	}
 	if task.Status.Phase != "Failed" {
 		t.Errorf("expected phase Failed, got %q", task.Status.Phase)
+	}
+}
+
+// A task's own memory limit can exceed MaxTaskMemory. Reconcile must fail it
+// at once, before any Substrate call. It must not retry forever like a
+// capacity wait (ax-9gp).
+func TestTaskReconciler_MemoryAboveMaxFailsTask(t *testing.T) {
+	mockSrv := &mockControlServer{}
+	r := newTestReconciler(t, mockSrv)
+	r.MaxTaskMemory = resource.MustParse("16Gi")
+
+	task := envTask("x")
+	task.Spec.Resources = &v1alpha1.ResourceReqs{Limits: &v1alpha1.ResourceList{Memory: "32Gi"}}
+	reconciled, err := r.Reconcile(context.Background(), task)
+	if err == nil || errors.Is(err, controller.ErrWaitingForCapacity) {
+		t.Fatalf("expected a plain memory-cap failure, got %v", err)
+	}
+	if reconciled.Status.Phase != "Failed" {
+		t.Errorf("expected phase Failed, got %q", reconciled.Status.Phase)
+	}
+	var reason, message string
+	for _, c := range reconciled.Status.Conditions {
+		if c.Type == "Ready" {
+			reason, message = c.Reason, c.Message
+		}
+	}
+	if reason != "MemoryExceedsCapacity" || !strings.Contains(message, "32Gi") || !strings.Contains(message, "16Gi") {
+		t.Errorf("expected MemoryExceedsCapacity naming both sizes, got %q: %q", reason, message)
+	}
+	if len(mockSrv.createdAtespaces) != 0 || len(mockSrv.createdActors) != 0 || mockSrv.resumeAttempts.Load() != 0 {
+		t.Errorf("expected zero Substrate calls, got atespaces=%v actors=%v resumeAttempts=%d", mockSrv.createdAtespaces, mockSrv.createdActors, mockSrv.resumeAttempts.Load())
+	}
+}
+
+// A task that names no memory limit falls back to DefaultTaskMemory.
+// Reconcile must check that default against the cap too.
+func TestTaskReconciler_DefaultMemoryAboveMaxFailsTask(t *testing.T) {
+	mockSrv := &mockControlServer{}
+	r := newTestReconciler(t, mockSrv)
+	r.MaxTaskMemory = resource.MustParse("16Gi")
+	r.DefaultTaskMemory = "32Gi"
+
+	reconciled, err := r.Reconcile(context.Background(), envTask("x"))
+	if err == nil || errors.Is(err, controller.ErrWaitingForCapacity) {
+		t.Fatalf("expected a plain memory-cap failure from the default, got %v", err)
+	}
+	if reconciled.Status.Phase != "Failed" {
+		t.Errorf("expected phase Failed, got %q", reconciled.Status.Phase)
+	}
+	if len(mockSrv.createdAtespaces) != 0 {
+		t.Errorf("expected zero Substrate calls, got atespaces=%v", mockSrv.createdAtespaces)
+	}
+}
+
+// A supervisor task ignores DefaultTaskMemory. It always sets its own
+// explicit limit; validateSupervisorTask enforces that. So an oversized
+// default must not fail it.
+func TestTaskReconciler_SupervisorIgnoresDefaultMemoryCap(t *testing.T) {
+	mockSrv := &mockControlServer{}
+	r := newTestReconciler(t, mockSrv)
+	r.MaxTaskMemory = resource.MustParse("16Gi")
+	r.DefaultTaskMemory = "32Gi"
+
+	if _, err := r.Reconcile(context.Background(), supervisorTask()); err != nil {
+		t.Fatalf("supervisor task with its own 512Mi limit should not be affected by an oversized default: %v", err)
+	}
+}
+
+// With no cap configured, Reconcile keeps the existing WaitingForCapacity
+// path (A6): a task waits for capacity instead of failing, even above a
+// size that would exceed a configured cap.
+func TestTaskReconciler_NoMaxLeavesCapacityWaitUnchanged(t *testing.T) {
+	mockSrv := &mockControlServer{resumeErr: status.Error(codes.ResourceExhausted, "no free workers available")}
+	r := newTestReconciler(t, mockSrv)
+	task := envTask("x")
+	task.Spec.Resources = &v1alpha1.ResourceReqs{Limits: &v1alpha1.ResourceList{Memory: "32Gi"}}
+	reconciled, err := r.Reconcile(context.Background(), task)
+	if !errors.Is(err, controller.ErrWaitingForCapacity) {
+		t.Fatalf("expected ErrWaitingForCapacity, got %v", err)
+	}
+	if reconciled.Status.Phase != "Pending" {
+		t.Errorf("expected phase Pending, got %q", reconciled.Status.Phase)
 	}
 }
 
