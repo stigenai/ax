@@ -525,6 +525,34 @@ func (c *Client) DeleteActor(ctx context.Context, atespace, actorName string, ac
 	return nil
 }
 
+// listActorsPageSize is the PageSize Client.ListActors requests on every
+// call. Substrate coerces values above 1000 to 1000 (ListActorsRequest's
+// doc comment); 500 leaves headroom under that cap.
+const listActorsPageSize = 500
+
+// ListActors returns every Actor in atespace, paging through Substrate's
+// ListActors RPC until NextPageToken is empty. An empty atespace lists
+// across every atespace (ListActorsRequest's doc comment).
+func (c *Client) ListActors(ctx context.Context, atespace string) ([]*ateapipb.Actor, error) {
+	var actors []*ateapipb.Actor
+	var pageToken string
+	for {
+		resp, err := c.control.ListActors(ctx, &ateapipb.ListActorsRequest{
+			Atespace:  atespace,
+			PageSize:  listActorsPageSize,
+			PageToken: pageToken,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("listing actors in %q: %w", atespace, err)
+		}
+		actors = append(actors, resp.GetActors()...)
+		pageToken = resp.GetNextPageToken()
+		if pageToken == "" {
+			return actors, nil
+		}
+	}
+}
+
 // ListActorTemplates returns all ActorTemplates in the given atespace.
 func (c *Client) ListActorTemplates(ctx context.Context, atespace string) ([]*ateapipb.ActorTemplate, error) {
 	resp, err := c.control.ListActorTemplates(ctx, &ateapipb.ListActorTemplatesRequest{Atespace: atespace})
