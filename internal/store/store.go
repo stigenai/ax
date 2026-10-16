@@ -100,6 +100,11 @@ type Store interface {
 	SaveTask(ctx context.Context, task *v1alpha1.Task) error
 	GetTask(ctx context.Context, atespace, name string) (*v1alpha1.Task, error)
 	ListTasks(ctx context.Context, atespace string, limit, offset int64) ([]*v1alpha1.Task, error)
+	// UpdateTaskStatus is a no-op on a task whose stored phase is already
+	// "Terminating" (ax-bsl.7): it returns a nil error and changes nothing,
+	// for every task, not only a supervisor task. This keeps a write built
+	// from a status read before a concurrent MarkTaskDeleting call from
+	// clearing the phase that call set.
 	UpdateTaskStatus(ctx context.Context, atespace, name string, status *v1alpha1.TaskStatus) error
 	// UpdateTaskStatusIf writes status only when expect reports true for the
 	// task's current stored status. It reads and writes in one transaction.
