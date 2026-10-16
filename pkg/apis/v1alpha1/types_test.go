@@ -507,6 +507,50 @@ func TestValidateTaskMemoryCap(t *testing.T) {
 	}
 }
 
+func TestValidateTaskCPUCap(t *testing.T) {
+	tests := []struct {
+		name       string
+		cpu        string
+		supervisor bool
+		max        string
+		wantErr    string
+	}{
+		{name: "no max set disables the check", cpu: "32", max: ""},
+		{name: "equal to max passes", cpu: "6", max: "6"},
+		{name: "equal to max in millicores passes", cpu: "6000m", max: "6"},
+		{name: "one millicore over max fails", cpu: "6001m", max: "6", wantErr: `spec.resources.limits.cpu: "6001m" exceeds the largest task a worker can hold (6)`},
+		{name: "one core over max fails", cpu: "7", max: "6", wantErr: `spec.resources.limits.cpu: "7" exceeds the largest task a worker can hold (6)`},
+		{name: "well over max fails naming the value and the max", cpu: "32", max: "6", wantErr: `spec.resources.limits.cpu: "32" exceeds the largest task a worker can hold (6)`},
+		{name: "under max passes", cpu: "500m", max: "6"},
+		{name: "no limit passes", cpu: "", max: "6"},
+		{name: "a supervisor task gets the same check", supervisor: true, cpu: "8", max: "6", wantErr: `exceeds the largest task a worker can hold (6)`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			spec := &v1alpha1.TaskSpec{
+				Resources: &v1alpha1.ResourceReqs{Limits: &v1alpha1.ResourceList{Cpu: tt.cpu}},
+			}
+			if tt.supervisor {
+				spec.SupervisorProfile = v1alpha1.FabriekSupervisorProfile
+			}
+			var max resource.Quantity
+			if tt.max != "" {
+				max = resource.MustParse(tt.max)
+			}
+			err := v1alpha1.ValidateTaskCPUCap(&v1alpha1.Task{Spec: spec}, max)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("error = %v, want containing %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestTask_Workspaces_YAML(t *testing.T) {
 	taskYAML := `
 apiVersion: ax.io/v1alpha1
