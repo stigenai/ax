@@ -278,3 +278,26 @@ func TestRunDeleteTask(t *testing.T) {
 		t.Fatalf("expected task to be NotFound after deletion, got %v", err)
 	}
 }
+
+func TestChooseSSHDial(t *testing.T) {
+	tests := []struct {
+		name      string
+		router    string
+		reachable bool
+		want      sshDialMode
+		wantProbe bool
+	}{
+		{"router env wins, no probe", "r:80", true, sshDialRouterEnv, false},
+		{"direct when reachable", "", true, sshDialDirect, true},
+		{"port-forward otherwise", "", false, sshDialPortForward, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			probed := false
+			got := chooseSSHDial(tt.router, func() bool { probed = true; return tt.reachable })
+			if got != tt.want || probed != tt.wantProbe {
+				t.Fatalf("got mode %v probed %v, want %v probed %v", got, probed, tt.want, tt.wantProbe)
+			}
+		})
+	}
+}
