@@ -395,7 +395,6 @@ func runGet(serverURL, atespace string, args []string) error {
 		return yaml.NewEncoder(os.Stdout).Encode(task)
 	}
 
-
 	if (resource == "workspaces" || resource == "workspace") && len(args) == 1 {
 		resp, err := client.ListWorkspaces(ctx, &v1alpha1.ListWorkspacesRequest{Atespace: atespace})
 		if err != nil {
@@ -601,7 +600,6 @@ func runDescribe(serverURL, atespace string, args []string) error {
 		}
 		return nil
 	}
-
 
 	task, err := client.GetTask(ctx, &v1alpha1.GetTaskRequest{Atespace: atespace, Name: name})
 	if err != nil {
@@ -1001,6 +999,26 @@ func runTunnel(args []string) error {
 	}
 }
 
+type sshDialMode int
+
+const (
+	sshDialPortForward sshDialMode = iota
+	sshDialDirect
+	sshDialRouterEnv
+)
+
+// chooseSSHDial picks how ax ssh reaches the guest. A non-empty AX_ROUTER value
+// wins and skips the reachability probe.
+func chooseSSHDial(axRouter string, directReachable func() bool) sshDialMode {
+	if axRouter != "" {
+		return sshDialRouterEnv
+	}
+	if directReachable() {
+		return sshDialDirect
+	}
+	return sshDialPortForward
+}
+
 func runSSH(serverURL, atespace, kubeContext string, args []string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("usage: ax ssh <task-name> [-- command...]")
@@ -1071,17 +1089,31 @@ func runSSH(serverURL, atespace, kubeContext string, args []string) error {
 		cleanup     func()
 	)
 
-	// 1. First, check if worker IP is directly reachable (e.g. within cluster or local mesh)
-	d := net.Dialer{Timeout: 500 * time.Millisecond}
 	guestEndpoint := net.JoinHostPort(host, fmt.Sprint(port))
-	if testConn, dialErr := d.Dial("tcp", guestEndpoint); dialErr == nil {
-		_ = testConn.Close()
+	routerAddr := os.Getenv("AX_ROUTER")
+	switch chooseSSHDial(routerAddr, func() bool {
+		d := net.Dialer{Timeout: 500 * time.Millisecond}
+		conn, dialErr := d.Dial("tcp", guestEndpoint)
+		if dialErr != nil {
+			return false
+		}
+		_ = conn.Close()
+		return true
+	}) {
+	case sshDialRouterEnv:
+		// AX_ROUTER points straight at atenet-router (e.g. from inside a microVM
+		// that can neither dial the worker nor open a port-forward).
+		guestClient, err = guest.DialTarget(routerAddr, targetActor)
+		if err != nil {
+			return fmt.Errorf("connecting to guest via atenet-router at %s: %w", routerAddr, err)
+		}
+	case sshDialDirect:
 		guestClient, err = guest.Dial(guestEndpoint)
 		if err != nil {
 			return fmt.Errorf("connecting to guest at %s: %w", guestEndpoint, err)
 		}
-	} else {
-		// 2. Connect via the Substrate atenet-router service in ate-system (port 80)
+	default:
+		// Connect via the Substrate atenet-router service in ate-system (port 80)
 		localPort, pfCleanup, err := tunnel.PortForward(context.Background(), kubeContext, "ate-system", "svc/atenet-router", 80)
 		if err != nil {
 			return fmt.Errorf("establishing port-forward to atenet-router: %w", err)
