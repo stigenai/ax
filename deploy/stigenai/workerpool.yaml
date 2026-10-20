@@ -11,7 +11,12 @@ metadata:
   labels:
     workload: ax
 spec:
-  replicas: 6
+  # 10 workers hold 20 tasks at 2 tasks per worker (see below). On 2026-10-20,
+  # 6 workers held the factory manager and 11 worker tasks, and 11 more tasks
+  # waited for hours with WaitingForCapacity. Four more 8Gi requests fit the
+  # memory headroom of gtr-150 (2), gtr-151 (1) and gtr-152 (1). The comments
+  # below still describe the 6-worker sizing.
+  replicas: 10
   workerImage: ghcr.io/stigenai/substrate/ateom-gvisor:v0.3.0-stigenai.2@sha256:9c4721241aaf7da1dd8832467c0e6bf472a1c8a18233ac206d3b7535f44c6dc1
   template:
     nodeSelector:
