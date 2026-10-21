@@ -85,3 +85,47 @@ patches:
                   # note there.
                   - name: AX_MAX_TASK_CPU
                     value: "6"
+  # ax-dbp: serve TLS on 8443 with the cert-manager Secret ax-server-tls
+  # (nix-fleet-hosts PR #301). Plaintext stays on 8080 for the probes,
+  # ax tunnels and in-cluster callers. The Secret volume is not optional:
+  # the pod stays Pending until the Secret exists.
+  - patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: ax-server
+        namespace: ax-system
+      spec:
+        template:
+          spec:
+            containers:
+              - name: ax-server
+                args:
+                  - "--addr=:8443"
+                  - "--plain-addr=:8080"
+                  - "--redis-addr=ax-redis.ax-system.svc.cluster.local:6379"
+                  - "--tls-cert-file=/etc/ax-server-tls/tls.crt"
+                  - "--tls-key-file=/etc/ax-server-tls/tls.key"
+                ports:
+                  - containerPort: 8443
+                    name: https
+                volumeMounts:
+                  - name: tls
+                    mountPath: /etc/ax-server-tls
+                    readOnly: true
+            volumes:
+              - name: tls
+                secret:
+                  secretName: ax-server-tls
+                  optional: false
+  - patch: |-
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: ax-server
+        namespace: ax-system
+      spec:
+        ports:
+          - port: 8443
+            targetPort: 8443
+            name: https

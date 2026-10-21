@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"log/slog"
+	"net/http"
 	"os"
 	"sync"
 	"time"
@@ -61,4 +62,13 @@ func (r *certReloader) get(*tls.ClientHelloInfo) (*tls.Certificate, error) {
 		r.certMod, r.keyMod = cs.ModTime(), ks.ModTime()
 	}
 	return r.cert, nil
+}
+
+// newPlainServer returns a plaintext server (HTTP/1 and h2c) for the ax tunnel
+// and the kubelet probes, which cannot check the TLS certificate.
+func newPlainServer(addr string, h http.Handler) *http.Server {
+	s := &http.Server{Addr: addr, Handler: h, Protocols: new(http.Protocols)}
+	s.Protocols.SetHTTP1(true)
+	s.Protocols.SetUnencryptedHTTP2(true)
+	return s
 }
