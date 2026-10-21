@@ -63,6 +63,7 @@ func main() {
 		maxTaskCPU    string
 		tlsCertFile   string
 		tlsKeyFile    string
+		plainAddr     string
 	)
 
 	flag.StringVar(&listenAddr, "addr", ":8080", "HTTP listen address")
@@ -71,6 +72,7 @@ func main() {
 	flag.StringVar(&maxTaskMemory, "max-task-memory", "", "Largest memory limit any worker can hold (Kubernetes quantity, e.g. 16Gi); UpdateTask rejects a task above it. Empty or 0 disables the check")
 	flag.StringVar(&maxTaskCPU, "max-task-cpu", "", "Largest cpu limit any worker can hold (Kubernetes quantity, e.g. 6); UpdateTask rejects a task above it. Empty or 0 disables the check")
 	flag.StringVar(&tlsCertFile, "tls-cert-file", "", "PEM certificate file; with --tls-key-file turns TLS on. Both files reload on change. Plaintext when unset")
+	flag.StringVar(&plainAddr, "plain-addr", "", "Extra plaintext listen address, for probes and the ax tunnel; only with TLS on. Off when unset")
 	flag.StringVar(&tlsKeyFile, "tls-key-file", "", "PEM private key file for --tls-cert-file")
 	flag.Parse()
 
@@ -135,6 +137,21 @@ func main() {
 		httpServer.Protocols.SetUnencryptedHTTP2(true)
 	}
 
+	var plainServer *http.Server
+	if plainAddr != "" {
+		if tlsConfig == nil {
+			slog.Error("--plain-addr needs TLS: set --tls-cert-file and --tls-key-file, or use --addr")
+			os.Exit(1)
+		}
+		plainServer = newPlainServer(plainAddr, srv.Handler())
+		go func() {
+			if err := plainServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				slog.Error("plaintext server failed", "error", err)
+				os.Exit(1)
+			}
+		}()
+	}
+
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
@@ -155,4 +172,7 @@ func main() {
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
 	_ = httpServer.Shutdown(shutdownCtx)
+	if plainServer != nil {
+		_ = plainServer.Shutdown(shutdownCtx)
+	}
 }

@@ -8,7 +8,10 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"io"
 	"math/big"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
@@ -146,5 +149,39 @@ func TestNewTLSConfigServesAndReloads(t *testing.T) {
 	}
 	if got := servedCN(t, addr, dir); got != "second" {
 		t.Fatalf("after bad renewal CN = %q, want second", got)
+	}
+}
+
+func TestNewPlainServerServesHTTP1AndH2C(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := newPlainServer("", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(r.Proto))
+	}))
+	go s.Serve(ln)
+	defer s.Close()
+	url := "http://" + ln.Addr().String()
+
+	for _, tc := range []struct {
+		name string
+		set  func(*http.Protocols)
+		want string
+	}{
+		{"http1", func(p *http.Protocols) { p.SetHTTP1(true) }, "HTTP/1.1"},
+		{"h2c", func(p *http.Protocols) { p.SetUnencryptedHTTP2(true) }, "HTTP/2.0"},
+	} {
+		tr := &http.Transport{Protocols: new(http.Protocols)}
+		tc.set(tr.Protocols)
+		resp, err := (&http.Client{Transport: tr}).Get(url)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if string(b) != tc.want {
+			t.Fatalf("%s: proto = %q, want %q", tc.name, b, tc.want)
+		}
 	}
 }
