@@ -191,3 +191,21 @@ func TestSSHRejectsTaskWithNoActor(t *testing.T) {
 		t.Fatalf("got err %v, want an error naming the missing actor", err)
 	}
 }
+
+func TestNewRouterDialerUsesAXRouter(t *testing.T) {
+	pf := func() (string, func(), error) {
+		t.Fatal("port-forward must not run when AX_ROUTER is set")
+		return "", nil, nil
+	}
+	dial := newRouterDialer("router.example:443", pf)
+	addr, cleanup, err := dial()
+	if err != nil || addr != "router.example:443" || cleanup != nil {
+		t.Fatalf("got %q, cleanup %v, err %v", addr, cleanup != nil, err)
+	}
+	called := false
+	dial = newRouterDialer("", func() (string, func(), error) { called = true; return "", nil, nil })
+	_, _, _ = dial()
+	if !called {
+		t.Fatal("port-forward must run when AX_ROUTER is empty")
+	}
+}

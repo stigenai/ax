@@ -1109,15 +1109,25 @@ func runSSH(serverURL, atespace, kubeContext string, args []string) error {
 			Name:     taskName,
 		})
 	}
-	dialRouter := func() (string, func(), error) {
+	dialRouter := newRouterDialer(os.Getenv("AX_ROUTER"), func() (string, func(), error) {
 		localPort, pfCleanup, err := tunnel.PortForward(context.Background(), kubeContext, "ate-system", "svc/atenet-router", 80)
 		if err != nil {
 			return "", nil, err
 		}
 		return fmt.Sprintf("127.0.0.1:%d", localPort), pfCleanup, nil
-	}
+	})
 
 	return runSSHExec(taskName, cmdToRun, getTask, dialRouter, sshRetryDelay, sshStartTimeout, os.Stdout, os.Stderr)
+}
+
+// newRouterDialer returns a dialer for atenet-router. A non-empty axRouter
+// (AX_ROUTER) is the address and portForward never runs. This serves callers,
+// such as a microVM, that cannot open a port-forward.
+func newRouterDialer(axRouter string, portForward routerDialer) routerDialer {
+	if axRouter != "" {
+		return func() (string, func(), error) { return axRouter, nil, nil }
+	}
+	return portForward
 }
 
 // runSSHExec connects to taskName's guest and runs cmdToRun, streaming output
