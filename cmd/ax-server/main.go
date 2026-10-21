@@ -61,6 +61,8 @@ func main() {
 		redisPassword string
 		maxTaskMemory string
 		maxTaskCPU    string
+		tlsCertFile   string
+		tlsKeyFile    string
 	)
 
 	flag.StringVar(&listenAddr, "addr", ":8080", "HTTP listen address")
@@ -68,6 +70,8 @@ func main() {
 	flag.StringVar(&redisPassword, "redis-password", "", "Redis password")
 	flag.StringVar(&maxTaskMemory, "max-task-memory", "", "Largest memory limit any worker can hold (Kubernetes quantity, e.g. 16Gi); UpdateTask rejects a task above it. Empty or 0 disables the check")
 	flag.StringVar(&maxTaskCPU, "max-task-cpu", "", "Largest cpu limit any worker can hold (Kubernetes quantity, e.g. 6); UpdateTask rejects a task above it. Empty or 0 disables the check")
+	flag.StringVar(&tlsCertFile, "tls-cert-file", "", "PEM certificate file; with --tls-key-file turns TLS on. Both files reload on change. Plaintext when unset")
+	flag.StringVar(&tlsKeyFile, "tls-key-file", "", "PEM private key file for --tls-cert-file")
 	flag.Parse()
 
 	if envAddr := os.Getenv("ADDR"); envAddr != "" {
@@ -96,6 +100,12 @@ func main() {
 		os.Exit(1)
 	}
 
+	tlsConfig, err := newTLSConfig(tlsCertFile, tlsKeyFile)
+	if err != nil {
+		slog.Error("invalid TLS flags", "error", err)
+		os.Exit(1)
+	}
+
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
 
@@ -118,13 +128,22 @@ func main() {
 	}
 	httpServer.Protocols = new(http.Protocols)
 	httpServer.Protocols.SetHTTP1(true)
-	httpServer.Protocols.SetUnencryptedHTTP2(true)
+	if tlsConfig != nil {
+		httpServer.TLSConfig = tlsConfig
+		httpServer.Protocols.SetHTTP2(true)
+	} else {
+		httpServer.Protocols.SetUnencryptedHTTP2(true)
+	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
 	go func() {
-		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		serve := httpServer.ListenAndServe
+		if tlsConfig != nil {
+			serve = func() error { return httpServer.ListenAndServeTLS("", "") }
+		}
+		if err := serve(); err != nil && err != http.ErrServerClosed {
 			slog.Error("HTTP server failed", "error", err)
 			os.Exit(1)
 		}
