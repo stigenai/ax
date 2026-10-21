@@ -19,12 +19,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"strings"
 	"time"
 
 	ateenvv1alpha "github.com/agent-substrate/env/proto/ateenv/v1alpha"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 )
 
@@ -43,10 +41,13 @@ func Dial(target string) (*Client, error) {
 // DialTarget connects to the guest daemon at the specified target, optionally injecting
 // the 'ate-target-actor' metadata header on all calls (required when routing via atenet-router).
 func DialTarget(target string, targetActor string) (*Client, error) {
-	target = strings.TrimPrefix(target, "http://")
-	target = strings.TrimPrefix(target, "https://")
+	addr := target
+	target, creds, err := TransportCredentials(addr)
+	if err != nil {
+		return nil, fmt.Errorf("connecting to guest at %s: %w", addr, err)
+	}
 
-	dialOpts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
+	dialOpts := []grpc.DialOption{grpc.WithTransportCredentials(creds)}
 	if targetActor != "" {
 		dialOpts = append(dialOpts,
 			grpc.WithChainUnaryInterceptor(func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {

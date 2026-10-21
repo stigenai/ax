@@ -32,7 +32,6 @@ import (
 	"github.com/google/ax/pkg/apis/v1alpha1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	"gopkg.in/yaml.v3"
@@ -190,13 +189,18 @@ Flags:
   -a, --atespace string       Task atespace scope (default: "default")
   -n, --namespace string      Kubernetes namespace where AX is installed (default: "ax-system")
   --context string            Kubernetes context (defaults to active kubectx / current-context)
-  --server string             AX API server address (default: auto-detected from kube context or $AX_SERVER)`)
+  --server string             AX API server address (default: auto-detected from kube context or $AX_SERVER)
+                              https:// uses TLS; $AX_CA_FILE adds a CA to the system roots
+Environment:
+  AX_ROUTER                   atenet-router address for ax ssh (skips the port-forward; https:// uses TLS)`)
 }
 
 func getAXClient(serverURL string) (v1alpha1.AXClient, *grpc.ClientConn, error) {
-	target := strings.TrimPrefix(serverURL, "http://")
-	target = strings.TrimPrefix(target, "https://")
-	conn, err := grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	target, creds, err := guest.TransportCredentials(serverURL)
+	if err != nil {
+		return nil, nil, fmt.Errorf("connecting to %s: %w", serverURL, err)
+	}
+	conn, err := grpc.NewClient(target, grpc.WithTransportCredentials(creds))
 	if err != nil {
 		return nil, nil, fmt.Errorf("connecting to %s: %w", target, err)
 	}
