@@ -11,12 +11,18 @@ metadata:
   labels:
     workload: ax
 spec:
-  # 10 workers hold 20 tasks at 2 tasks per worker (see below). On 2026-10-20,
-  # 6 workers held the factory manager and 11 worker tasks, and 11 more tasks
-  # waited for hours with WaitingForCapacity. Four more 8Gi requests fit the
-  # memory headroom of gtr-150 (2), gtr-151 (1) and gtr-152 (1). The comments
-  # below still describe the 6-worker sizing.
-  replicas: 10
+  # 28 workers hold 56 tasks at 2 tasks per worker (see below).
+  #
+  # On 2026-10-20, 6 workers held 12 tasks, and 11 more tasks waited for
+  # hours with WaitingForCapacity.
+  #
+  # gtr-150, gtr-151 and gtr-152 hold 9 workers. They have no memory left.
+  # On 2026-10-22, hs-2 got the substrate label. It has 40 CPU and about
+  # 247Gi allocatable, and it holds the other 19 workers. CPU sets this
+  # limit: 19 requests of 2 CPU plus 2.35 CPU of other pods.
+  #
+  # The comments below still describe the 6-worker sizing.
+  replicas: 28
   workerImage: ghcr.io/stigenai/substrate/ateom-gvisor:v0.3.0-stigenai.2@sha256:9c4721241aaf7da1dd8832467c0e6bf472a1c8a18233ac206d3b7535f44c6dc1
   template:
     nodeSelector:
