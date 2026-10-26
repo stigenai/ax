@@ -588,6 +588,24 @@ spec:
 	}
 }
 
+func TestValidateTaskSandboxClass(t *testing.T) {
+	for class, wantErr := range map[string]bool{
+		"":                           false,
+		v1alpha1.SandboxClassGVisor:  false,
+		v1alpha1.SandboxClassMicroVM: false,
+		"kata":                       true,
+		"MICROVM":                    true,
+	} {
+		err := v1alpha1.ValidateTask(&v1alpha1.Task{Spec: &v1alpha1.TaskSpec{SandboxClass: class}})
+		if (err != nil) != wantErr {
+			t.Errorf("sandboxClass %q: error = %v, want error %v", class, err, wantErr)
+		}
+	}
+	if (&v1alpha1.TaskSpec{}).ProtoReflect().Descriptor().Fields().ByName("sandbox_class").Number() != 13 {
+		t.Fatal("sandbox_class protobuf field number changed")
+	}
+}
+
 func TestValidateFabriekSupervisor(t *testing.T) {
 	valid := func() *v1alpha1.Task {
 		return &v1alpha1.Task{Spec: &v1alpha1.TaskSpec{
@@ -617,6 +635,7 @@ func TestValidateFabriekSupervisor(t *testing.T) {
 		"invalid attempt": func(s *v1alpha1.TaskSpec) { s.Env[0].Value = "not-a-uuid" },
 		"workspace goal":  func(s *v1alpha1.TaskSpec) { s.Workspaces[0].Goal = "start work" },
 		"workspace path":  func(s *v1alpha1.TaskSpec) { s.Workspaces[0].Path = "/etc/fabriek" },
+		"microvm":         func(s *v1alpha1.TaskSpec) { s.SandboxClass = v1alpha1.SandboxClassMicroVM },
 	} {
 		t.Run(name, func(t *testing.T) {
 			task := valid()

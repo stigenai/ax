@@ -262,6 +262,8 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 	launchTask.Spec.Env = nil
 	// Capabilities belong to the template; older runners reject this field.
 	launchTask.Spec.Capabilities = nil
+	// The sandbox class belongs to the template too, for the same reason.
+	launchTask.Spec.SandboxClass = ""
 	if taskYAML, err := yaml.Marshal(launchTask); err == nil {
 		extraEnv["AX_TASK_YAML"] = string(taskYAML)
 	}
@@ -274,7 +276,7 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 	// If a custom image, workspace, or extra environment is specified, provision or use a dedicated ActorTemplate
 	if task.Spec != nil && (task.Spec.Image != "" || len(extraEnv) > 0) {
 		slog.Info("ensuring custom ActorTemplate for task", "image", task.Spec.Image)
-		customTemplateName := taskTemplateName(task.Metadata.Name, task.Spec.Image, task.Spec.Capabilities, extraEnv)
+		customTemplateName := taskTemplateName(task.Metadata.Name, task.Spec.Image, task.Spec.Capabilities, task.Spec.GetSandboxClass(), extraEnv)
 
 		// The default books only memory, and only when the task named none:
 		// an explicit task limit always wins. This never touches task.Spec,
@@ -290,7 +292,7 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 			}
 		}
 
-		tmpl, err := r.client.EnsureActorTemplateWithImage(ctx, templateAtespace, templateName, atespace, customTemplateName, task.Spec.Image, task.Spec.SupervisorProfile, effectiveResources, task.Spec.Capabilities, extraEnv)
+		tmpl, err := r.client.EnsureActorTemplateWithImage(ctx, templateAtespace, templateName, atespace, customTemplateName, task.Spec.Image, task.Spec.SupervisorProfile, task.Spec.GetSandboxClass(), effectiveResources, task.Spec.Capabilities, extraEnv)
 		if err != nil {
 			// The default template has neither this image nor this env, so an
 			// actor made from it would not be this task: fail with the reason.
@@ -476,12 +478,16 @@ func (r *TaskReconciler) lookupGeminiKey(ctx context.Context, atespace string) s
 }
 
 // taskTemplateName derives the per-task ActorTemplate name from the task name and a
-// digest of the image, capabilities and container environment, so a spec change yields a new template.
-func taskTemplateName(taskName, image string, capabilities []string, env map[string]string) string {
+// digest of the image, capabilities, sandbox class and container environment, so a spec change yields a new template.
+func taskTemplateName(taskName, image string, capabilities []string, sandboxClass string, env map[string]string) string {
 	h := sha256.New()
 	h.Write([]byte(image))
 	for _, c := range capabilities {
 		h.Write([]byte("cap:" + c + ";"))
+	}
+	// Hashed only when set, so a task without one keeps its template name.
+	if sandboxClass != "" {
+		h.Write([]byte("sandbox:" + sandboxClass + ";"))
 	}
 	keys := make([]string, 0, len(env))
 	for k := range env {

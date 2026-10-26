@@ -37,7 +37,7 @@ func TestBuildActorTemplateResources(t *testing.T) {
 		resources := &v1alpha1.ResourceReqs{
 			Limits: &v1alpha1.ResourceList{Memory: "4Gi"},
 		}
-		tmpl := BuildActorTemplate("atespace", "name", "image", nil, nil, "", "", resources, nil)
+		tmpl := BuildActorTemplate("atespace", "name", "image", nil, nil, "", "", "", resources, nil)
 
 		if tmpl.GetResources() == nil {
 			t.Fatalf("want top-level Resources set, got nil")
@@ -52,7 +52,7 @@ func TestBuildActorTemplateResources(t *testing.T) {
 	})
 
 	t.Run("nil resources gives nil top-level Resources", func(t *testing.T) {
-		tmpl := BuildActorTemplate("atespace", "name", "image", nil, nil, "", "", nil, nil)
+		tmpl := BuildActorTemplate("atespace", "name", "image", nil, nil, "", "", "", nil, nil)
 		if tmpl.GetResources() != nil {
 			t.Fatalf("want nil top-level Resources, got %v", tmpl.GetResources())
 		}
@@ -62,7 +62,7 @@ func TestBuildActorTemplateResources(t *testing.T) {
 		resources := &v1alpha1.ResourceReqs{
 			Limits: &v1alpha1.ResourceList{Cpu: "2"},
 		}
-		tmpl := BuildActorTemplate("atespace", "name", "image", nil, nil, "", "", resources, nil)
+		tmpl := BuildActorTemplate("atespace", "name", "image", nil, nil, "", "", "", resources, nil)
 
 		got := tmpl.GetResources().GetLimits()
 		if len(got) != 1 || limitQuantity(got, "cpu") != "2" {
@@ -74,7 +74,7 @@ func TestBuildActorTemplateResources(t *testing.T) {
 		resources := &v1alpha1.ResourceReqs{
 			Limits: &v1alpha1.ResourceList{Cpu: "1", Memory: "2Gi"},
 		}
-		tmpl := BuildActorTemplate("atespace", "name", "image", nil, nil, "", v1alpha1.FabriekSupervisorProfile, resources, nil)
+		tmpl := BuildActorTemplate("atespace", "name", "image", nil, nil, "", v1alpha1.FabriekSupervisorProfile, "", resources, nil)
 
 		gotTop := tmpl.GetResources().GetLimits()
 		if len(gotTop) != 2 || limitQuantity(gotTop, "cpu") != "1" || limitQuantity(gotTop, "memory") != "2Gi" {
@@ -85,4 +85,21 @@ func TestBuildActorTemplateResources(t *testing.T) {
 			t.Fatalf("want Containers[0].Resources.Limits == [{cpu 1} {memory 2Gi}], got %v", gotContainer)
 		}
 	})
+}
+
+func TestBuildActorTemplateSandboxClass(t *testing.T) {
+	for _, tc := range []struct {
+		sandboxClass string
+		wantClass    ateapipb.SandboxClass
+		wantConfig   string
+	}{
+		{"", ateapipb.SandboxClass_SANDBOX_CLASS_GVISOR, "gvisor-default"},
+		{v1alpha1.SandboxClassGVisor, ateapipb.SandboxClass_SANDBOX_CLASS_GVISOR, "gvisor-default"},
+		{v1alpha1.SandboxClassMicroVM, ateapipb.SandboxClass_SANDBOX_CLASS_MICROVM, "microvm"},
+	} {
+		got := BuildActorTemplate("atespace", "name", "image", nil, nil, "", "", tc.sandboxClass, nil, nil).GetSandboxConfig()
+		if got.GetSandboxClass() != tc.wantClass || got.GetConfigName() != tc.wantConfig {
+			t.Errorf("sandboxClass %q: got %v, want %v/%s", tc.sandboxClass, got, tc.wantClass, tc.wantConfig)
+		}
+	}
 }

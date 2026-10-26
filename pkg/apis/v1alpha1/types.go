@@ -42,6 +42,10 @@ const (
 	KindModel                = "Model"
 	FabriekSupervisorProfile = "fabriek-native-v1"
 
+	// Sandbox classes a task can name in spec.sandboxClass. Empty means gVisor.
+	SandboxClassGVisor  = "gvisor"
+	SandboxClassMicroVM = "microvm"
+
 	// PhaseTerminating marks a task whose deletion has been requested and whose
 	// actor is being torn down. The record disappears once cleanup completes.
 	PhaseTerminating = "Terminating"
@@ -261,6 +265,11 @@ func ValidateTask(t *Task) error {
 	if err := validateSupervisorTask(spec); err != nil {
 		return err
 	}
+	switch spec.GetSandboxClass() {
+	case "", SandboxClassGVisor, SandboxClassMicroVM:
+	default:
+		return fmt.Errorf("spec.sandboxClass: %q is not one of %q, %q", spec.GetSandboxClass(), SandboxClassGVisor, SandboxClassMicroVM)
+	}
 	refs := spec.WorkspaceRefs()
 	paths := spec.WorkspacePaths()
 	names := make(map[string]bool, len(refs))
@@ -398,6 +407,10 @@ func validateSupervisorTask(spec *TaskSpec) error {
 	}
 	if len(spec.GetCapabilities()) > 0 {
 		return fmt.Errorf("Fabriek supervisor rejects task-supplied capabilities")
+	}
+	// The protected supervisor pool is a gVisor pool.
+	if spec.GetSandboxClass() == SandboxClassMicroVM {
+		return fmt.Errorf("Fabriek supervisor rejects spec.sandboxClass %q", SandboxClassMicroVM)
 	}
 	if spec.GetDebug() || !fabriekImage.MatchString(spec.GetImage()) || !slices.Equal(spec.GetCommand(), []string{"/usr/local/bin/python", "-m", "factory.execution.ax_worker", "serve"}) {
 		return fmt.Errorf("Fabriek supervisor requires debug=false, a digest-pinned image and the protected worker command")
