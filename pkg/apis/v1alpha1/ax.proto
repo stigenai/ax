@@ -96,6 +96,12 @@ message TaskSpec {
   repeated string capabilities = 11;
   // supervisor_profile opts into a protected platform bootstrap projection.
   string supervisor_profile = 12;
+  // sandbox_class selects the Substrate sandbox class for the task actor:
+  // "gvisor" (the default when empty) or "microvm" (a Cloud Hypervisor guest
+  // with a real Linux kernel, for work gVisor cannot run, such as Nix builds).
+  // A microvm task needs a WorkerPool with sandboxClass microvm and the
+  // cluster-scoped SandboxConfig named "microvm".
+  string sandbox_class = 13;
 }
 
 message EnvVar {

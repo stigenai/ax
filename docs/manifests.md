@@ -32,11 +32,18 @@ spec:
 
   debug: true   # serve guest services inside the sandbox so `ax ssh` works; off by default
   capabilities: ["SETUID", "SETGID"]   # added to the container's default set; see below
+  sandboxClass: gvisor   # gvisor (default) or microvm; see below
 ```
 
 ### Capabilities
 
 The task container starts as root with Substrate's default capabilities, `AUDIT_WRITE`, `KILL` and `NET_BIND_SERVICE`, so it cannot change user. `spec.capabilities` adds to that set, named without the `CAP_` prefix, and becomes the container's `securityContext.capabilities.add` in its ActorTemplate. `SETUID` and `SETGID` let a task drop its work to a non-root user, which tools that refuse root (PostgreSQL's `initdb`, say) need. Substrate refuses `ALL` and names it does not know, and the task fails with its reason. The sandbox stays the isolation boundary.
+
+### Sandbox class
+
+`spec.sandboxClass` selects the Substrate sandbox for the task actor. Empty or `gvisor` uses gVisor and the `gvisor-default` SandboxConfig. `microvm` uses a Cloud Hypervisor guest with a real Linux kernel and the cluster-scoped SandboxConfig named `microvm`. Use `microvm` for work that gVisor cannot run, such as Nix builds. A `microvm` task stays pending until a WorkerPool with `sandboxClass: microvm` has a free worker. The Fabriek supervisor profile rejects `microvm`.
+
+A root Nix build inside a `microvm` task also needs capabilities, because Nix changes the owner of `/nix/store` and starts its builds as the `nixbld` users. In a test on 2026-10-26, a build with these capabilities passed: `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `FSETID`, `SETUID`, `SETGID`, `SETPCAP`, `SETFCAP`, `MKNOD`, `SYS_ADMIN`, `SYS_CHROOT` and `SYS_PTRACE`. A smaller set was not tested.
 
 ### Binding several workspaces
 

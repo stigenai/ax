@@ -639,6 +639,36 @@ func TestTaskReconciler_Capabilities(t *testing.T) {
 	}
 }
 
+// spec.sandboxClass selects the template's SandboxConfig and its name digest,
+// but stays out of AX_TASK_YAML, which a runner built before the field would refuse.
+func TestTaskReconciler_SandboxClass(t *testing.T) {
+	reconcile := func(sandboxClass string) *ateapipb.ActorTemplate {
+		mockSrv := &mockControlServer{}
+		task := envTask("x")
+		task.Spec.SandboxClass = sandboxClass
+		if _, err := newTestReconciler(t, mockSrv).Reconcile(context.Background(), task); err != nil {
+			t.Fatalf("Reconcile(%q) failed: %v", sandboxClass, err)
+		}
+		return mockSrv.lastTemplate
+	}
+	gvisor, microvm := reconcile(""), reconcile(v1alpha1.SandboxClassMicroVM)
+
+	if got := gvisor.GetSandboxConfig(); got.GetSandboxClass() != ateapipb.SandboxClass_SANDBOX_CLASS_GVISOR || got.GetConfigName() != "gvisor-default" {
+		t.Errorf("default sandbox config = %v", got)
+	}
+	if got := microvm.GetSandboxConfig(); got.GetSandboxClass() != ateapipb.SandboxClass_SANDBOX_CLASS_MICROVM || got.GetConfigName() != "microvm" {
+		t.Errorf("microvm sandbox config = %v", got)
+	}
+	if gvisor.GetMetadata().GetName() == microvm.GetMetadata().GetName() {
+		t.Errorf("sandbox class did not change the template name %q", gvisor.GetMetadata().GetName())
+	}
+	for _, e := range microvm.GetContainers()[0].GetEnv() {
+		if e.GetName() == "AX_TASK_YAML" && strings.Contains(e.GetValue(), "sandbox") {
+			t.Errorf("AX_TASK_YAML carries the sandbox class: %q", e.GetValue())
+		}
+	}
+}
+
 // taskTopLevelMemory returns the top-level memory limit quantity the mock
 // server captured, or "" if the template carries no top-level Resources.
 func taskTopLevelMemory(tmpl *ateapipb.ActorTemplate) string {

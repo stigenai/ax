@@ -236,8 +236,24 @@ func resourceLimitsFromReqs(resources *v1alpha1.ResourceReqs) []*ateapipb.Limits
 	return limits
 }
 
+// sandboxConfigFor maps a task's spec.sandboxClass to the Substrate sandbox
+// class and the cluster-scoped SandboxConfig that supplies its binaries.
+// ValidateTask rejects other values, so anything else means gVisor.
+func sandboxConfigFor(sandboxClass string) *ateapipb.SandboxConfig {
+	if sandboxClass == v1alpha1.SandboxClassMicroVM {
+		return &ateapipb.SandboxConfig{
+			SandboxClass: ateapipb.SandboxClass_SANDBOX_CLASS_MICROVM,
+			ConfigName:   "microvm",
+		}
+	}
+	return &ateapipb.SandboxConfig{
+		SandboxClass: ateapipb.SandboxClass_SANDBOX_CLASS_GVISOR,
+		ConfigName:   "gvisor-default",
+	}
+}
+
 // BuildActorTemplate constructs a Substrate ActorTemplate based on the standard ate-env specification.
-func BuildActorTemplate(atespace, name, image string, envMap map[string]string, command []string, snapshotsBucket, supervisorProfile string, resources *v1alpha1.ResourceReqs, capabilities []string) *ateapipb.ActorTemplate {
+func BuildActorTemplate(atespace, name, image string, envMap map[string]string, command []string, snapshotsBucket, supervisorProfile, sandboxClass string, resources *v1alpha1.ResourceReqs, capabilities []string) *ateapipb.ActorTemplate {
 	if atespace == "" {
 		atespace = "default"
 	}
@@ -313,10 +329,7 @@ func BuildActorTemplate(atespace, name, image string, envMap map[string]string, 
 				FromData: ateapipb.ResumeSource_RESUME_SOURCE_GOLDEN,
 			},
 		},
-		SandboxConfig: &ateapipb.SandboxConfig{
-			SandboxClass: ateapipb.SandboxClass_SANDBOX_CLASS_GVISOR,
-			ConfigName:   "gvisor-default",
-		},
+		SandboxConfig: sandboxConfigFor(sandboxClass),
 	}
 	if limits := resourceLimitsFromReqs(resources); limits != nil {
 		// Set on every task, supervisor or not: Substrate's scheduler
@@ -348,7 +361,7 @@ func BuildActorTemplate(atespace, name, image string, envMap map[string]string, 
 }
 
 // EnsureActorTemplateWithImage creates an ActorTemplate using the specified container image and optional environment variables.
-func (c *Client) EnsureActorTemplateWithImage(ctx context.Context, baseAtespace, baseTemplate, targetAtespace, targetTemplate, image, supervisorProfile string, resources *v1alpha1.ResourceReqs, capabilities []string, extraEnv ...map[string]string) (*ateapipb.ActorTemplate, error) {
+func (c *Client) EnsureActorTemplateWithImage(ctx context.Context, baseAtespace, baseTemplate, targetAtespace, targetTemplate, image, supervisorProfile, sandboxClass string, resources *v1alpha1.ResourceReqs, capabilities []string, extraEnv ...map[string]string) (*ateapipb.ActorTemplate, error) {
 	envMap := make(map[string]string)
 	for _, envs := range extraEnv {
 		for k, v := range envs {
@@ -356,7 +369,7 @@ func (c *Client) EnsureActorTemplateWithImage(ctx context.Context, baseAtespace,
 		}
 	}
 
-	tmpl := BuildActorTemplate(targetAtespace, targetTemplate, image, envMap, nil, "", supervisorProfile, resources, capabilities)
+	tmpl := BuildActorTemplate(targetAtespace, targetTemplate, image, envMap, nil, "", supervisorProfile, sandboxClass, resources, capabilities)
 	existing, err := c.GetActorTemplate(ctx, targetAtespace, targetTemplate)
 	if err == nil && existing != nil {
 		if supervisorProfile != "" && !sameTemplateSpec(existing, tmpl) {
