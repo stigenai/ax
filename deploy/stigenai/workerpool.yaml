@@ -159,3 +159,63 @@ spec:
       requests:
         cpu: "2"
         memory: 8Gi
+---
+# ax-3hy: micro-VM workers for tasks with spec.sandboxClass: microvm, such as
+# Nix builds, which fail under gVisor. Each actor is a Cloud Hypervisor guest
+# with a real Linux kernel. The worker pod requests the ate.dev/kvm extended
+# resource, so the scheduler puts it only on a node with /dev/kvm.
+#
+# The guest RAM must really be there, so the memory request equals the limit.
+# The limits match the gVisor pool above, so AX_MAX_TASK_MEMORY and
+# AX_MAX_TASK_CPU stay true for both pools.
+# ponytail: 1 worker; raise replicas when microvm tasks wait for capacity.
+apiVersion: ate.dev/v1alpha1
+kind: WorkerPool
+metadata:
+  name: ax-microvm
+  namespace: ax-system
+  labels:
+    workload: ax-microvm
+spec:
+  replicas: 1
+  sandboxClass: microvm
+  workerImage: ghcr.io/stigenai/substrate/ateom-microvm:v0.3.0-stigenai.2@sha256:14c13378bb43f3379e95f6da68d0b5a6b8be1e66dce64d974496a33fff75a066
+  template:
+    nodeSelector:
+      ate.dev/substrate-version: v0.3.0-stigenai.2
+    resources:
+      limits:
+        cpu: "6"
+        memory: 16Gi
+      requests:
+        cpu: "2"
+        memory: 16Gi
+---
+# ax-3hy: the cluster-scoped SandboxConfig that microvm task templates name
+# (sandboxConfig.configName: microvm). The assets are kata 4.1.0 and
+# cloud-hypervisor v53.0 for amd64, with the sha256 values that Substrate pins
+# in manifests/microvm/sandboxconfig-microvm.yaml.tmpl. atelet downloads them
+# from the in-cluster object store bucket ate-snapshots, prefix kata-assets/.
+# Stage the four files there before this applies (hack/microvm-assets/ in
+# Substrate assembles them).
+apiVersion: ate.dev/v1alpha1
+kind: SandboxConfig
+metadata:
+  name: microvm
+spec:
+  sandboxClass: microvm
+  pauseImage: "registry.k8s.io/pause:3.10.2@sha256:f548e0e8e3dc1896ca956272154dde3314e8cc4fde0a57577ee9fa1c63f5baf4"
+  assets:
+    amd64:
+      cloud-hypervisor:
+        url: "gs://ate-snapshots/kata-assets/cloud-hypervisor"
+        sha256: "448af3d4e59b22c2987f7df94c213ad40fb53a10d437e42b5ee6c4fce7c29ecc"
+      virtiofsd:
+        url: "gs://ate-snapshots/kata-assets/virtiofsd"
+        sha256: "15b2e72a78cc08a9bd8a6943e89fb69c88cb3cbeb63069efceade835342ac7d4"
+      kata-kernel:
+        url: "gs://ate-snapshots/kata-assets/vmlinux"
+        sha256: "8e9dbc3a6e4c26adb089d23d31201edebce905c7f3e31aa67b32bdd41df1b86f"
+      kata-image:
+        url: "gs://ate-snapshots/kata-assets/rootfs.img"
+        sha256: "96497f64da1de9c7473fef46c3d29ddd0805d334731cf9d903a21a5b2c33cefb"
