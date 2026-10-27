@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -52,6 +53,23 @@ func resolveMaxQuantity(value string) (resource.Quantity, error) {
 		return resource.Quantity{}, fmt.Errorf("%q must be greater than zero", value)
 	}
 	return q, nil
+}
+
+// minAuthTokenLen is the shortest AX_AUTH_TOKEN the server accepts.
+const minAuthTokenLen = 32
+
+// resolveAuthToken reads the AX_AUTH_TOKEN value. An empty value turns caller
+// authentication off. Any other value is trimmed and must then hold at least
+// minAuthTokenLen bytes. If it does not, the server must not start.
+func resolveAuthToken(value string) (string, error) {
+	if value == "" {
+		return "", nil
+	}
+	token := strings.TrimSpace(value)
+	if len(token) < minAuthTokenLen {
+		return "", fmt.Errorf("must hold at least %d bytes after trimming whitespace", minAuthTokenLen)
+	}
+	return token, nil
 }
 
 func main() {
@@ -102,6 +120,12 @@ func main() {
 		os.Exit(1)
 	}
 
+	authToken, err := resolveAuthToken(os.Getenv("AX_AUTH_TOKEN"))
+	if err != nil {
+		slog.Error("invalid AX_AUTH_TOKEN", "error", err)
+		os.Exit(1)
+	}
+
 	tlsConfig, err := newTLSConfig(tlsCertFile, tlsKeyFile)
 	if err != nil {
 		slog.Error("invalid TLS flags", "error", err)
@@ -111,7 +135,10 @@ func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
 
-	slog.Info("starting ax-server", "listenAddr", listenAddr, "redisAddr", redisAddr, "maxTaskMemory", maxTaskMemoryQuantity.String(), "maxTaskCpu", maxTaskCPUQuantity.String())
+	slog.Info("starting ax-server", "listenAddr", listenAddr, "redisAddr", redisAddr, "maxTaskMemory", maxTaskMemoryQuantity.String(), "maxTaskCpu", maxTaskCPUQuantity.String(), "callerAuth", map[bool]string{true: "on", false: "off"}[authToken != ""])
+	if authToken == "" {
+		slog.Warn("caller authentication is off: any client that reaches ax-server can change tasks; set AX_AUTH_TOKEN")
+	}
 
 	rClient := goredis.NewClient(&goredis.Options{
 		Addr:     redisAddr,
@@ -123,6 +150,7 @@ func main() {
 	srv := server.NewServer(rStore)
 	srv.MaxTaskMemory = maxTaskMemoryQuantity
 	srv.MaxTaskCPU = maxTaskCPUQuantity
+	srv.AuthToken = authToken
 
 	httpServer := &http.Server{
 		Addr:    listenAddr,
