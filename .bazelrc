@@ -5,3 +5,26 @@ build --host_action_env=CGO_ENABLED=0
 build --@rules_go//go/config:static
 build --@rules_go//go/config:pure
 test --test_output=errors
+
+# BuildBuddy invocation UI (opt-in): bazel test //... --config=bes
+# The API key is a secret. Do not commit it. Put it in ~/.bazelrc:
+#   build:bes --bes_header=x-buildbuddy-api-key=<key>
+#   build:rbe --remote_header=x-buildbuddy-api-key=<key>
+# CI writes these two lines from the BUILDBUDDY_API_KEY secret.
+build:bes --bes_backend=grpcs://stigen-ai-bb.buildbuddy.io
+build:bes --bes_results_url=https://stigen-ai-bb.buildbuddy.io/invocation/
+
+# Remote build execution: BuildBuddy cloud scheduler and cache, executors in pool gtr.
+build:rbe --remote_executor=grpcs://stigen-ai-bb.buildbuddy.io
+build:rbe --remote_cache=grpcs://stigen-ai-bb.buildbuddy.io
+build:rbe --remote_default_exec_properties=Pool=gtr
+build:rbe --remote_default_exec_properties=container-image=docker://gcr.io/flame-public/rbe-ubuntu20-04:latest
+build:rbe --spawn_strategy=remote,sandboxed,local
+# If the pool is down, run local. A failing test still fails.
+build:rbe --remote_local_fallback
+build:rbe --jobs=200
+build:rbe --config=bes
+
+# CI
+common:ci --lockfile_mode=error
+build:ci --repository_cache=~/.cache/bazel-repo
