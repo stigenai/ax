@@ -1,0 +1,39 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "substrate",
+    srcs = [
+        "client.go",
+        "native_egress.go",
+    ],
+    importpath = "github.com/google/ax/internal/substrate",
+    visibility = ["//:__subpackages__"],
+    deps = [
+        "//pkg/apis/v1alpha1",
+        "@com_github_agent_substrate_substrate//pkg/proto/ateapipb",
+        "@org_golang_google_grpc//:grpc",
+        "@org_golang_google_grpc//codes",
+        "@org_golang_google_grpc//credentials",
+        "@org_golang_google_grpc//credentials/insecure",
+        "@org_golang_google_grpc//status",
+        "@org_golang_google_protobuf//proto",
+    ],
+)
+
+go_test(
+    name = "substrate_test",
+    srcs = [
+        "client_test.go",
+        "get_actor_test.go",
+        "list_actors_test.go",
+    ],
+    embed = [":substrate"],
+    deps = [
+        "//pkg/apis/v1alpha1",
+        "@com_github_agent_substrate_substrate//pkg/proto/ateapipb",
+        "@org_golang_google_grpc//:grpc",
+        "@org_golang_google_grpc//codes",
+        "@org_golang_google_grpc//credentials/insecure",
+        "@org_golang_google_grpc//status",
+    ],
+)

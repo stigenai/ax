@@ -11,4 +11,14 @@ go_sdk.from_file(go_mod = "//:go.mod")
 
 go_deps = use_extension("@gazelle//:extensions.bzl", "go_deps")
 go_deps.from_file(go_mod = "//:go.mod")
+
+# These modules check in their .pb.go files. Build those, not the proto rules.
+go_deps.gazelle_override(
+    directives = ["gazelle:proto disable"],
+    path = "github.com/agent-substrate/env",
+)
+go_deps.gazelle_override(
+    directives = ["gazelle:proto disable"],
+    path = "github.com/agent-substrate/substrate",
+)
 use_repo(go_deps, "com_github_agent_substrate_env", "com_github_agent_substrate_substrate", "com_github_redis_go_redis_v9", "in_gopkg_yaml_v3", "io_k8s_apimachinery", "org_golang_google_grpc", "org_golang_google_protobuf", "org_golang_x_net")

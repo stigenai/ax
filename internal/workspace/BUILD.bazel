@@ -1,0 +1,30 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "workspace",
+    srcs = [
+        "planner.go",
+        "setup.go",
+    ],
+    importpath = "github.com/google/ax/internal/workspace",
+    visibility = ["//:__subpackages__"],
+    deps = [
+        "//internal/model",
+        "//internal/store",
+        "//pkg/apis/v1alpha1",
+    ],
+)
+
+go_test(
+    name = "workspace_test",
+    srcs = [
+        "planner_test.go",
+        "setup_test.go",
+    ],
+    deps = [
+        ":workspace",
+        "//internal/model",
+        "//internal/store/memory",
+        "//pkg/apis/v1alpha1",
+    ],
+)

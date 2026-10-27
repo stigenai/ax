@@ -1,0 +1,23 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "runner",
+    srcs = ["runner.go"],
+    importpath = "github.com/google/ax/runner",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//internal/metadata",
+        "//internal/workspace",
+        "//pkg/apis/v1alpha1",
+    ],
+)
+
+go_test(
+    name = "runner_test",
+    srcs = ["runner_test.go"],
+    deps = [
+        ":runner",
+        "//internal/workspace",
+        "//pkg/apis/v1alpha1",
+    ],
+)

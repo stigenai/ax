@@ -1,0 +1,28 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "memory",
+    srcs = ["store.go"],
+    importpath = "github.com/google/ax/internal/store/memory",
+    visibility = ["//:__subpackages__"],
+    deps = [
+        "//internal/store",
+        "//pkg/apis/v1alpha1",
+        "@org_golang_google_protobuf//proto",
+    ],
+)
+
+go_test(
+    name = "memory_test",
+    srcs = [
+        "delete_test.go",
+        "requeue_delete_test.go",
+        "update_if_test.go",
+    ],
+    embed = [":memory"],
+    deps = [
+        "//internal/store",
+        "//pkg/apis/v1alpha1",
+        "@org_golang_google_protobuf//types/known/timestamppb",
+    ],
+)

@@ -1,0 +1,27 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "metadata",
+    srcs = ["server.go"],
+    importpath = "github.com/google/ax/internal/metadata",
+    visibility = ["//:__subpackages__"],
+    deps = [
+        "//pkg/apis/v1alpha1",
+        "@com_github_agent_substrate_env//guest",
+        "@in_gopkg_yaml_v3//:yaml_v3",
+        "@org_golang_google_grpc//:grpc",
+    ],
+)
+
+go_test(
+    name = "metadata_test",
+    srcs = ["server_test.go"],
+    deps = [
+        ":metadata",
+        "//pkg/apis/v1alpha1",
+        "@com_github_agent_substrate_env//proto/ateenv/v1alpha",
+        "@in_gopkg_yaml_v3//:yaml_v3",
+        "@org_golang_google_grpc//:grpc",
+        "@org_golang_google_grpc//credentials/insecure",
+    ],
+)
