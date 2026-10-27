@@ -189,6 +189,17 @@ ax --context=dev-cluster get tasks
 | `--context` | Kubernetes context to target | active `kubectx` / `current-context` |
 | `--server` | Control plane address, bypassing auto-detection | derived from kube context, or `$AX_SERVER` |
 
+### Caller authentication
+
+`ax-server` can require a bearer token on every gRPC call. Set `AX_AUTH_TOKEN`
+on `ax-server` to a value of 32 bytes or more. If it is unset, auth is off.
+`/healthz` stays open.
+
+Set the same `AX_AUTH_TOKEN` for the `ax` CLI. The CLI sends it as
+`authorization: Bearer <token>`. The CLI sends it only over TLS (`https://`) or to a
+loopback address, and returns an error for any other plaintext address. The CLI
+never sends it to `AX_ROUTER`.
+
 ## License
 
 Apache License 2.0. See [LICENSE](LICENSE) for details.
