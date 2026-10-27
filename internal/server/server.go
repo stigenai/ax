@@ -16,7 +16,9 @@ package server
 
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
+	"log/slog"
 	"net/http"
 	"strings"
 
@@ -24,6 +26,8 @@ import (
 	"github.com/google/ax/pkg/apis/v1alpha1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -46,14 +50,55 @@ type Server struct {
 	// UpdateTask checks a task's cpu limit against this value. A zero
 	// value, the default, turns the check off.
 	MaxTaskCPU resource.Quantity
+
+	// AuthToken is the bearer token every gRPC call must carry. Set it
+	// before the server takes calls. An empty value, the default, turns
+	// caller authentication off. /healthz is HTTP and stays open.
+	AuthToken string
+}
+
+// authorize lets a call pass only if it has exactly one authorization
+// value and that value is "Bearer " plus AuthToken. It fails closed.
+func (s *Server) authorize(ctx context.Context, method string) error {
+	if s.AuthToken == "" {
+		return nil
+	}
+	md, _ := metadata.FromIncomingContext(ctx)
+	if v := md.Get("authorization"); len(v) == 1 &&
+		subtle.ConstantTimeCompare([]byte(v[0]), []byte("Bearer "+s.AuthToken)) == 1 {
+		return nil
+	}
+	peerAddr := ""
+	if p, ok := peer.FromContext(ctx); ok {
+		peerAddr = p.Addr.String()
+	}
+	slog.Info("rejected unauthenticated call", "method", method, "peer", peerAddr)
+	return status.Error(codes.Unauthenticated, "missing or invalid credentials")
+}
+
+func (s *Server) unaryAuth(ctx context.Context, req any, info *grpc.UnaryServerInfo, next grpc.UnaryHandler) (any, error) {
+	if err := s.authorize(ctx, info.FullMethod); err != nil {
+		return nil, err
+	}
+	return next(ctx, req)
+}
+
+func (s *Server) streamAuth(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, next grpc.StreamHandler) error {
+	if err := s.authorize(ss.Context(), info.FullMethod); err != nil {
+		return err
+	}
+	return next(srv, ss)
 }
 
 // NewServer creates a new AX API server.
 func NewServer(s store.Store) *Server {
 	srv := &Server{
-		store:      s,
-		grpcServer: grpc.NewServer(),
+		store: s,
 	}
+	srv.grpcServer = grpc.NewServer(
+		grpc.ChainUnaryInterceptor(srv.unaryAuth),
+		grpc.ChainStreamInterceptor(srv.streamAuth),
+	)
 	v1alpha1.RegisterAXServer(srv.grpcServer, srv)
 	return srv
 }
