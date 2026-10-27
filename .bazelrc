@@ -1,0 +1,7 @@
+common --enable_bzlmod
+common --noincompatible_disallow_empty_glob
+build --action_env=CGO_ENABLED=0
+build --host_action_env=CGO_ENABLED=0
+build --@rules_go//go/config:static
+build --@rules_go//go/config:pure
+test --test_output=errors
