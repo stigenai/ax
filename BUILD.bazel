@@ -1,0 +1,11 @@
+load("@gazelle//:def.bzl", "gazelle")
+
+# gazelle:prefix github.com/google/ax
+# gazelle:proto disable_global
+# gazelle:exclude deploy
+# gazelle:exclude docs
+# gazelle:exclude examples
+# gazelle:exclude assets
+# gazelle:exclude .beads
+
+gazelle(name = "gazelle")

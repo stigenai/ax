@@ -1,0 +1,24 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "model",
+    srcs = ["client.go"],
+    importpath = "github.com/google/ax/internal/model",
+    visibility = ["//:__subpackages__"],
+    deps = [
+        "//internal/store",
+        "//pkg/apis/v1alpha1",
+        "@org_golang_google_protobuf//types/known/structpb",
+    ],
+)
+
+go_test(
+    name = "model_test",
+    srcs = ["client_test.go"],
+    deps = [
+        ":model",
+        "//internal/store/memory",
+        "//pkg/apis/v1alpha1",
+        "@org_golang_google_protobuf//types/known/structpb",
+    ],
+)

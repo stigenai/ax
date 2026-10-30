@@ -1,0 +1,37 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "redis",
+    srcs = ["store.go"],
+    importpath = "github.com/google/ax/internal/store/redis",
+    visibility = ["//:__subpackages__"],
+    deps = [
+        "//internal/store",
+        "//pkg/apis/v1alpha1",
+        "@com_github_redis_go_redis_v9//:go-redis",
+        "@org_golang_google_protobuf//encoding/protojson",
+    ],
+)
+
+go_test(
+    name = "redis_test",
+    srcs = [
+        "claim_test.go",
+        "delete_test.go",
+        "requeue_delete_test.go",
+        "requeue_test.go",
+        "update_if_test.go",
+    ],
+    embed = [":redis"],
+    # Needs a Redis at AX_DELETE_TEST_REDIS_ADDRESS on the host: never cache, never run remote.
+    tags = [
+        "external",
+        "no-remote-exec",
+    ],
+    deps = [
+        "//internal/store",
+        "//pkg/apis/v1alpha1",
+        "@com_github_redis_go_redis_v9//:go-redis",
+        "@org_golang_google_protobuf//types/known/timestamppb",
+    ],
+)

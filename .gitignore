@@ -16,3 +16,4 @@ cmd/ax-task-runner/__pycache__/antigravity_bootstrap.cpython-313.pyc
 .beads-credential-key
 .beads/proxieddb/
 *.gate.lock*
+/bazel-*

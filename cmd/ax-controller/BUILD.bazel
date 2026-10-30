@@ -1,0 +1,34 @@
+load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
+
+go_library(
+    name = "ax-controller_lib",
+    srcs = ["main.go"],
+    importpath = "github.com/google/ax/cmd/ax-controller",
+    visibility = ["//visibility:private"],
+    deps = [
+        "//internal/controller",
+        "//internal/store/redis",
+        "//internal/substrate",
+        "//pkg/apis/v1alpha1",
+        "@com_github_redis_go_redis_v9//:go-redis",
+        "@io_k8s_apimachinery//pkg/api/resource",
+    ],
+)
+
+go_binary(
+    name = "ax-controller",
+    embed = [":ax-controller_lib"],
+    visibility = ["//visibility:public"],
+)
+
+go_test(
+    name = "ax-controller_test",
+    srcs = ["main_test.go"],
+    embed = [":ax-controller_lib"],
+    deps = [
+        "//internal/controller",
+        "//internal/store/memory",
+        "@com_github_agent_substrate_substrate//pkg/proto/ateapipb",
+        "@io_k8s_apimachinery//pkg/api/resource",
+    ],
+)
