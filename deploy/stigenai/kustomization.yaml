@@ -85,6 +85,16 @@ patches:
                   # note there.
                   - name: AX_MAX_TASK_CPU
                     value: "6"
+                  # ax-0yc: caller auth. Without the Secret the server runs
+                  # with auth off. With it, every gRPC call needs
+                  # "authorization: Bearer <token>" (32 bytes or more).
+                  # Create the Secret only after every caller sends the token.
+                  - name: AX_AUTH_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: ax-server-auth
+                        key: token
+                        optional: true
   # ax-dbp: serve TLS on 8443 with the cert-manager Secret ax-server-tls
   # (nix-fleet-hosts PR #301). Plaintext stays on 8080 for the probes,
   # ax tunnels and in-cluster callers. The Secret volume is not optional:

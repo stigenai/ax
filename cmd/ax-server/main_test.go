@@ -20,6 +20,34 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 )
 
+func TestResolveAuthToken(t *testing.T) {
+	tok := "0123456789abcdef0123456789abcdef"
+	cases := []struct {
+		name    string
+		value   string
+		want    string
+		wantErr bool
+	}{
+		{name: "unset is off", value: ""},
+		{name: "32 bytes is on", value: tok, want: tok},
+		{name: "value is trimmed", value: "  " + tok + "\n", want: tok},
+		{name: "31 bytes is an error", value: tok[:31], wantErr: true},
+		{name: "whitespace only is an error", value: "   \n", wantErr: true},
+		{name: "short after trim is an error", value: " " + tok[:31] + " ", wantErr: true},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := resolveAuthToken(tt.value)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("resolveAuthToken(%q) error = %v, wantErr %v", tt.value, err, tt.wantErr)
+			}
+			if got != tt.want {
+				t.Fatalf("resolveAuthToken(%q) = %q, want %q", tt.value, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestResolveMaxQuantity(t *testing.T) {
 	cases := []struct {
 		name    string

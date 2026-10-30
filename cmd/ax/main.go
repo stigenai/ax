@@ -21,6 +21,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"sort"
 	"strings"
@@ -192,7 +193,8 @@ Flags:
   --server string             AX API server address (default: auto-detected from kube context or $AX_SERVER)
                               https:// uses TLS; $AX_CA_FILE adds a CA to the system roots
 Environment:
-  AX_ROUTER                   atenet-router address for ax ssh (skips the port-forward; https:// uses TLS)`)
+  AX_AUTH_TOKEN               bearer token for ax-server; sent only over TLS or to a loopback address, never to AX_ROUTER
+  AX_ROUTER                  atenet-router address for ax ssh (skips the port-forward; https:// uses TLS)`)
 }
 
 func getAXClient(serverURL string) (v1alpha1.AXClient, *grpc.ClientConn, error) {
@@ -200,11 +202,42 @@ func getAXClient(serverURL string) (v1alpha1.AXClient, *grpc.ClientConn, error) 
 	if err != nil {
 		return nil, nil, fmt.Errorf("connecting to %s: %w", serverURL, err)
 	}
-	conn, err := grpc.NewClient(target, grpc.WithTransportCredentials(creds))
+	opts := []grpc.DialOption{grpc.WithTransportCredentials(creds)}
+	if token := strings.TrimSpace(os.Getenv("AX_AUTH_TOKEN")); token != "" {
+		if creds.Info().SecurityProtocol != "tls" && !isLoopbackTarget(target) {
+			return nil, nil, fmt.Errorf("connecting to %s: AX_AUTH_TOKEN is set, so the address must use TLS (https://) or be a loopback address", serverURL)
+		}
+		opts = append(opts, grpc.WithPerRPCCredentials(bearerCreds{token}))
+	}
+	conn, err := grpc.NewClient(target, opts...)
 	if err != nil {
 		return nil, nil, fmt.Errorf("connecting to %s: %w", target, err)
 	}
 	return v1alpha1.NewAXClient(conn), conn, nil
+}
+
+// bearerCreds adds "Bearer <token>" to every call. It does not require
+// transport security: getAXClient allows plaintext only to a loopback address.
+type bearerCreds struct{ token string }
+
+func (b bearerCreds) GetRequestMetadata(context.Context, ...string) (map[string]string, error) {
+	return map[string]string{"authorization": "Bearer " + b.token}, nil
+}
+
+func (bearerCreds) RequireTransportSecurity() bool { return false }
+
+// isLoopbackTarget reports whether a host:port target names localhost or a
+// loopback IP. A target it cannot parse is not loopback.
+func isLoopbackTarget(target string) bool {
+	host, _, err := net.SplitHostPort(target)
+	if err != nil {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func runApply(serverURL string, args []string) error {
