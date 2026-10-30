@@ -26,6 +26,7 @@ go_binary(
 go_test(
     name = "ax_test",
     srcs = [
+        "auth_test.go",
         "delete_test.go",
         "main_test.go",
         "ssh_stale_test.go",
