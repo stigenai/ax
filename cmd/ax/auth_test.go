@@ -31,7 +31,7 @@ import (
 	"google.golang.org/grpc/metadata"
 )
 
-const testAuthToken = "0123456789abcdef0123456789abcdef"
+const testAuthToken = "zqsecret-zqsecret-zqsecret-zqsec"
 
 func portOf(t *testing.T, a net.Addr) string {
 	t.Helper()
