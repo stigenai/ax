@@ -32,7 +32,7 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-const authToken = "0123456789abcdef0123456789abcdef"
+const authToken = "zqsecret-zqsecret-zqsecret-zqsec"
 
 func startAuthServer(t *testing.T, token string) v1alpha1.AXClient {
 	t.Helper()
