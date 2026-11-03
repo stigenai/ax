@@ -19,13 +19,16 @@ spec:
   # gtr-150, gtr-151 and gtr-152 hold 9 workers.
   # On 2026-11-03 the owner asked for 30 workers. gtr-151 had about 13.9Gi
   # and gtr-152 about 10.6Gi of memory not requested, so each takes one more
-  # worker (8Gi request). After that, the gtr nodes have no memory left.
+  # worker (8Gi request).
+  # With 30 live, gtr-150 still had about 14.8Gi and 9.7 CPU not requested, so
+  # it takes a 31st worker. That is the most the labeled nodes hold: gtr-151
+  # and gtr-152 then had 5.9Gi and 2.6Gi left, and hs-2 has 1.6 CPU left.
   # On 2026-10-22, hs-2 got the substrate label. It has 40 CPU and about
   # 247Gi allocatable, and it holds the other 19 workers. CPU sets this
   # limit: 19 requests of 2 CPU plus 2.35 CPU of other pods.
   #
   # The comments below still describe the 6-worker sizing.
-  replicas: 30
+  replicas: 31
   workerImage: ghcr.io/stigenai/substrate/ateom-gvisor:v0.3.0-stigenai.2@sha256:9c4721241aaf7da1dd8832467c0e6bf472a1c8a18233ac206d3b7535f44c6dc1
   template:
     nodeSelector:
