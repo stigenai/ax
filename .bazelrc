@@ -18,7 +18,8 @@ build:bes --bes_results_url=https://stigen-ai-bb.buildbuddy.io/invocation/
 build:rbe --remote_executor=grpcs://stigen-ai-bb.buildbuddy.io
 build:rbe --remote_cache=grpcs://stigen-ai-bb.buildbuddy.io
 build:rbe --remote_default_exec_properties=Pool=gtr
-build:rbe --remote_default_exec_properties=container-image=docker://gcr.io/flame-public/rbe-ubuntu20-04:latest
+# Pinned 2026-11-03. Renew every 6 months: crane digest gcr.io/flame-public/rbe-ubuntu24-04:latest
+build:rbe --remote_default_exec_properties=container-image=docker://gcr.io/flame-public/rbe-ubuntu24-04@sha256:be9853fc45092d2cf2bda3abed30d22182881659a50bf35c7125161d7cfc8a75
 build:rbe --spawn_strategy=remote,sandboxed,local
 # If the pool is down, run local. A failing test still fails.
 build:rbe --remote_local_fallback
