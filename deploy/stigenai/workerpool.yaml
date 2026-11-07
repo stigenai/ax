@@ -27,8 +27,12 @@ spec:
   # 247Gi allocatable, and it holds the other 19 workers. CPU sets this
   # limit: 19 requests of 2 CPU plus 2.35 CPU of other pods.
   #
+  # On 2026-11-07 the owner asked for a little room for the ax-microvm pool
+  # (Nix builds). Two hs-2 workers go: 29 workers hold 58 tasks (24 ran then),
+  # and hs-2 gets 4 CPU back for microvm workers (1 CPU, 16Gi each).
+  #
   # The comments below still describe the 6-worker sizing.
-  replicas: 31
+  replicas: 29
   workerImage: ghcr.io/stigenai/substrate/ateom-gvisor:v0.3.0-stigenai.2@sha256:9c4721241aaf7da1dd8832467c0e6bf472a1c8a18233ac206d3b7535f44c6dc1
   template:
     nodeSelector:
