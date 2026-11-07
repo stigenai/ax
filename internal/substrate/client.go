@@ -18,6 +18,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -204,12 +205,34 @@ func (c *Client) GetActorTemplate(ctx context.Context, atespace, templateName st
 }
 
 const (
-	DefaultGuestCommand    = "/usr/local/bin/ax-task-runner"
-	DefaultSnapshotsBucket = "gs://dberkov-gke-dev3/ate-env/"
+	DefaultGuestCommand = "/usr/local/bin/ax-task-runner"
+
+	defaultSandboxClass  = "gvisor"
+	defaultSandboxConfig = "gvisor-default"
 )
 
+// sandboxConfig maps a sandbox class name ("gvisor", "microvm") and config name to a
+// Substrate SandboxConfig. An empty class means gvisor; only gvisor has a default config name.
+func sandboxConfig(class, configName string) (*ateapipb.SandboxConfig, error) {
+	if class == "" {
+		class = defaultSandboxClass
+	}
+	enum, ok := ateapipb.SandboxClass_value["SANDBOX_CLASS_"+strings.ToUpper(class)]
+	if !ok || enum == 0 {
+		return nil, fmt.Errorf("unknown sandbox class %q", class)
+	}
+	if configName == "" {
+		if class != defaultSandboxClass {
+			return nil, fmt.Errorf("sandbox class %q needs a sandbox config name", class)
+		}
+		configName = defaultSandboxConfig
+	}
+	return &ateapipb.SandboxConfig{SandboxClass: ateapipb.SandboxClass(enum), ConfigName: configName}, nil
+}
+
 // BuildActorTemplate constructs a Substrate ActorTemplate based on the standard ate-env specification.
-func BuildActorTemplate(atespace, name, image string, envMap map[string]string, command []string, snapshotsBucket string) *ateapipb.ActorTemplate {
+// The snapshot bucket comes from snapshotsBucket or, if empty, from AX_SNAPSHOTS_BUCKET. It has no default.
+func BuildActorTemplate(atespace, name, image string, envMap map[string]string, command []string, snapshotsBucket, sandboxClass, sandboxConfigName string) (*ateapipb.ActorTemplate, error) {
 	if atespace == "" {
 		atespace = "default"
 	}
@@ -220,11 +243,14 @@ func BuildActorTemplate(atespace, name, image string, envMap map[string]string, 
 		command = []string{DefaultGuestCommand}
 	}
 	if snapshotsBucket == "" {
-		if envBucket := os.Getenv("AX_SNAPSHOTS_BUCKET"); envBucket != "" {
-			snapshotsBucket = envBucket
-		} else {
-			snapshotsBucket = DefaultSnapshotsBucket
-		}
+		snapshotsBucket = os.Getenv("AX_SNAPSHOTS_BUCKET")
+	}
+	if snapshotsBucket == "" {
+		return nil, errors.New("no snapshot bucket: set AX_SNAPSHOTS_BUCKET")
+	}
+	sandbox, err := sandboxConfig(sandboxClass, sandboxConfigName)
+	if err != nil {
+		return nil, err
 	}
 
 	var envList []*ateapipb.EnvVar
@@ -268,15 +294,12 @@ func BuildActorTemplate(atespace, name, image string, envMap map[string]string, 
 				FromData: ateapipb.ResumeSource_RESUME_SOURCE_GOLDEN,
 			},
 		},
-		SandboxConfig: &ateapipb.SandboxConfig{
-			SandboxClass: ateapipb.SandboxClass_SANDBOX_CLASS_GVISOR,
-			ConfigName:   "gvisor-default",
-		},
-	}
+		SandboxConfig: sandbox,
+	}, nil
 }
 
 // EnsureActorTemplateWithImage creates an ActorTemplate using the specified container image and optional environment variables.
-func (c *Client) EnsureActorTemplateWithImage(ctx context.Context, baseAtespace, baseTemplate, targetAtespace, targetTemplate, image string, extraEnv ...map[string]string) (*ateapipb.ActorTemplate, error) {
+func (c *Client) EnsureActorTemplateWithImage(ctx context.Context, baseAtespace, baseTemplate, targetAtespace, targetTemplate, image, sandboxClass, sandboxConfigName string, extraEnv ...map[string]string) (*ateapipb.ActorTemplate, error) {
 	existing, err := c.GetActorTemplate(ctx, targetAtespace, targetTemplate)
 	if err == nil && existing != nil {
 		return existing, nil
@@ -289,7 +312,10 @@ func (c *Client) EnsureActorTemplateWithImage(ctx context.Context, baseAtespace,
 		}
 	}
 
-	tmpl := BuildActorTemplate(targetAtespace, targetTemplate, image, envMap, nil, "")
+	tmpl, err := BuildActorTemplate(targetAtespace, targetTemplate, image, envMap, nil, "", sandboxClass, sandboxConfigName)
+	if err != nil {
+		return nil, fmt.Errorf("building actor template %s/%s: %w", targetAtespace, targetTemplate, err)
+	}
 	req := &ateapipb.CreateActorTemplateRequest{
 		ActorTemplate: tmpl,
 	}
@@ -505,5 +531,3 @@ func (c *Client) DeleteActorTemplate(ctx context.Context, atespace, templateName
 	}
 	return nil
 }
-
-

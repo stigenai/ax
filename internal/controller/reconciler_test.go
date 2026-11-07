@@ -19,6 +19,7 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -33,6 +34,12 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+func TestMain(m *testing.M) {
+	// The snapshot bucket has no built-in default, so tests that create templates set one.
+	os.Setenv("AX_SNAPSHOTS_BUCKET", "gs://test-bucket/ate-env/")
+	os.Exit(m.Run())
+}
+
 type mockControlServer struct {
 	ateapipb.UnimplementedControlServer
 	workerIP         string
@@ -42,6 +49,7 @@ type mockControlServer struct {
 	suspendedActors  []string
 	deletedActors    []string
 	actorTemplates   map[string]bool
+	createdTemplates []*ateapipb.ActorTemplate
 	deletedTemplates []string
 	getActorFunc     func(ctx context.Context, req *ateapipb.GetActorRequest) (*ateapipb.Actor, error)
 	crashedActor     string
@@ -67,6 +75,7 @@ func (m *mockControlServer) CreateActorTemplate(_ context.Context, req *ateapipb
 	}
 	tmpl := req.GetActorTemplate()
 	m.actorTemplates[tmpl.GetMetadata().GetName()] = true
+	m.createdTemplates = append(m.createdTemplates, tmpl)
 	return tmpl, nil
 }
 
@@ -129,7 +138,6 @@ func (m *mockControlServer) SuspendActor(ctx context.Context, req *ateapipb.Susp
 	m.suspendedActors = append(m.suspendedActors, name)
 	return &ateapipb.SuspendActorResponse{}, nil
 }
-
 
 func (m *mockControlServer) RevertActor(_ context.Context, req *ateapipb.RevertActorRequest) (*ateapipb.RevertActorResponse, error) {
 	name := req.GetActor().GetName()
@@ -430,6 +438,49 @@ func TestTaskReconciler_WorkspaceReady(t *testing.T) {
 	}
 	if got := len(mockSrv.actorTemplates); got != 2 {
 		t.Errorf("command change left %d templates, want 2", got)
+	}
+}
+
+func TestTaskReconciler_SandboxClass(t *testing.T) {
+	ctx := context.Background()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer lis.Close()
+	mockSrv := &mockControlServer{}
+	grpcServer := grpc.NewServer()
+	ateapipb.RegisterControlServer(grpcServer, mockSrv)
+	go grpcServer.Serve(lis)
+	defer grpcServer.Stop()
+	client, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("failed to create substrate client: %v", err)
+	}
+	defer client.Close()
+	reconciler := controller.NewTaskReconciler(client, "test-template", "ax-system")
+	reconciler.SecretResolver = noSecrets
+
+	newTask := func(class, config string) *v1alpha1.Task {
+		return &v1alpha1.Task{
+			Metadata: &v1alpha1.ObjectMeta{Name: "t", Atespace: "default"},
+			Spec:     &v1alpha1.TaskSpec{Image: "img", SandboxClass: class, SandboxConfigName: config},
+		}
+	}
+	if _, err := reconciler.Reconcile(ctx, newTask("", ""), nil); err != nil {
+		t.Fatalf("default: %v", err)
+	}
+	if _, err := reconciler.Reconcile(ctx, newTask("microvm", "microvm-default"), nil); err != nil {
+		t.Fatalf("microvm: %v", err)
+	}
+	if got := len(mockSrv.createdTemplates); got != 2 {
+		t.Fatalf("created %d templates, want 2 (class must change the template name)", got)
+	}
+	if got := mockSrv.createdTemplates[0].GetSandboxConfig().GetSandboxClass(); got != ateapipb.SandboxClass_SANDBOX_CLASS_GVISOR {
+		t.Errorf("default task class = %v, want gvisor", got)
+	}
+	if got := mockSrv.createdTemplates[1].GetSandboxConfig().GetSandboxClass(); got != ateapipb.SandboxClass_SANDBOX_CLASS_MICROVM {
+		t.Errorf("microvm task class = %v, want microvm", got)
 	}
 }
 

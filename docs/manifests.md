@@ -33,7 +33,14 @@ spec:
       goal: "Install dependencies and run the test suite"   # Antigravity prepares the workspace to this goal on first run
 
   debug: true   # serve guest services inside the sandbox so `ax ssh` works; off by default
+
+  sandboxClass: gvisor              # optional: "gvisor" (default) or "microvm"
+  sandboxConfigName: gvisor-default # optional: Substrate SandboxConfig; default for gvisor only, required for other classes
 ```
+
+The sandbox class and config name go into the task's `ActorTemplate`. A change to either gives the task a new template.
+
+The server needs the `AX_SNAPSHOTS_BUCKET` environment variable (for example `gs://my-bucket/ate-env/`). It has no default. If it is not set, the server cannot create a task template.
 
 ### Binding several workspaces
 
