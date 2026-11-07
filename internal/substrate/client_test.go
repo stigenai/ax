@@ -140,3 +140,51 @@ func TestClient_DeleteActor_PropagatesRPCError(t *testing.T) {
 		t.Fatal("expected error, got nil")
 	}
 }
+
+func TestBuildActorTemplate_SandboxDefaultsToGVisor(t *testing.T) {
+	tmpl, err := BuildActorTemplate("ns", "t", "", nil, nil, "gs://b/env/", "", "")
+	if err != nil {
+		t.Fatalf("BuildActorTemplate: %v", err)
+	}
+	sc := tmpl.GetSandboxConfig()
+	if sc.GetSandboxClass() != ateapipb.SandboxClass_SANDBOX_CLASS_GVISOR || sc.GetConfigName() != "gvisor-default" {
+		t.Errorf("got %v/%q, want gvisor/gvisor-default", sc.GetSandboxClass(), sc.GetConfigName())
+	}
+}
+
+func TestBuildActorTemplate_Microvm(t *testing.T) {
+	tmpl, err := BuildActorTemplate("ns", "t", "", nil, nil, "gs://b/env/", "microvm", "microvm-default")
+	if err != nil {
+		t.Fatalf("BuildActorTemplate: %v", err)
+	}
+	sc := tmpl.GetSandboxConfig()
+	if sc.GetSandboxClass() != ateapipb.SandboxClass_SANDBOX_CLASS_MICROVM || sc.GetConfigName() != "microvm-default" {
+		t.Errorf("got %v/%q, want microvm/microvm-default", sc.GetSandboxClass(), sc.GetConfigName())
+	}
+}
+
+func TestBuildActorTemplate_RejectsBadSandbox(t *testing.T) {
+	for _, tc := range []struct{ class, config string }{
+		{"firecracker", "x"}, // unknown class
+		{"microvm", ""},      // non-default class needs a config name
+	} {
+		if _, err := BuildActorTemplate("ns", "t", "", nil, nil, "gs://b/env/", tc.class, tc.config); err == nil {
+			t.Errorf("class %q config %q: want error", tc.class, tc.config)
+		}
+	}
+}
+
+func TestBuildActorTemplate_BucketHasNoDefault(t *testing.T) {
+	t.Setenv("AX_SNAPSHOTS_BUCKET", "")
+	if _, err := BuildActorTemplate("ns", "t", "", nil, nil, "", "", ""); err == nil {
+		t.Fatal("want error when no snapshot bucket is set")
+	}
+	t.Setenv("AX_SNAPSHOTS_BUCKET", "gs://from-env/")
+	tmpl, err := BuildActorTemplate("ns", "t", "", nil, nil, "", "", "")
+	if err != nil {
+		t.Fatalf("BuildActorTemplate: %v", err)
+	}
+	if got := tmpl.GetSnapshotsConfig().GetStorageLocation(); got != "gs://from-env/" {
+		t.Errorf("bucket = %q, want gs://from-env/", got)
+	}
+}

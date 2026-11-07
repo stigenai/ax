@@ -185,9 +185,15 @@ type TaskSpec struct {
 	Workspaces []*WorkspaceRef `protobuf:"bytes,5,rep,name=workspaces,proto3" json:"workspaces,omitempty"`
 	// debug enables the in-container guest services (process execution and file
 	// access) that back `ax ssh`. Off by default.
-	Debug         bool `protobuf:"varint,6,opt,name=debug,proto3" json:"debug,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Debug bool `protobuf:"varint,6,opt,name=debug,proto3" json:"debug,omitempty"`
+	// sandbox_class selects the Substrate sandbox backend: "gvisor" or "microvm".
+	// Empty means "gvisor".
+	SandboxClass string `protobuf:"bytes,7,opt,name=sandbox_class,json=sandboxClass,proto3" json:"sandbox_class,omitempty"`
+	// sandbox_config_name names the Substrate SandboxConfig to use. Empty means
+	// "gvisor-default" when the class is gvisor. Other classes must set it.
+	SandboxConfigName string `protobuf:"bytes,8,opt,name=sandbox_config_name,json=sandboxConfigName,proto3" json:"sandbox_config_name,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *TaskSpec) Reset() {
@@ -260,6 +266,20 @@ func (x *TaskSpec) GetDebug() bool {
 		return x.Debug
 	}
 	return false
+}
+
+func (x *TaskSpec) GetSandboxClass() string {
+	if x != nil {
+		return x.SandboxClass
+	}
+	return ""
+}
+
+func (x *TaskSpec) GetSandboxConfigName() string {
+	if x != nil {
+		return x.SandboxConfigName
+	}
+	return ""
 }
 
 type EnvVar struct {
@@ -2572,7 +2592,7 @@ const file_pkg_apis_v1alpha1_ax_proto_rawDesc = "" +
 	"\x04kind\x18\x02 \x01(\tR\x04kind\x123\n" +
 	"\bmetadata\x18\x03 \x01(\v2\x17.ax.v1alpha1.ObjectMetaR\bmetadata\x12)\n" +
 	"\x04spec\x18\x04 \x01(\v2\x15.ax.v1alpha1.TaskSpecR\x04spec\x12/\n" +
-	"\x06status\x18\x05 \x01(\v2\x17.ax.v1alpha1.TaskStatusR\x06status\"\xeb\x01\n" +
+	"\x06status\x18\x05 \x01(\v2\x17.ax.v1alpha1.TaskStatusR\x06status\"\xc0\x02\n" +
 	"\bTaskSpec\x12\x14\n" +
 	"\x05image\x18\x01 \x01(\tR\x05image\x12\x18\n" +
 	"\acommand\x18\x02 \x03(\tR\acommand\x12%\n" +
@@ -2581,7 +2601,9 @@ const file_pkg_apis_v1alpha1_ax_proto_rawDesc = "" +
 	"\n" +
 	"workspaces\x18\x05 \x03(\v2\x19.ax.v1alpha1.WorkspaceRefR\n" +
 	"workspaces\x12\x14\n" +
-	"\x05debug\x18\x06 \x01(\bR\x05debug\"2\n" +
+	"\x05debug\x18\x06 \x01(\bR\x05debug\x12#\n" +
+	"\rsandbox_class\x18\a \x01(\tR\fsandboxClass\x12.\n" +
+	"\x13sandbox_config_name\x18\b \x01(\tR\x11sandboxConfigName\"2\n" +
 	"\x06EnvVar\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value\"x\n" +

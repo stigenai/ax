@@ -78,6 +78,12 @@ message TaskSpec {
   // debug enables the in-container guest services (process execution and file
   // access) that back `ax ssh`. Off by default.
   bool debug = 6;
+  // sandbox_class selects the Substrate sandbox backend: "gvisor" or "microvm".
+  // Empty means "gvisor".
+  string sandbox_class = 7;
+  // sandbox_config_name names the Substrate SandboxConfig to use. Empty means
+  // "gvisor-default" when the class is gvisor. Other classes must set it.
+  string sandbox_config_name = 8;
 }
 
 message EnvVar {

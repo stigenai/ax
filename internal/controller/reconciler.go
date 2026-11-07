@@ -170,9 +170,9 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 	// If a custom image, workspace, or extra environment is specified, provision or use a dedicated ActorTemplate
 	if task.Spec != nil && (task.Spec.Image != "" || len(extraEnv) > 0) {
 		slog.Info("ensuring custom ActorTemplate for task", "image", task.Spec.Image)
-		customTemplateName := taskTemplateName(task.Metadata.Name, task.Spec.Image, extraEnv)
+		customTemplateName := taskTemplateName(task.Metadata.Name, task.Spec.Image, task.Spec.SandboxClass, task.Spec.SandboxConfigName, extraEnv)
 
-		tmpl, err := r.client.EnsureActorTemplateWithImage(ctx, templateAtespace, templateName, atespace, customTemplateName, task.Spec.Image, extraEnv)
+		tmpl, err := r.client.EnsureActorTemplateWithImage(ctx, templateAtespace, templateName, atespace, customTemplateName, task.Spec.Image, task.Spec.SandboxClass, task.Spec.SandboxConfigName, extraEnv)
 		if err != nil {
 			slog.Warn("could not create custom ActorTemplate, falling back to default template", "error", err)
 		} else if tmpl != nil && tmpl.Metadata != nil {
@@ -367,10 +367,14 @@ func (r *TaskReconciler) lookupGeminiKey(ctx context.Context, atespace string) s
 }
 
 // taskTemplateName derives the per-task ActorTemplate name from the task name and a
-// digest of the image and container environment, so a spec change yields a new template.
-func taskTemplateName(taskName, image string, env map[string]string) string {
+// digest of the image, sandbox and container environment, so a spec change yields a new template.
+func taskTemplateName(taskName, image, sandboxClass, sandboxConfigName string, env map[string]string) string {
 	h := sha256.New()
 	h.Write([]byte(image))
+	// ponytail: an empty class and an unset class hash the same, so existing task templates keep their names.
+	if sandboxClass != "" || sandboxConfigName != "" {
+		h.Write([]byte("|sandbox=" + sandboxClass + "/" + sandboxConfigName))
+	}
 	keys := make([]string, 0, len(env))
 	for k := range env {
 		keys = append(keys, k)
