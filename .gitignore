@@ -17,3 +17,7 @@ cmd/ax-task-runner/__pycache__/antigravity_bootstrap.cpython-313.pyc
 .beads/proxieddb/
 *.gate.lock*
 /bazel-*
+
+# devenv
+.devenv*
+devenv.local.nix
