@@ -1156,6 +1156,9 @@ func runSSH(serverURL, atespace, kubeContext string, args []string, stdio bool) 
 	sigCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	exitCode, err := guestClient.Exec(sigCtx, opts)
+	if err != nil && sigCtx.Err() != nil {
+		return nil // A signal ended it, e.g. ssh closed its ProxyCommand.
+	}
 	if err != nil {
 		return err
 	}
