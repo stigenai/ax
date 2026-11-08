@@ -23,13 +23,22 @@ want="$(readlink -f "$(go env GOROOT 2>/dev/null)" 2>/dev/null)/bin/gofmt"
 echo "gofmt path: ${got:-<missing>}"
 [ "$got" = "$want" ] || bad 'gofmt path' "$got" "$want"
 
+in_store() {
+  p=$(readlink -f "$(command -v "$1")" 2>/dev/null)
+  echo "$1 path: ${p:-<missing>}"
+  case "$p" in /nix/store/*) ;; *) bad "$1 path" "$p" '/nix/store/...' ;; esac
+}
+
+in_store bazel
 got=$(bazel --version 2>&1)
 echo "bazel: $got"
 [ "$got" = "$want_bazel" ] || bad bazel "$got" "$want_bazel"
 
+in_store gitleaks
 got=$(gitleaks version 2>&1) || bad gitleaks "$got" 'exit 0'
 echo "gitleaks: $got"
 
+in_store govulncheck
 got=$(govulncheck -version 2>&1) || bad govulncheck "$got" 'exit 0'
 echo "govulncheck: $got"
 
