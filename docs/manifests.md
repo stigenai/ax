@@ -31,7 +31,11 @@ spec:
     path: "/workspace"   # optional; this is the default
 
   debug: true   # serve guest services inside the sandbox so `ax ssh` works; off by default
+
+  sandboxClass: gvisor   # optional: "gvisor" or "microvm"; empty means any WorkerPool
 ```
+
+A task with `sandboxClass` runs only on WorkerPools that have the label `ate.dev/sandboxClass: <class>`. Label your pools to match. If no pool has the label, the task does not start.
 
 ### Image references
 

@@ -419,6 +419,7 @@ func (c *Client) EnsureActorTemplateWithImage(ctx context.Context, baseAtespace,
 	}
 
 	tmpl := BuildActorTemplate(targetAtespace, targetTemplate, image, envMap, nil, "", resources)
+	tmpl.WorkerSelector = sandboxSelector(sandboxClass)
 	req := &ateapipb.CreateActorTemplateRequest{
 		ActorTemplate: tmpl,
 	}
@@ -703,5 +704,16 @@ func (c *Client) DeleteActorTemplate(ctx context.Context, atespace, templateName
 	return nil
 }
 
-// sandboxSelector is a stub until the next commit.
-func sandboxSelector(class string) *ateapipb.Selector { return nil }
+// sandboxClassLabel is the WorkerPool label a task's sandboxClass selects.
+const sandboxClassLabel = "ate.dev/sandboxClass"
+
+// sandboxSelector pins an actor template to the pools of one sandbox class.
+// An empty class leaves every pool eligible. ValidateTask allows only gvisor
+// and microvm. Any other value still gives a selector, so Substrate rejects
+// the template or no pool matches it: it fails closed.
+func sandboxSelector(class string) *ateapipb.Selector {
+	if class == "" {
+		return nil
+	}
+	return &ateapipb.Selector{MatchLabels: map[string]string{sandboxClassLabel: class}}
+}

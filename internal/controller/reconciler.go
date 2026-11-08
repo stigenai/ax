@@ -211,7 +211,7 @@ func (r *TaskReconciler) ensureSubstrateResources(ctx context.Context, task *v1a
 
 	// If a custom image, workspace, or extra environment is specified, provision or use a dedicated ActorTemplate
 	if task.Spec != nil && (task.Spec.Image != "" || len(extraEnv) > 0) {
-		slog.Info("ensuring custom ActorTemplate for task", "image", task.Spec.Image)
+		slog.Info("ensuring custom ActorTemplate for task", "image", task.Spec.Image, "sandboxClass", task.Spec.GetSandboxClass())
 		customTemplateName := taskTemplateName(task.Metadata.Name, task.Spec.Image, extraEnv)
 
 		// spec.resources rides along in AX_TASK_YAML, so a limits change is already

@@ -408,6 +408,9 @@ func ValidateTask(t *Task) error {
 	if err := ValidateTaskConfig(spec); err != nil {
 		return err
 	}
+	if c := spec.GetSandboxClass(); c != "" && c != "gvisor" && c != "microvm" {
+		return fmt.Errorf("spec.sandboxClass: %q is not one of \"gvisor\", \"microvm\"", c)
+	}
 	if err := ValidateTaskSize(t); err != nil {
 		return err
 	}
