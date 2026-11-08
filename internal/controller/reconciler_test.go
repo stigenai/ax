@@ -19,46 +19,43 @@ import (
 	"errors"
 	"net"
 	"net/http"
-	"os"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"github.com/google/ax/internal/controller"
 	"github.com/google/ax/internal/substrate"
 	"github.com/google/ax/pkg/apis/v1alpha1"
+	ateapipb "go.ate.dev/substrate/api/ateapi/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 )
-
-func TestMain(m *testing.M) {
-	// The snapshot bucket has no built-in default, so tests that create templates set one.
-	os.Setenv("AX_SNAPSHOTS_BUCKET", "gs://test-bucket/ate-env/")
-	os.Exit(m.Run())
-}
 
 type mockControlServer struct {
 	ateapipb.UnimplementedControlServer
-	workerIP         string
-	createdAtespaces []string
-	createdActors    []string
-	resumedActors    []string
-	suspendedActors  []string
-	deletedActors    []string
-	actorTemplates   map[string]bool
-	createdTemplates []*ateapipb.ActorTemplate
-	deletedTemplates []string
-	getActorFunc     func(ctx context.Context, req *ateapipb.GetActorRequest) (*ateapipb.Actor, error)
-	crashedActor     string
-	revertedActors   []string
-}
-
-// noSecrets is a SecretResolver for tests: it never finds a key and never touches a cluster.
-func noSecrets(context.Context, string, string, string) (string, error) {
-	return "", nil
+	workerIP          string
+	createdAtespaces  []string
+	createdActors     []string
+	resumedActors     []string
+	suspendedActors   []string
+	suspendErr        error
+	deletedActors     []string
+	actorTemplates    map[string]bool
+	createdTemplates  []*ateapipb.ActorTemplate
+	templateImages    []string
+	deletedTemplates  []string
+	getActorFunc      func(ctx context.Context, req *ateapipb.GetActorRequest) (*ateapipb.Actor, error)
+	createAtespaceErr error
+	createActorErr    error
+	resumeActorErr    error
+	crashedActor      string
+	revertedActors    []string
+	// createTemplateErr, when set, is returned by CreateActorTemplate to stand in
+	// for Substrate rejecting a template (for example an invalid quantity).
+	createTemplateErr error
 }
 
 func (m *mockControlServer) GetActorTemplate(_ context.Context, req *ateapipb.GetActorTemplateRequest) (*ateapipb.ActorTemplate, error) {
@@ -70,16 +67,25 @@ func (m *mockControlServer) GetActorTemplate(_ context.Context, req *ateapipb.Ge
 }
 
 func (m *mockControlServer) CreateActorTemplate(_ context.Context, req *ateapipb.CreateActorTemplateRequest) (*ateapipb.ActorTemplate, error) {
+	if m.createTemplateErr != nil {
+		return nil, m.createTemplateErr
+	}
 	if m.actorTemplates == nil {
 		m.actorTemplates = make(map[string]bool)
 	}
 	tmpl := req.GetActorTemplate()
 	m.actorTemplates[tmpl.GetMetadata().GetName()] = true
 	m.createdTemplates = append(m.createdTemplates, tmpl)
+	for _, c := range tmpl.GetContainers() {
+		m.templateImages = append(m.templateImages, c.GetImage())
+	}
 	return tmpl, nil
 }
 
 func (m *mockControlServer) CreateAtespace(ctx context.Context, req *ateapipb.CreateAtespaceRequest) (*ateapipb.Atespace, error) {
+	if m.createAtespaceErr != nil {
+		return nil, m.createAtespaceErr
+	}
 	name := ""
 	if req.Atespace != nil && req.Atespace.Metadata != nil {
 		name = req.Atespace.Metadata.Name
@@ -89,6 +95,9 @@ func (m *mockControlServer) CreateAtespace(ctx context.Context, req *ateapipb.Cr
 }
 
 func (m *mockControlServer) CreateActor(ctx context.Context, req *ateapipb.CreateActorRequest) (*ateapipb.Actor, error) {
+	if m.createActorErr != nil {
+		return nil, m.createActorErr
+	}
 	name := ""
 	if req.Actor != nil && req.Actor.Metadata != nil {
 		name = req.Actor.Metadata.Name
@@ -106,6 +115,9 @@ func (m *mockControlServer) CreateActor(ctx context.Context, req *ateapipb.Creat
 }
 
 func (m *mockControlServer) ResumeActor(ctx context.Context, req *ateapipb.ResumeActorRequest) (*ateapipb.ResumeActorResponse, error) {
+	if m.resumeActorErr != nil {
+		return nil, m.resumeActorErr
+	}
 	name := ""
 	if req.Actor != nil {
 		name = req.Actor.Name
@@ -121,8 +133,8 @@ func (m *mockControlServer) ResumeActor(ctx context.Context, req *ateapipb.Resum
 			Status: &ateapipb.ActorStatus{
 				State: ateapipb.ActorState_ACTOR_STATE_RUNNING,
 				WorkerAssignment: &ateapipb.WorkerAssignment{
-					WorkerPod:   "worker-pod-1",
-					WorkerPodIp: wIP,
+					WorkerPod:    "worker-pod-1",
+					WorkerPodIps: []string{wIP},
 				},
 			},
 		},
@@ -131,6 +143,9 @@ func (m *mockControlServer) ResumeActor(ctx context.Context, req *ateapipb.Resum
 }
 
 func (m *mockControlServer) SuspendActor(ctx context.Context, req *ateapipb.SuspendActorRequest) (*ateapipb.SuspendActorResponse, error) {
+	if m.suspendErr != nil {
+		return nil, m.suspendErr
+	}
 	name := ""
 	if req.Actor != nil {
 		name = req.Actor.Name
@@ -221,9 +236,8 @@ func TestTaskReconciler(t *testing.T) {
 	}
 	defer client.Close()
 
-	// 3. Reconcile Task
-	reconciler := controller.NewTaskReconciler(client, "test-template", "ax-system")
-	reconciler.SecretResolver = noSecrets
+	// 3. Resume the task
+	reconciler := controller.NewTaskReconciler(client, "test-template", v1alpha1.DefaultSystemNamespace, "")
 	reconciler.WorkspaceReadyTimeout = 200 * time.Millisecond
 
 	task := &v1alpha1.Task{
@@ -237,26 +251,22 @@ func TestTaskReconciler(t *testing.T) {
 			Image:   "ghrc.io/my-org/my-image",
 			Command: []string{"/bin/task-runner"},
 		},
-		// A client-supplied actor name must not survive: the actor is always
-		// named after the task.
-		Status: &v1alpha1.TaskStatus{Actor: "not-the-task", Phase: "Running"},
+		// A client-supplied actor name is ignored: the actor is always named
+		// after the task.
+		Status: &v1alpha1.TaskStatus{Actor: "not-the-task"},
 	}
 
-	reconciled, err := reconciler.Reconcile(ctx, task)
-	if err != nil {
-		t.Fatalf("Reconcile failed: %v", err)
+	if err := reconciler.Resume(ctx, task, nil); err != nil {
+		t.Fatalf("Resume failed: %v", err)
 	}
 
-	// 4. Validate reconciliation results
-	if reconciled.Status.Phase != "Running" {
-		t.Errorf("expected phase 'Running', got %q", reconciled.Status.Phase)
+	// 4. Validate the results. The phase and worker IP belong to the actor, so
+	// Resume leaves them for the server to read from Substrate.
+	if st := task.GetStatus(); st.GetPhase() != "" || st.GetWorkerIp() != "" {
+		t.Errorf("Resume set phase %q and worker IP %q, want both left empty", st.GetPhase(), st.GetWorkerIp())
 	}
-	if reconciled.Status.Actor != "test-task" {
-		t.Errorf("expected actor 'test-task', got %q", reconciled.Status.Actor)
-	}
-	if reconciled.Status.WorkerIp != "10.244.1.42" {
-		t.Errorf("expected worker IP '10.244.1.42', got %q", reconciled.Status.WorkerIp)
-	}
+	// The mock's worker does not answer the readiness check.
+	assertCondition(t, task, "WorkspaceReady", "False", v1alpha1.ReasonInitializing)
 
 	// Verify mock was called
 	if len(mockSrv.createdAtespaces) != 1 || mockSrv.createdAtespaces[0] != "default" {
@@ -267,6 +277,60 @@ func TestTaskReconciler(t *testing.T) {
 	}
 	if len(mockSrv.resumedActors) != 1 || mockSrv.resumedActors[0] != "test-task" {
 		t.Errorf("expected actor 'test-task' resumed, got %v", mockSrv.resumedActors)
+	}
+}
+
+// TestTaskReconciler_DefaultTaskImage verifies that a task without spec.image is
+// defaulted to the image passed to NewTaskReconciler (or the API default when
+// none is given), and that the image
+// is what ends up in the per-task ActorTemplate.
+func TestTaskReconciler_DefaultTaskImage(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		override string
+		want     string
+	}{
+		{name: "api default", want: v1alpha1.DefaultTaskImage},
+		{name: "server override", override: "localhost:5001/ax-task-runner:e2e", want: "localhost:5001/ax-task-runner:e2e"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			lis, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatalf("failed to listen: %v", err)
+			}
+			defer lis.Close()
+
+			mockSrv := &mockControlServer{}
+			grpcServer := grpc.NewServer()
+			ateapipb.RegisterControlServer(grpcServer, mockSrv)
+			go grpcServer.Serve(lis)
+			defer grpcServer.Stop()
+
+			client, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+			if err != nil {
+				t.Fatalf("failed to create substrate client: %v", err)
+			}
+			defer client.Close()
+
+			reconciler := controller.NewTaskReconciler(client, "test-template", v1alpha1.DefaultSystemNamespace, tc.override)
+			reconciler.WorkspaceReadyTimeout = 200 * time.Millisecond
+
+			task := &v1alpha1.Task{
+				ApiVersion: v1alpha1.APIVersion,
+				Kind:       v1alpha1.KindTask,
+				Metadata:   &v1alpha1.ObjectMeta{Name: "no-image", Atespace: "default"},
+				Spec:       &v1alpha1.TaskSpec{},
+			}
+			if err := reconciler.Resume(context.Background(), task, nil); err != nil {
+				t.Fatalf("Resume failed: %v", err)
+			}
+			if got := task.GetSpec().GetImage(); got != tc.want {
+				t.Errorf("spec.image = %q, want %q", got, tc.want)
+			}
+			if len(mockSrv.templateImages) != 1 || mockSrv.templateImages[0] != tc.want {
+				t.Errorf("ActorTemplate images = %v, want [%q]", mockSrv.templateImages, tc.want)
+			}
+		})
 	}
 }
 
@@ -291,8 +355,7 @@ func TestTaskReconciler_Suspend(t *testing.T) {
 	}
 	defer client.Close()
 
-	reconciler := controller.NewTaskReconciler(client, "test-template", "ax-system")
-	reconciler.SecretResolver = noSecrets
+	reconciler := controller.NewTaskReconciler(client, "test-template", v1alpha1.DefaultSystemNamespace, "")
 	reconciler.WorkspaceReadyTimeout = 200 * time.Millisecond
 
 	task := &v1alpha1.Task{
@@ -307,19 +370,194 @@ func TestTaskReconciler_Suspend(t *testing.T) {
 		},
 	}
 
-	reconciled, err := reconciler.Reconcile(ctx, task, nil)
-	if err != nil {
-		t.Fatalf("Reconcile failed: %v", err)
+	if err := reconciler.Suspend(ctx, task, nil); err != nil {
+		t.Fatalf("Suspend failed: %v", err)
 	}
 
-	if reconciled.Status.Phase != "Suspended" {
-		t.Errorf("expected phase 'Suspended', got %q", reconciled.Status.Phase)
-	}
-	if reconciled.Status.WorkerIp != "" {
-		t.Errorf("expected empty worker IP, got %q", reconciled.Status.WorkerIp)
+	if st := task.GetStatus(); st.GetPhase() != "" || st.GetWorkerIp() != "" {
+		t.Errorf("Suspend set phase %q and worker IP %q, want both left empty", st.GetPhase(), st.GetWorkerIp())
 	}
 	if len(mockSrv.suspendedActors) != 1 || mockSrv.suspendedActors[0] != "suspend-task" {
 		t.Errorf("expected actor 'suspend-task' suspended, got %v", mockSrv.suspendedActors)
+	}
+	if len(mockSrv.resumedActors) != 0 {
+		t.Errorf("expected no actor to be resumed, got %v", mockSrv.resumedActors)
+	}
+}
+
+func TestTaskReconciler_SuspendError(t *testing.T) {
+	ctx := context.Background()
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer lis.Close()
+
+	mockSrv := &mockControlServer{
+		suspendErr: status.Error(codes.Unavailable, "substrate unavailable"),
+	}
+	grpcServer := grpc.NewServer()
+	ateapipb.RegisterControlServer(grpcServer, mockSrv)
+	go grpcServer.Serve(lis)
+	defer grpcServer.Stop()
+
+	client, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("failed to create substrate client: %v", err)
+	}
+	defer client.Close()
+
+	reconciler := controller.NewTaskReconciler(client, "test-template", "ax-system", "")
+
+	task := &v1alpha1.Task{
+		ApiVersion: v1alpha1.APIVersion,
+		Kind:       v1alpha1.KindTask,
+		Metadata: &v1alpha1.ObjectMeta{
+			Name:     "suspend-fail-task",
+			Atespace: "default",
+		},
+		Spec: &v1alpha1.TaskSpec{
+			Image: "ghrc.io/my-org/my-image",
+		},
+		Status: &v1alpha1.TaskStatus{
+			// Set, so that ensureSubstrateResources has no task ID to fill in.
+			Id:         "task-suspend-fail-task-1",
+			WorkerIp:   "10.1.1.1",
+			Conditions: []*v1alpha1.Condition{{Type: "Ready", Status: "True", Reason: v1alpha1.ReasonTaskRunning}},
+		},
+	}
+	before := proto.Clone(task.Status).(*v1alpha1.TaskStatus)
+
+	if err := reconciler.Suspend(ctx, task, nil); err == nil {
+		t.Fatal("expected Suspend to return an error when SuspendActor fails")
+	}
+	if !proto.Equal(task.Status, before) {
+		t.Errorf("Suspend changed the status after SuspendActor failed:\n got: %v\nwant: %v", task.Status, before)
+	}
+}
+
+// TestTaskReconciler_TemplateCreationFailed covers google/ax#366: when Substrate
+// rejects the per-task ActorTemplate (for example because the image is referenced
+// by tag rather than digest), the task must report that error directly instead of
+// silently falling back to the default template.
+func TestTaskReconciler_TemplateCreationFailed(t *testing.T) {
+	ctx := t.Context()
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer lis.Close()
+
+	const substrateMsg = `actor_template.containers[0].image: Invalid value: "localhost:5001/my-agent:v1": must be pinned by digest (changing the image invalidates snapshots)`
+	mockSrv := &mockControlServer{
+		createTemplateErr: status.Error(codes.InvalidArgument, substrateMsg),
+	}
+	grpcServer := grpc.NewServer()
+	ateapipb.RegisterControlServer(grpcServer, mockSrv)
+	go grpcServer.Serve(lis)
+	defer grpcServer.Stop()
+
+	client, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("failed to create substrate client: %v", err)
+	}
+	defer client.Close()
+
+	reconciler := controller.NewTaskReconciler(client, "test-template", "ax-system", "")
+	reconciler.WorkspaceReadyTimeout = 200 * time.Millisecond
+
+	task := &v1alpha1.Task{
+		ApiVersion: v1alpha1.APIVersion,
+		Kind:       v1alpha1.KindTask,
+		Metadata: &v1alpha1.ObjectMeta{
+			Name:     "tagged-image",
+			Atespace: "default",
+		},
+		Spec: &v1alpha1.TaskSpec{
+			Image:   "localhost:5001/my-agent:v1",
+			Command: []string{"python3", "/app/agent.py"},
+		},
+	}
+
+	err = reconciler.Resume(ctx, task, nil)
+	if err == nil {
+		t.Fatal("expected Resume to fail when the ActorTemplate cannot be created")
+	}
+	if !strings.Contains(err.Error(), "must be pinned by digest") {
+		t.Errorf("expected error to carry the Substrate message, got %v", err)
+	}
+
+	assertCondition(t, task, "Ready", "False", v1alpha1.ReasonTemplateCreationFailed)
+	for _, c := range task.Status.Conditions {
+		if c.Type != "Ready" {
+			continue
+		}
+		// The user-facing message should be exactly what Substrate said, without the
+		// "rpc error: code = ... desc = " wrapper or our internal context prefix.
+		if c.Message != substrateMsg {
+			t.Errorf("expected Ready message to be the bare Substrate error\n got: %q\nwant: %q", c.Message, substrateMsg)
+		}
+	}
+
+	// Resume must stop before touching the actor: no fallback to the default template.
+	if len(mockSrv.createdActors) != 0 {
+		t.Errorf("expected no actor to be created, got %v", mockSrv.createdActors)
+	}
+	if len(mockSrv.resumedActors) != 0 {
+		t.Errorf("expected no actor to be resumed, got %v", mockSrv.resumedActors)
+	}
+}
+
+// TestTaskReconciler_TemplateCreationTransient checks that a transient Substrate
+// error during ActorTemplate creation (for example Unavailable after retries are
+// exhausted) is recorded as SubstrateUnavailable rather than TemplateCreationFailed.
+// The server keeps a task that failed this way Pending for a retry.
+func TestTaskReconciler_TemplateCreationTransient(t *testing.T) {
+	ctx := t.Context()
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer lis.Close()
+
+	// DeadlineExceeded is transient per substrate.IsTransientError but is not in the
+	// client's retry list, so the test does not wait out the Unavailable backoff.
+	mockSrv := &mockControlServer{
+		createTemplateErr: status.Error(codes.DeadlineExceeded, "substrate control plane timed out"),
+	}
+	grpcServer := grpc.NewServer()
+	ateapipb.RegisterControlServer(grpcServer, mockSrv)
+	go grpcServer.Serve(lis)
+	defer grpcServer.Stop()
+
+	client, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("failed to create substrate client: %v", err)
+	}
+	defer client.Close()
+
+	reconciler := controller.NewTaskReconciler(client, "test-template", "ax-system", "")
+	reconciler.WorkspaceReadyTimeout = 200 * time.Millisecond
+
+	task := &v1alpha1.Task{
+		ApiVersion: v1alpha1.APIVersion,
+		Kind:       v1alpha1.KindTask,
+		Metadata: &v1alpha1.ObjectMeta{
+			Name:     "template-transient",
+			Atespace: "default",
+		},
+		Spec: &v1alpha1.TaskSpec{Image: "ghcr.io/my-org/my-agent@sha256:0000000000000000000000000000000000000000000000000000000000000000"},
+	}
+
+	if err := reconciler.Resume(ctx, task, nil); err == nil {
+		t.Fatal("expected Resume to return an error on transient template failure")
+	}
+	assertCondition(t, task, "Ready", "False", v1alpha1.ReasonSubstrateUnavailable)
+	if len(mockSrv.createdActors) != 0 {
+		t.Errorf("expected no actor to be created, got %v", mockSrv.createdActors)
 	}
 }
 
@@ -368,8 +606,7 @@ func TestTaskReconciler_WorkspaceReady(t *testing.T) {
 	}
 	defer client.Close()
 
-	reconciler := controller.NewTaskReconciler(client, "test-template", "ax-system")
-	reconciler.SecretResolver = noSecrets
+	reconciler := controller.NewTaskReconciler(client, "test-template", v1alpha1.DefaultSystemNamespace, "")
 	reconciler.WorkspaceReadyTimeout = 200 * time.Millisecond
 
 	task := &v1alpha1.Task{
@@ -380,108 +617,233 @@ func TestTaskReconciler_WorkspaceReady(t *testing.T) {
 			Atespace: "default",
 		},
 		Spec: &v1alpha1.TaskSpec{},
-		Status: &v1alpha1.TaskStatus{
-			Phase: "Running",
-		},
 	}
 
-	// Case 1: Worker not responding on readyz -> WorkspaceReady=False and Ready=False.
-	reconciled, err := reconciler.Reconcile(ctx, task, nil)
-	if err != nil {
-		t.Fatalf("Reconcile failed: %v", err)
+	// Case 1: Worker not responding on readyz -> WorkspaceReady=False.
+	if err := reconciler.Resume(ctx, task, nil); err != nil {
+		t.Fatalf("Resume failed: %v", err)
 	}
-	assertCondition(t, reconciled, "WorkspaceReady", "False", "Initializing")
-	assertCondition(t, reconciled, "Ready", "False", "WorkspaceInitializing")
+	assertCondition(t, task, "WorkspaceReady", "False", v1alpha1.ReasonInitializing)
 
-	// Case 2: Worker readyz endpoint succeeds -> WorkspaceReady=True and Ready=True.
+	// Case 2: Worker readyz endpoint succeeds -> WorkspaceReady=True.
 	mockSrv.workerIP = httpLis.Addr().String()
-	reconciledReady, err := reconciler.Reconcile(ctx, task, nil)
-	if err != nil {
-		t.Fatalf("Reconcile with ready worker failed: %v", err)
+	if err := reconciler.Resume(ctx, task, nil); err != nil {
+		t.Fatalf("Resume with ready worker failed: %v", err)
 	}
-	assertCondition(t, reconciledReady, "WorkspaceReady", "True", "SetupComplete")
-	assertCondition(t, reconciledReady, "Ready", "True", "TaskRunning")
+	assertCondition(t, task, "WorkspaceReady", "True", v1alpha1.ReasonSetupComplete)
 
-	// Case 3: Suspending the task -> Ready=False (TaskSuspended), but the workspace was
-	// already initialized so WorkspaceReady stays True.
-	task = reconciledReady
-	task.Status.Phase = "Suspended"
-	reconciledSuspended, err := reconciler.Reconcile(ctx, task, nil)
-	if err != nil {
-		t.Fatalf("Reconcile with suspend failed: %v", err)
+	// Case 3: Suspending the task -> the workspace was already initialized, so
+	// WorkspaceReady stays True.
+	if err := reconciler.Suspend(ctx, task, nil); err != nil {
+		t.Fatalf("Suspend failed: %v", err)
 	}
-	if reconciledSuspended.Status.Phase != "Suspended" {
-		t.Errorf("expected phase Suspended, got %s", reconciledSuspended.Status.Phase)
-	}
-	assertCondition(t, reconciledSuspended, "Ready", "False", "TaskSuspended")
-	assertCondition(t, reconciledSuspended, "WorkspaceReady", "True", "SetupComplete")
+	assertCondition(t, task, "WorkspaceReady", "True", v1alpha1.ReasonSetupComplete)
 
 	// Case 4: Resuming with the worker unreachable -> the reconciler trusts the recorded
-	// WorkspaceReady instead of re-polling, so the task is Ready again immediately.
+	// WorkspaceReady instead of re-polling.
 	mockSrv.workerIP = "127.0.0.1:1"
-	task = reconciledSuspended
-	task.Status.Phase = "Running"
-	reconciledResumed, err := reconciler.Reconcile(ctx, task, nil)
-	if err != nil {
-		t.Fatalf("Reconcile with resume failed: %v", err)
+	if err := reconciler.Resume(ctx, task, nil); err != nil {
+		t.Fatalf("Resume after suspend failed: %v", err)
 	}
-	assertCondition(t, reconciledResumed, "WorkspaceReady", "True", "SetupComplete")
-	assertCondition(t, reconciledResumed, "Ready", "True", "TaskRunning")
+	assertCondition(t, task, "WorkspaceReady", "True", v1alpha1.ReasonSetupComplete)
 	if got := len(mockSrv.actorTemplates); got != 1 {
 		t.Fatalf("readiness updates and suspend/resume created %d templates, want 1", got)
 	}
 
 	// A launch configuration change must still get a distinct template.
 	task.Spec.Command = []string{"python3", "agent.py"}
-	if _, err := reconciler.Reconcile(ctx, task, nil); err != nil {
-		t.Fatalf("Reconcile with changed command failed: %v", err)
+	if err := reconciler.Resume(ctx, task, nil); err != nil {
+		t.Fatalf("Resume with changed command failed: %v", err)
 	}
 	if got := len(mockSrv.actorTemplates); got != 2 {
 		t.Errorf("command change left %d templates, want 2", got)
 	}
 }
 
-func TestTaskReconciler_SandboxClass(t *testing.T) {
+func TestTaskReconciler_ResourceLimits(t *testing.T) {
 	ctx := context.Background()
+
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("failed to listen: %v", err)
 	}
 	defer lis.Close()
+
 	mockSrv := &mockControlServer{}
 	grpcServer := grpc.NewServer()
 	ateapipb.RegisterControlServer(grpcServer, mockSrv)
 	go grpcServer.Serve(lis)
 	defer grpcServer.Stop()
+
 	client, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		t.Fatalf("failed to create substrate client: %v", err)
 	}
 	defer client.Close()
-	reconciler := controller.NewTaskReconciler(client, "test-template", "ax-system")
-	reconciler.SecretResolver = noSecrets
 
-	newTask := func(class, config string) *v1alpha1.Task {
+	reconciler := controller.NewTaskReconciler(client, "test-template", "ax-system", "")
+	reconciler.WorkspaceReadyTimeout = 200 * time.Millisecond
+
+	task := &v1alpha1.Task{
+		ApiVersion: v1alpha1.APIVersion,
+		Kind:       v1alpha1.KindTask,
+		Metadata: &v1alpha1.ObjectMeta{
+			Name:     "sized-task",
+			Atespace: "default",
+		},
+		Spec: &v1alpha1.TaskSpec{
+			Image: "ghrc.io/my-org/my-image",
+			Resources: &v1alpha1.ResourcesSpec{
+				Limits: &v1alpha1.ResourceList{Cpu: "2", Memory: "4Gi"},
+			},
+		},
+	}
+
+	if err := reconciler.Suspend(ctx, task, nil); err != nil {
+		t.Fatalf("Suspend failed: %v", err)
+	}
+	if len(mockSrv.createdTemplates) != 1 {
+		t.Fatalf("created %d templates, want 1", len(mockSrv.createdTemplates))
+	}
+	want := &ateapipb.ResourceRequirements{Limits: &ateapipb.Resources{
+		CpuMillicores: 2000,
+		MemoryBytes:   4 << 30,
+	}}
+	if got := mockSrv.createdTemplates[0].GetResources(); !proto.Equal(got, want) {
+		t.Errorf("template resources = %v, want %v", got, want)
+	}
+
+	// Raising a limit is a launch configuration change and must provision a new
+	// template, under a new name, carrying the new value.
+	task.Spec.Resources.Limits.Memory = "8Gi"
+	if err := reconciler.Suspend(ctx, task, nil); err != nil {
+		t.Fatalf("Suspend with changed limits failed: %v", err)
+	}
+	if len(mockSrv.createdTemplates) != 2 {
+		t.Fatalf("limits change left %d templates, want 2", len(mockSrv.createdTemplates))
+	}
+	first, second := mockSrv.createdTemplates[0].GetMetadata().GetName(), mockSrv.createdTemplates[1].GetMetadata().GetName()
+	if first == second {
+		t.Errorf("limits change reused template name %q, want a distinct name", first)
+	}
+	want.Limits.MemoryBytes = 8 << 30
+	if got := mockSrv.createdTemplates[1].GetResources(); !proto.Equal(got, want) {
+		t.Errorf("template resources after change = %v, want %v", got, want)
+	}
+
+	// A task without limits uses the default CPU and memory limits.
+	plain := &v1alpha1.Task{
+		ApiVersion: v1alpha1.APIVersion,
+		Kind:       v1alpha1.KindTask,
+		Metadata:   &v1alpha1.ObjectMeta{Name: "plain-task", Atespace: "default"},
+		Spec:       &v1alpha1.TaskSpec{Image: "ghrc.io/my-org/my-image"},
+	}
+	if err := reconciler.Suspend(ctx, plain, nil); err != nil {
+		t.Fatalf("Suspend of task without limits failed: %v", err)
+	}
+	wantDefault := &ateapipb.ResourceRequirements{Limits: &ateapipb.Resources{
+		CpuMillicores: substrate.DefaultCPUMillicores,
+		MemoryBytes:   substrate.DefaultMemoryBytes,
+	}}
+	if got := mockSrv.createdTemplates[len(mockSrv.createdTemplates)-1].GetResources(); !proto.Equal(got, wantDefault) {
+		t.Errorf("template for task without limits has resources %v, want %v", got, wantDefault)
+	}
+}
+
+// A task that asks for limits must never run without them: invalid limits and a
+// Substrate rejection of the template both fail the reconcile instead of falling
+// back to the default template. Without limits the fallback contract is unchanged.
+func TestTaskReconciler_ResourceLimitsFailurePaths(t *testing.T) {
+	ctx := context.Background()
+
+	newTask := func(name string, resources *v1alpha1.ResourcesSpec) *v1alpha1.Task {
 		return &v1alpha1.Task{
-			Metadata: &v1alpha1.ObjectMeta{Name: "t", Atespace: "default"},
-			Spec:     &v1alpha1.TaskSpec{Image: "img", SandboxClass: class, SandboxConfigName: config},
+			ApiVersion: v1alpha1.APIVersion,
+			Kind:       v1alpha1.KindTask,
+			Metadata:   &v1alpha1.ObjectMeta{Name: name, Atespace: "default"},
+			Spec:       &v1alpha1.TaskSpec{Image: "ghrc.io/my-org/my-image", Resources: resources},
 		}
 	}
-	if _, err := reconciler.Reconcile(ctx, newTask("", ""), nil); err != nil {
-		t.Fatalf("default: %v", err)
+	setup := func(t *testing.T, mockSrv *mockControlServer) *controller.TaskReconciler {
+		lis, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("failed to listen: %v", err)
+		}
+		grpcServer := grpc.NewServer()
+		ateapipb.RegisterControlServer(grpcServer, mockSrv)
+		go grpcServer.Serve(lis)
+		client, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			t.Fatalf("failed to create substrate client: %v", err)
+		}
+		t.Cleanup(func() {
+			client.Close()
+			grpcServer.Stop()
+			lis.Close()
+		})
+		reconciler := controller.NewTaskReconciler(client, "test-template", "ax-system", "")
+		reconciler.WorkspaceReadyTimeout = 200 * time.Millisecond
+		return reconciler
 	}
-	if _, err := reconciler.Reconcile(ctx, newTask("microvm", "microvm-default"), nil); err != nil {
-		t.Fatalf("microvm: %v", err)
-	}
-	if got := len(mockSrv.createdTemplates); got != 2 {
-		t.Fatalf("created %d templates, want 2 (class must change the template name)", got)
-	}
-	if got := mockSrv.createdTemplates[0].GetSandboxConfig().GetSandboxClass(); got != ateapipb.SandboxClass_SANDBOX_CLASS_GVISOR {
-		t.Errorf("default task class = %v, want gvisor", got)
-	}
-	if got := mockSrv.createdTemplates[1].GetSandboxConfig().GetSandboxClass(); got != ateapipb.SandboxClass_SANDBOX_CLASS_MICROVM {
-		t.Errorf("microvm task class = %v, want microvm", got)
-	}
+
+	t.Run("invalid limits fail before provisioning", func(t *testing.T) {
+		mockSrv := &mockControlServer{}
+		reconciler := setup(t, mockSrv)
+
+		for _, reqs := range []*v1alpha1.ResourcesSpec{
+			{Limits: &v1alpha1.ResourceList{Cpu: "two"}},
+			{Limits: &v1alpha1.ResourceList{Cpu: "0"}},
+			{Limits: &v1alpha1.ResourceList{Cpu: "1000"}},
+			{Limits: &v1alpha1.ResourceList{Memory: "-4Gi"}},
+			{Requests: &v1alpha1.ResourceList{Cpu: "500m"}, Limits: &v1alpha1.ResourceList{Cpu: "2"}},
+		} {
+			task := newTask("bad-limits", reqs)
+			if err := reconciler.Suspend(ctx, task, nil); err == nil {
+				t.Errorf("Suspend(%v) succeeded, want error", reqs)
+			}
+			assertCondition(t, task, "Ready", "False", v1alpha1.ReasonInvalidResources)
+		}
+		if len(mockSrv.createdTemplates) != 0 || len(mockSrv.createdActors) != 0 || len(mockSrv.resumedActors) != 0 {
+			t.Errorf("invalid limits reached Substrate: templates=%d actors=%v resumed=%v",
+				len(mockSrv.createdTemplates), mockSrv.createdActors, mockSrv.resumedActors)
+		}
+	})
+
+	t.Run("rejected template with limits does not fall back", func(t *testing.T) {
+		mockSrv := &mockControlServer{
+			createTemplateErr: status.Error(codes.InvalidArgument, "actor_template.resources.limits[0].quantity: Invalid value"),
+		}
+		reconciler := setup(t, mockSrv)
+
+		task := newTask("rejected-limits", &v1alpha1.ResourcesSpec{
+			Limits: &v1alpha1.ResourceList{Cpu: "2", Memory: "4Gi"},
+		})
+		if err := reconciler.Suspend(ctx, task, nil); err == nil {
+			t.Fatal("Suspend succeeded although the template with limits was rejected")
+		}
+		assertCondition(t, task, "Ready", "False", v1alpha1.ReasonTemplateCreationFailed)
+		if len(mockSrv.createdActors) != 0 || len(mockSrv.resumedActors) != 0 {
+			t.Errorf("task ran on a fallback template without its limits: actors=%v resumed=%v", mockSrv.createdActors, mockSrv.resumedActors)
+		}
+	})
+
+	t.Run("rejected template without limits does not fall back either", func(t *testing.T) {
+		mockSrv := &mockControlServer{
+			createTemplateErr: status.Error(codes.InvalidArgument, "image must be pinned by digest"),
+		}
+		reconciler := setup(t, mockSrv)
+
+		task := newTask("no-limits", nil)
+		if err := reconciler.Suspend(ctx, task, nil); err == nil {
+			t.Fatal("Suspend succeeded although the template was rejected")
+		}
+		// Falling back would run a different image than the task asked for, so the
+		// template error is terminal regardless of whether limits are set (#366).
+		assertCondition(t, task, "Ready", "False", v1alpha1.ReasonTemplateCreationFailed)
+		if len(mockSrv.createdActors) != 0 {
+			t.Errorf("task ran on a fallback template: actors=%v", mockSrv.createdActors)
+		}
+	})
 }
 
 // assertCondition fails the test unless the task has a condition of the given type with
@@ -500,7 +862,7 @@ func assertCondition(t *testing.T, task *v1alpha1.Task, condType, wantStatus, wa
 	t.Errorf("expected %s condition to be set", condType)
 }
 
-func TestReconcileDelete_RemovesActorAndTemplates(t *testing.T) {
+func TestDelete_RemovesActorAndTemplates(t *testing.T) {
 	ctx := context.Background()
 
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
@@ -527,12 +889,11 @@ func TestReconcileDelete_RemovesActorAndTemplates(t *testing.T) {
 	}
 	defer client.Close()
 
-	reconciler := controller.NewTaskReconciler(client, "test-template", "ax-system")
-	reconciler.SecretResolver = noSecrets
+	reconciler := controller.NewTaskReconciler(client, "test-template", v1alpha1.DefaultSystemNamespace, "")
 	reconciler.WorkspaceReadyTimeout = 200 * time.Millisecond
 
-	if err := reconciler.ReconcileDelete(ctx, "default", "job"); err != nil {
-		t.Fatalf("ReconcileDelete failed: %v", err)
+	if err := reconciler.Delete(ctx, "default", "job"); err != nil {
+		t.Fatalf("Delete failed: %v", err)
 	}
 
 	if len(mockSrv.deletedActors) != 1 || mockSrv.deletedActors[0] != "job" {
@@ -555,7 +916,7 @@ func TestReconcileDelete_RemovesActorAndTemplates(t *testing.T) {
 	}
 }
 
-func TestReconcileDelete_BlocksUntilActorDeleted(t *testing.T) {
+func TestDelete_BlocksUntilActorDeleted(t *testing.T) {
 	ctx := context.Background()
 
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
@@ -590,11 +951,10 @@ func TestReconcileDelete_BlocksUntilActorDeleted(t *testing.T) {
 	}
 	defer client.Close()
 
-	reconciler := controller.NewTaskReconciler(client, "test-template", "ax-system")
-	reconciler.SecretResolver = noSecrets
+	reconciler := controller.NewTaskReconciler(client, "test-template", v1alpha1.DefaultSystemNamespace, "")
 
-	if err := reconciler.ReconcileDelete(ctx, "default", "slow-delete-task"); err != nil {
-		t.Fatalf("ReconcileDelete failed: %v", err)
+	if err := reconciler.Delete(ctx, "default", "slow-delete-task"); err != nil {
+		t.Fatalf("Delete failed: %v", err)
 	}
 
 	if getCalls < 3 {
@@ -602,7 +962,7 @@ func TestReconcileDelete_BlocksUntilActorDeleted(t *testing.T) {
 	}
 }
 
-func TestReconcileDelete_ActorDeletionTimeout(t *testing.T) {
+func TestDelete_ActorDeletionTimeout(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
 	defer cancel()
 
@@ -632,10 +992,9 @@ func TestReconcileDelete_ActorDeletionTimeout(t *testing.T) {
 	}
 	defer client.Close()
 
-	reconciler := controller.NewTaskReconciler(client, "test-template", "ax-system")
-	reconciler.SecretResolver = noSecrets
+	reconciler := controller.NewTaskReconciler(client, "test-template", v1alpha1.DefaultSystemNamespace, "")
 
-	err = reconciler.ReconcileDelete(ctx, "default", "stuck-task")
+	err = reconciler.Delete(ctx, "default", "stuck-task")
 	if err == nil {
 		t.Fatal("expected error due to timeout, got nil")
 	}
@@ -673,4 +1032,86 @@ func TestEnsureActor_RevertsCrashedActor(t *testing.T) {
 	if len(mockSrv.revertedActors) != 1 || len(mockSrv.deletedActors) != 0 {
 		t.Errorf("crashed actor: reverted %v, deleted %v; want reverted only", mockSrv.revertedActors, mockSrv.deletedActors)
 	}
+}
+
+func TestTaskReconciler_TransientSubstrateUnavailable(t *testing.T) {
+	ctx := context.Background()
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer lis.Close()
+
+	mockSrv := &mockControlServer{}
+	grpcServer := grpc.NewServer()
+	ateapipb.RegisterControlServer(grpcServer, mockSrv)
+	go grpcServer.Serve(lis)
+	defer grpcServer.Stop()
+
+	client, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("failed to create substrate client: %v", err)
+	}
+	defer client.Close()
+
+	reconciler := controller.NewTaskReconciler(client, "test-template", v1alpha1.DefaultSystemNamespace, "")
+	reconciler.WorkspaceReadyTimeout = 50 * time.Millisecond
+
+	// 1. A transient error during EnsureAtespace is recorded with Reason="SubstrateUnavailable".
+	mockSrv.createAtespaceErr = status.Error(codes.DeadlineExceeded, "substrate control plane timed out")
+	task := &v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{Name: "transient-atespace"},
+		Spec:     &v1alpha1.TaskSpec{Image: "ghrc.io/my-org/my-image"},
+	}
+	if err := reconciler.Suspend(ctx, task, nil); err == nil {
+		t.Fatal("expected error from Suspend when EnsureAtespace fails, got nil")
+	}
+	assertCondition(t, task, "Ready", "False", v1alpha1.ReasonSubstrateUnavailable)
+	mockSrv.createAtespaceErr = nil
+
+	// 2. A transient error during EnsureActor is recorded with Reason="SubstrateUnavailable".
+	mockSrv.createActorErr = status.Error(codes.DeadlineExceeded, "substrate actor creation timed out")
+	task2 := &v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{Name: "transient-actor"},
+		Spec:     &v1alpha1.TaskSpec{Image: "ghrc.io/my-org/my-image"},
+	}
+	if err := reconciler.Suspend(ctx, task2, nil); err == nil {
+		t.Fatal("expected error from Suspend when EnsureActor fails, got nil")
+	}
+	assertCondition(t, task2, "Ready", "False", v1alpha1.ReasonSubstrateUnavailable)
+	mockSrv.createActorErr = nil
+
+	// 3. A transient error during ResumeActor is recorded with Reason="SubstrateUnavailable",
+	// and a subsequent Resume once Substrate recovers resumes the actor.
+	mockSrv.resumeActorErr = status.Error(codes.DeadlineExceeded, "substrate worker pool temporarily unreachable")
+	task3 := &v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{Name: "transient-resume"},
+		Spec:     &v1alpha1.TaskSpec{Image: "ghrc.io/my-org/my-image"},
+	}
+	if err := reconciler.Resume(ctx, task3, nil); err == nil {
+		t.Fatal("expected error from Resume when ResumeActor fails, got nil")
+	}
+	assertCondition(t, task3, "Ready", "False", v1alpha1.ReasonSubstrateUnavailable)
+
+	// Recovery on retry:
+	mockSrv.resumeActorErr = nil
+	if err := reconciler.Resume(ctx, task3, nil); err != nil {
+		t.Fatalf("expected Resume to succeed after Substrate recovers, got %v", err)
+	}
+	if len(mockSrv.resumedActors) != 1 || mockSrv.resumedActors[0] != "transient-resume" {
+		t.Errorf("expected actor 'transient-resume' resumed after recovery, got %v", mockSrv.resumedActors)
+	}
+
+	// 4. A permanent error is recorded with its own reason.
+	mockSrv.createActorErr = status.Error(codes.InvalidArgument, "invalid actor specification")
+	task4 := &v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{Name: "permanent-actor-err"},
+		Spec:     &v1alpha1.TaskSpec{Image: "ghrc.io/my-org/my-image"},
+	}
+	if err := reconciler.Suspend(ctx, task4, nil); err == nil {
+		t.Fatal("expected error on InvalidArgument, got nil")
+	}
+	assertCondition(t, task4, "Ready", "False", v1alpha1.ReasonActorCreationFailed)
+	mockSrv.createActorErr = nil
 }

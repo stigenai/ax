@@ -12,24 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-defaultBaseImage: cgr.dev/chainguard/static:latest
-baseImageOverrides:
-  github.com/google/ax/cmd/ax-task-runner: alpine/git:latest
-builds:
-  - id: ax-server
-    main: ./cmd/ax-server
-    env:
-      - CGO_ENABLED=0
-    flags:
-      - -trimpath
-    ldflags:
-      - -s -w
-  - id: ax-task-runner
-    main: ./cmd/ax-task-runner
-    env:
-      - CGO_ENABLED=0
-    flags:
-      - -trimpath
-    ldflags:
-      - -s -w
+FROM alpine:3.21
 
+RUN apk add --no-cache ca-certificates
+
+ARG TARGETARCH=amd64
+COPY bin/linux_${TARGETARCH}/ax-server /usr/local/bin/ax-server
+
+ENTRYPOINT ["/usr/local/bin/ax-server"]

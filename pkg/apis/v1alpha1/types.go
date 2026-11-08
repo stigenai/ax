@@ -35,12 +35,99 @@ const (
 	KindWorkspace = "Workspace"
 	KindModel     = "Model"
 
-	DefaultTaskImage = "gcr.io/ax-substrate/ate-images/ax-task-runner"
+	DefaultTaskImage       = "gcr.io/ax-substrate/ate-images/ax-task-runner"
+	DefaultSystemNamespace = "ax-system"
 
+	// PhasePending marks a task whose actor has not been provisioned yet, for
+	// example because Substrate was unavailable. Retrying the operation can
+	// still succeed.
+	PhasePending = "Pending"
+	// PhaseFailed marks a task that AX could not provision or operate, or whose
+	// actor crashed or disappeared.
+	PhaseFailed = "Failed"
 	// PhaseTerminating marks a task whose deletion has been requested and whose
 	// actor is being torn down. The record disappears once cleanup completes.
 	PhaseTerminating = "Terminating"
+
+	// The phases below follow from the state of the task's actor on Agent
+	// Substrate. They are never stored.
+
+	// PhaseRunning marks a task whose actor is running.
+	PhaseRunning = "Running"
+	// PhaseResuming marks a task whose actor is being resumed.
+	PhaseResuming = "Resuming"
+	// PhaseSuspending marks a task whose actor is being suspended.
+	PhaseSuspending = "Suspending"
+	// PhaseSuspended marks a task whose actor is suspended.
+	PhaseSuspended = "Suspended"
+	// PhaseUnknown marks a task whose actor could not be read, or is in a state
+	// AX does not recognize.
+	PhaseUnknown = "Unknown"
 )
+
+// Condition types reported on Task status.
+const (
+	// ConditionReady reports whether the task as a whole is ready to do work:
+	// its actor is running and the workspace inside it has finished setting up.
+	ConditionReady = "Ready"
+	// ConditionWorkspaceReady reports whether the workspace inside the actor has
+	// finished setting up.
+	ConditionWorkspaceReady = "WorkspaceReady"
+)
+
+// TODO(jbd): ReasonAtespaceCreationFailed, ReasonSubstrateUnavailable,
+// ReasonActorNotFound, ReasonActorCreationFailed, ReasonActorResumeFailed
+// are invalid states. These should be returned as errors, shouldn't be
+// leaking as state.
+
+// Condition reasons. A Ready condition that is False because the actor is
+// not running (for example while it is suspended) uses the task's phase as its
+// reason instead.
+const (
+	// ReasonTaskRunning: Ready is True; the actor is running and the workspace
+	// is set up.
+	ReasonTaskRunning = "TaskRunning"
+	// ReasonWorkspaceInitializing: Ready is False; the actor is running but
+	// the workspace is still being set up.
+	ReasonWorkspaceInitializing = "WorkspaceInitializing"
+	// ReasonSubstrateUnavailable: Agent Substrate could not be reached. Ready
+	// is False with phase Pending while provisioning, or Unknown with phase
+	// Unknown while reading the actor.
+	ReasonSubstrateUnavailable = "SubstrateUnavailable"
+	// ReasonActorNotFound: Ready is False; the task's actor was removed
+	// outside AX.
+	ReasonActorNotFound = "ActorNotFound"
+	// ReasonAtespaceCreationFailed: Ready is False; the atespace could not be
+	// created on Agent Substrate.
+	ReasonAtespaceCreationFailed = "AtespaceCreationFailed"
+	// ReasonInvalidResources: Ready is False; spec.resources is invalid.
+	ReasonInvalidResources = "InvalidResources"
+	// ReasonTemplateCreationFailed: Ready is False; Agent Substrate rejected
+	// the task's ActorTemplate, for example because of its image.
+	ReasonTemplateCreationFailed = "TemplateCreationFailed"
+	// ReasonActorCreationFailed: Ready is False; the actor could not be
+	// created.
+	ReasonActorCreationFailed = "ActorCreationFailed"
+	// ReasonActorResumeFailed: Ready is False; the actor could not be resumed.
+	ReasonActorResumeFailed = "ActorResumeFailed"
+
+	// ReasonSetupComplete: WorkspaceReady is True.
+	ReasonSetupComplete = "SetupComplete"
+	// ReasonInitializing: WorkspaceReady is False; setup is still running.
+	ReasonInitializing = "Initializing"
+)
+
+// IsAXPhase reports whether phase describes the control plane's own work on a
+// task (provisioning it, failing to, or tearing it down) rather than the state
+// of the task's actor. Only these phases are stored; every other phase is read
+// from the actor on Agent Substrate when the task is fetched.
+func IsAXPhase(phase string) bool {
+	switch phase {
+	case PhasePending, PhaseFailed, PhaseTerminating:
+		return true
+	}
+	return false
+}
 
 // YAML encoding.
 //
@@ -58,6 +145,9 @@ const (
 var (
 	protoMarshal   = protojson.MarshalOptions{}
 	protoUnmarshal = protojson.UnmarshalOptions{} // unknown fields are errors
+	// protoUnmarshalLenient is for specs the control plane hands to a runner,
+	// which may come from a newer control plane than the runner image.
+	protoUnmarshalLenient = protojson.UnmarshalOptions{DiscardUnknown: true}
 )
 
 // normalizer rewrites a generically decoded document in place so legacy shapes
@@ -73,6 +163,25 @@ func marshalYAML(m proto.Message) (any, error) {
 }
 
 func unmarshalYAML(value *yaml.Node, m proto.Message, normalize normalizer) error {
+	return unmarshalYAMLWith(value, m, normalize, protoUnmarshal)
+}
+
+// UnmarshalYAMLLenient decodes a Task, Workspace or Model like their
+// UnmarshalYAML methods but ignores fields it doesn't know. Runners use it for
+// the specs the control plane passes them, so a runner image keeps working
+// when a newer control plane adds fields it doesn't use.
+func UnmarshalYAMLLenient(value *yaml.Node, m proto.Message) error {
+	var normalize normalizer
+	switch m.(type) {
+	case *Workspace:
+		normalize = normalizeWorkspace
+	case *Model:
+		normalize = normalizeModel
+	}
+	return unmarshalYAMLWith(value, m, normalize, protoUnmarshalLenient)
+}
+
+func unmarshalYAMLWith(value *yaml.Node, m proto.Message, normalize normalizer, opts protojson.UnmarshalOptions) error {
 	var doc any
 	if err := value.Decode(&doc); err != nil {
 		return err
@@ -84,7 +193,7 @@ func unmarshalYAML(value *yaml.Node, m proto.Message, normalize normalizer) erro
 	if err != nil {
 		return fmt.Errorf("converting yaml to json: %w", err)
 	}
-	return protoUnmarshal.Unmarshal(data, m)
+	return opts.Unmarshal(data, m)
 }
 
 // jsonToYAMLNode converts a JSON document into a yaml.Node tree, preserving
@@ -202,45 +311,22 @@ func (w *Workspace) UnmarshalYAML(n *yaml.Node) error { return unmarshalYAML(n, 
 func (m *Model) MarshalYAML() (any, error)        { return marshalYAML(m) }
 func (m *Model) UnmarshalYAML(n *yaml.Node) error { return unmarshalYAML(n, m, normalizeModel) }
 
-// Workspace bindings.
+// Workspace binding.
 //
-// A task binds one or more workspaces through spec.workspaces. Every entry is
-// treated the same way regardless of how many there are.
+// A task binds at most one workspace through spec.workspace.
 
-// DefaultWorkspacePath is the durable volume every workspace lives under. A
-// binding without a path is mounted at DefaultWorkspacePath/<name>, and a task
-// with no bindings gets an empty working directory at DefaultWorkspacePath.
+// DefaultWorkspacePath is where the task's workspace is mounted unless the
+// binding sets a path. It is the task command's working directory, and a task
+// with no workspace gets an empty directory there.
 const DefaultWorkspacePath = "/workspace"
 
-// WorkspaceRefs returns the workspaces the task binds, in declaration order,
-// with nil entries dropped.
-func (s *TaskSpec) WorkspaceRefs() []*WorkspaceRef {
-	if s == nil {
-		return nil
+// WorkspacePath returns the task command's working directory: the bound
+// workspace's path when set, otherwise DefaultWorkspacePath.
+func (s *TaskSpec) WorkspacePath() string {
+	if p := s.GetWorkspace().GetPath(); p != "" {
+		return p
 	}
-	out := make([]*WorkspaceRef, 0, len(s.GetWorkspaces()))
-	for _, r := range s.GetWorkspaces() {
-		if r != nil {
-			out = append(out, r)
-		}
-	}
-	return out
-}
-
-// WorkspacePaths returns the mount path of each workspace in WorkspaceRefs, in
-// the same order. An explicit path wins; otherwise the workspace lands at
-// DefaultWorkspacePath/<name>.
-func (s *TaskSpec) WorkspacePaths() []string {
-	refs := s.WorkspaceRefs()
-	paths := make([]string, len(refs))
-	for i, r := range refs {
-		if r.GetPath() != "" {
-			paths[i] = r.GetPath()
-		} else {
-			paths[i] = DefaultWorkspacePath + "/" + r.GetName()
-		}
-	}
-	return paths
+	return DefaultWorkspacePath
 }
 
 // Resource names.
@@ -311,33 +397,73 @@ func ValidateTask(t *Task) error {
 		return err
 	}
 	spec := t.GetSpec()
-	if spec == nil {
+	if ref := spec.GetWorkspace(); ref != nil {
+		if ref.GetName() == "" {
+			return errors.New("spec.workspace: name is required")
+		}
+		if p := ref.GetPath(); p != "" && !strings.HasPrefix(p, "/") {
+			return fmt.Errorf("spec.workspace: path %q must be absolute", p)
+		}
+	}
+	if err := ValidateTaskConfig(spec); err != nil {
+		return err
+	}
+	if err := ValidateTaskSize(t); err != nil {
+		return err
+	}
+	return ValidateResources(spec.GetResources())
+}
+
+// MaxEnvValueSize is the longest environment variable value Substrate accepts
+// (EnvVar.value in ateapi.proto caps it at 32,768 characters). It is applied
+// to the byte length, which is never less than the character count.
+const MaxEnvValueSize = 32 << 10
+
+// MaxTaskYAMLSize is the largest a task's launch configuration may be once
+// encoded as YAML, the form in which it reaches the runner through the
+// AX_TASK_YAML environment variable. It keeps 1 KiB of MaxEnvValueSize in
+// reserve for the fields the control plane fills in after validation, such as
+// metadata.atespace and metadata.createTime.
+const MaxTaskYAMLSize = MaxEnvValueSize - 1<<10
+
+// MaxTaskConfigSize is the largest spec.config a task may have, measured as
+// its JSON encoding. The config travels inside AX_TASK_YAML, so it must fit
+// within MaxTaskYAMLSize together with the rest of the spec; this limit leaves
+// room for that and gives a more specific error than ValidateTaskSize. The
+// config's YAML encoding can be somewhat larger than its JSON encoding, so a
+// config near this limit can still be rejected by ValidateTaskSize.
+const MaxTaskConfigSize = 16 << 10
+
+// ValidateTaskSize checks that the task's launch configuration, encoded as the
+// control plane encodes it for AX_TASK_YAML, fits within MaxTaskYAMLSize.
+// Larger tasks would be rejected by Substrate when their template is created.
+func ValidateTaskSize(t *Task) error {
+	launch := proto.Clone(t).(*Task)
+	launch.Status = nil
+	data, err := yaml.Marshal(launch)
+	if err != nil {
+		return fmt.Errorf("encoding task: %w", err)
+	}
+	if len(data) > MaxTaskYAMLSize {
+		return fmt.Errorf("task: encoded launch configuration is %d bytes, which exceeds the limit of %d bytes", len(data), MaxTaskYAMLSize)
+	}
+	return nil
+}
+
+// ValidateTaskConfig checks that spec.config fits within MaxTaskConfigSize.
+// The config is otherwise opaque: its schema belongs to the runner, and AX does
+// not interpret it.
+func ValidateTaskConfig(spec *TaskSpec) error {
+	config := spec.GetConfig()
+	if config == nil {
 		return nil
 	}
-	refs := spec.WorkspaceRefs()
-	paths := spec.WorkspacePaths()
-	names := make(map[string]bool, len(refs))
-	seen := make(map[string]string, len(refs))
-	for i, r := range refs {
-		field := fmt.Sprintf("spec.workspaces[%d]", i)
-		if r.GetName() == "" {
-			return fmt.Errorf("%s: name is required", field)
-		}
-		if names[r.GetName()] {
-			return fmt.Errorf("%s: workspace %q is bound more than once", field, r.GetName())
-		}
-		names[r.GetName()] = true
-		if r.GetPath() != "" && !strings.HasPrefix(r.GetPath(), "/") {
-			return fmt.Errorf("%s: path %q must be absolute", field, r.GetPath())
-		}
-		p := strings.TrimRight(paths[i], "/")
-		if p == "" {
-			p = "/"
-		}
-		if other, dup := seen[p]; dup {
-			return fmt.Errorf("%s: path %q is already used by workspace %q", field, paths[i], other)
-		}
-		seen[p] = r.GetName()
+	data, err := protoMarshal.Marshal(config)
+	if err != nil {
+		return fmt.Errorf("spec.config: %w", err)
+	}
+	if len(data) > MaxTaskConfigSize {
+		return fmt.Errorf("spec.config: %d bytes exceeds the limit of %d bytes", len(data), MaxTaskConfigSize)
 	}
 	return nil
 }
