@@ -1151,6 +1151,7 @@ func runSSH(serverURL, atespace, kubeContext string, args []string, stdio bool) 
 	if stdio {
 		opts.Stdin = os.Stdin
 		opts.Timeout = stdioTimeout
+		opts.LiveOutput = true // A long ssh session outgrows the 10 MiB spool cap.
 	}
 	// ssh sends SIGHUP to its ProxyCommand on exit; Exec then stops the remote process.
 	sigCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM)

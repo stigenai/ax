@@ -22,3 +22,5 @@ require (
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260720211330-0afa2a65878a // indirect
 	gopkg.in/check.v1 v1.0.0-20201130134442-10cb98267c6c // indirect
 )
+
+replace github.com/agent-substrate/env => github.com/stigenai/env v0.0.11-0.20261108201937-a65cca03e939

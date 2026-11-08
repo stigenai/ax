@@ -103,10 +103,11 @@ func TestExecStdinRoundTrip(t *testing.T) {
 	defer cancel()
 	var out bytes.Buffer
 	code, err := c.Exec(ctx, ExecOptions{
-		Command: []string{"sshd", "-i"},
-		Stdin:   strings.NewReader("hello\nworld\n"),
-		Stdout:  &out,
-		Timeout: 48 * time.Hour,
+		Command:    []string{"sshd", "-i"},
+		Stdin:      strings.NewReader("hello\nworld\n"),
+		Stdout:     &out,
+		Timeout:    48 * time.Hour,
+		LiveOutput: true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -119,6 +120,9 @@ func TestExecStdinRoundTrip(t *testing.T) {
 	}
 	if !g.start.GetStdin() {
 		t.Error("StartProcessRequest.stdin = false, want true")
+	}
+	if !g.start.GetLiveOutput() {
+		t.Error("StartProcessRequest.live_output = false, want true")
 	}
 	if got := g.start.GetTimeout().AsDuration(); got != 48*time.Hour {
 		t.Errorf("timeout = %v, want 48h", got)

@@ -92,6 +92,9 @@ type ExecOptions struct {
 	Stdin io.Reader
 	// Timeout overrides the guest watchdog (default 1h). Zero keeps the default.
 	Timeout time.Duration
+	// LiveOutput asks the guest to keep output in memory with no 10 MiB cap and
+	// no spool file. A guest without the field ignores it.
+	LiveOutput bool
 }
 
 // Exec runs a command inside the task container and streams stdout/stderr until completion.
@@ -102,11 +105,12 @@ func (c *Client) Exec(ctx context.Context, opts ExecOptions) (code int, err erro
 	}
 
 	proc, err := c.process.StartProcess(ctx, &ateenvv1alpha.StartProcessRequest{
-		Command: opts.Command,
-		Cwd:     opts.Cwd,
-		Env:     opts.Env,
-		Stdin:   opts.Stdin != nil,
-		Timeout: timeout(opts.Timeout),
+		Command:    opts.Command,
+		Cwd:        opts.Cwd,
+		Env:        opts.Env,
+		Stdin:      opts.Stdin != nil,
+		Timeout:    timeout(opts.Timeout),
+		LiveOutput: opts.LiveOutput,
 	})
 	if err != nil {
 		return 1, fmt.Errorf("starting process: %w", err)
