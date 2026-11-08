@@ -1,10 +1,13 @@
 # Binaries
 bin/
 /tmp/
+/.tmp/
 *.exe
 *.test
 /ax
 /ax-server
 /ax-task-runner
 
-cmd/ax-task-runner/__pycache__/antigravity_bootstrap.cpython-313.pyc
+.vscode/
+/claude-code-runner
+ax-claude-code-runner

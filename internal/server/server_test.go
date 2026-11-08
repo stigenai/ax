@@ -15,18 +15,24 @@
 package server_test
 
 import (
+	"cmp"
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/google/ax/internal/controller"
 	"github.com/google/ax/internal/server"
 	"github.com/google/ax/internal/store"
 	"github.com/google/ax/internal/store/memory"
+	"github.com/google/ax/internal/substrate/substratetest"
 	"github.com/google/ax/pkg/apis/v1alpha1"
+	ateapipb "go.ate.dev/substrate/api/ateapi/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -35,7 +41,7 @@ import (
 
 func TestServerHealthzHTTP(t *testing.T) {
 	memStore := memory.NewStore()
-	srv := server.NewServer(memStore)
+	srv := server.NewServer(memStore, newTestReconciler(substratetest.NewServer(t)))
 
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	rec := httptest.NewRecorder()
@@ -59,7 +65,7 @@ func TestServerHealthzHTTP(t *testing.T) {
 
 func TestServerGRPC(t *testing.T) {
 	memStore := memory.NewStore()
-	srv := server.NewServer(memStore)
+	srv := server.NewServer(memStore, newTestReconciler(substratetest.NewServer(t)))
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -115,7 +121,7 @@ func TestServerGRPC(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetWorkspace failed: %v", err)
 	}
-	if ws.GetMetadata().GetAtespace() != "default" || ws.GetMetadata().GetCreationTimestamp() == nil {
+	if ws.GetMetadata().GetAtespace() != "default" || ws.GetMetadata().GetCreateTime() == nil {
 		t.Errorf("expected workspace metadata to be defaulted, got %v", ws.GetMetadata())
 	}
 
@@ -127,7 +133,7 @@ func TestServerGRPC(t *testing.T) {
 	if task.Metadata.Name != "grpc-task" {
 		t.Errorf("expected name 'grpc-task', got %s", task.Metadata.Name)
 	}
-	if task.Metadata.CreationTimestamp == nil {
+	if task.Metadata.CreateTime == nil {
 		t.Errorf("expected creation timestamp to be populated on applied task")
 	}
 
@@ -138,7 +144,7 @@ func TestServerGRPC(t *testing.T) {
 	if len(listTasksResp.Tasks) != 1 {
 		t.Fatalf("expected 1 task in list, got %d", len(listTasksResp.Tasks))
 	}
-	if listTasksResp.Tasks[0].Metadata.CreationTimestamp == nil {
+	if listTasksResp.Tasks[0].Metadata.CreateTime == nil {
 		t.Errorf("expected creation timestamp on listed task")
 	}
 
@@ -168,7 +174,6 @@ func TestServerGRPC(t *testing.T) {
 	if resTask.Status.Phase != "Running" {
 		t.Errorf("expected task phase to be 'Running', got %q", resTask.Status.Phase)
 	}
-
 
 	// 5. Workspaces
 	ws, err = client.GetWorkspace(ctx, &v1alpha1.GetWorkspaceRequest{Atespace: "default", Name: "grpc-ws"})
@@ -204,22 +209,6 @@ func TestServerGRPC(t *testing.T) {
 		t.Fatalf("expected 1 model in list, got %d", len(listModelsResp.Models))
 	}
 
-	// 7b. WatchTask (should receive INITIAL state)
-	stream, err := client.WatchTask(ctx, &v1alpha1.WatchTaskRequest{Atespace: "default", Name: "grpc-task"})
-	if err != nil {
-		t.Fatalf("WatchTask failed: %v", err)
-	}
-	watchMsg, err := stream.Recv()
-	if err != nil {
-		t.Fatalf("WatchTask Recv failed: %v", err)
-	}
-	if watchMsg.Action != "INITIAL" {
-		t.Errorf("expected INITIAL action, got %s", watchMsg.Action)
-	}
-	if watchMsg.Task == nil || watchMsg.Task.Metadata == nil || watchMsg.Task.Metadata.Name != "grpc-task" {
-		t.Errorf("expected task 'grpc-task' in watch, got %+v", watchMsg.Task)
-	}
-
 	// 8. Delete operations
 	if _, err := client.DeleteTask(ctx, &v1alpha1.DeleteTaskRequest{Atespace: "default", Name: "grpc-task"}); err != nil {
 		t.Fatalf("DeleteTask failed: %v", err)
@@ -245,7 +234,7 @@ func TestServerGRPC(t *testing.T) {
 // labels. The server rejects them up front instead of failing during Substrate
 // actor creation.
 func TestCreate_RejectsInvalidNames(t *testing.T) {
-	srv := server.NewServer(memory.NewStore())
+	srv := server.NewServer(memory.NewStore(), newTestReconciler(substratetest.NewServer(t)))
 	ctx := context.Background()
 
 	for _, meta := range []*v1alpha1.ObjectMeta{
@@ -283,60 +272,141 @@ func TestCreate_RejectsInvalidNames(t *testing.T) {
 	}
 }
 
-func TestCreateTask_ValidatesWorkspaceBindings(t *testing.T) {
-	srv := server.NewServer(memory.NewStore())
+func TestCreateTask_ValidatesWorkspaceBinding(t *testing.T) {
+	srv := server.NewServer(memory.NewStore(), newTestReconciler(substratetest.NewServer(t)))
 	ctx := context.Background()
 
 	_, err := srv.CreateTask(ctx, &v1alpha1.CreateTaskRequest{Task: &v1alpha1.Task{
 		Metadata: &v1alpha1.ObjectMeta{Name: "bad"},
 		Spec: &v1alpha1.TaskSpec{
-			Workspaces: []*v1alpha1.WorkspaceRef{{Name: "a", Path: "/same"}, {Name: "b", Path: "/same"}},
+			Workspace: &v1alpha1.WorkspaceRef{Path: "/w"},
 		},
 	}})
 	if status.Code(err) != codes.InvalidArgument {
-		t.Fatalf("expected InvalidArgument for colliding workspace paths, got %v", err)
+		t.Fatalf("expected InvalidArgument for a nameless workspace binding, got %v", err)
 	}
 
+	if _, err := srv.UpdateWorkspace(ctx, &v1alpha1.UpdateWorkspaceRequest{Workspace: &v1alpha1.Workspace{
+		Metadata: &v1alpha1.ObjectMeta{Name: "a"},
+	}}); err != nil {
+		t.Fatalf("UpdateWorkspace: %v", err)
+	}
 	_, err = srv.CreateTask(ctx, &v1alpha1.CreateTaskRequest{Task: &v1alpha1.Task{
 		Metadata: &v1alpha1.ObjectMeta{Name: "good"},
 		Spec: &v1alpha1.TaskSpec{
-			Workspaces: []*v1alpha1.WorkspaceRef{{Name: "a"}, {Name: "b"}},
+			Workspace: &v1alpha1.WorkspaceRef{Name: "a"},
 		},
 	}})
 	if err != nil {
-		t.Fatalf("expected a valid multi-workspace task to be accepted, got %v", err)
+		t.Fatalf("expected a valid workspace binding to be accepted, got %v", err)
 	}
 }
 
-type fakeReconciler struct {
-	reconcileCount int
-	deleteCount    int
-	deleteErr      error
-	onDelete       func(ctx context.Context, atespace, taskName string) error
+type failGetWorkspaceStore struct {
+	store.Store
+	err error
 }
 
-func (f *fakeReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, workspaces ...*v1alpha1.Workspace) (*v1alpha1.Task, error) {
-	f.reconcileCount++
-	task.Status = &v1alpha1.TaskStatus{
-		Phase: task.GetStatus().GetPhase(),
-	}
-	return task, nil
+func (f *failGetWorkspaceStore) GetWorkspace(context.Context, string, string) (*v1alpha1.Workspace, error) {
+	return nil, f.err
 }
 
-func (f *fakeReconciler) ReconcileDelete(ctx context.Context, atespace, taskName string) error {
-	f.deleteCount++
-	if f.onDelete != nil {
-		return f.onDelete(ctx, atespace, taskName)
+// A task is immutable, so CreateTask must not save or provision a task whose
+// Workspace does not exist yet: it would run with an empty workspace forever.
+func TestCreateTask_RequiresBoundWorkspace(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		taskAtespace  string
+		wsAtespace    string // where the "data" Workspace exists; empty for nowhere
+		binding       string
+		getErr        error
+		wantCode      codes.Code
+		wantMsg       string
+		wantWorkspace bool
+	}{
+		{name: "missing", binding: "data", wantCode: codes.FailedPrecondition, wantMsg: `workspace "data" not found in atespace "default"`},
+		{name: "other atespace", taskAtespace: "team-a", wsAtespace: "team-b", binding: "data", wantCode: codes.FailedPrecondition, wantMsg: `workspace "data" not found in atespace "team-a"`},
+		{name: "wrapped not found", binding: "data", getErr: fmt.Errorf("lookup: %w", store.ErrNotFound), wantCode: codes.FailedPrecondition},
+		{name: "store error", binding: "data", getErr: errors.New("store unavailable"), wantCode: codes.Internal, wantMsg: `getting workspace "data": store unavailable`},
+		{name: "present", wsAtespace: "default", binding: "data", wantCode: codes.OK, wantWorkspace: true},
+		{name: "present in task atespace", taskAtespace: "team-a", wsAtespace: "team-a", binding: "data", wantCode: codes.OK, wantWorkspace: true},
+		{name: "no binding", wantCode: codes.OK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			mem := memory.NewStore()
+			var st store.Store = mem
+			if tc.getErr != nil {
+				st = &failGetWorkspaceStore{Store: mem, err: tc.getErr}
+			}
+			if tc.wsAtespace != "" {
+				if err := mem.SaveWorkspace(ctx, &v1alpha1.Workspace{
+					Metadata: &v1alpha1.ObjectMeta{Atespace: tc.wsAtespace, Name: "data"},
+					Spec:     &v1alpha1.WorkspaceSpec{},
+				}); err != nil {
+					t.Fatalf("SaveWorkspace: %v", err)
+				}
+			}
+			sub := substratetest.NewServer(t)
+			srv := server.NewServer(st, newTestReconciler(sub))
+
+			task := &v1alpha1.Task{
+				Metadata: &v1alpha1.ObjectMeta{Atespace: tc.taskAtespace, Name: "task"},
+				Spec:     &v1alpha1.TaskSpec{Image: "alpine"},
+			}
+			if tc.binding != "" {
+				task.Spec.Workspace = &v1alpha1.WorkspaceRef{Name: tc.binding}
+			}
+			_, err := srv.CreateTask(ctx, &v1alpha1.CreateTaskRequest{Task: task})
+			if status.Code(err) != tc.wantCode {
+				t.Fatalf("CreateTask: got %v, want %v", err, tc.wantCode)
+			}
+			if !strings.Contains(status.Convert(err).Message(), tc.wantMsg) {
+				t.Errorf("CreateTask error = %q, want it to contain %q", status.Convert(err).Message(), tc.wantMsg)
+			}
+
+			atespace := cmp.Or(tc.taskAtespace, "default")
+			_, getErr := mem.GetTask(ctx, atespace, "task")
+			actor, hasActor := sub.Actor(atespace, "task")
+			if tc.wantCode != codes.OK {
+				if !errors.Is(getErr, store.ErrNotFound) {
+					t.Errorf("stored task after rejection: got %v, want ErrNotFound", getErr)
+				}
+				if hasActor {
+					t.Errorf("rejected task has actor %v, want none", actor)
+				}
+				return
+			}
+			if getErr != nil {
+				t.Fatalf("stored task: %v", getErr)
+			}
+			if !hasActor {
+				t.Fatal("accepted task has no actor")
+			}
+			ref := actor.GetActorTemplate()
+			tmpl, ok := sub.Template(ref.GetAtespace(), ref.GetName())
+			if !ok {
+				t.Fatalf("actor template %v not found", ref)
+			}
+			var gotWorkspace bool
+			for _, env := range tmpl.GetContainers()[0].GetEnv() {
+				if env.GetName() == "AX_WORKSPACE_YAML" {
+					gotWorkspace = true
+				}
+			}
+			if gotWorkspace != tc.wantWorkspace {
+				t.Errorf("template has AX_WORKSPACE_YAML = %v, want %v", gotWorkspace, tc.wantWorkspace)
+			}
+		})
 	}
-	return f.deleteErr
 }
 
 func TestServer_DirectReconcilerLifecycle(t *testing.T) {
-	rec := &fakeReconciler{}
-	srv := server.NewServer(memory.NewStore(), server.Options{Reconciler: rec})
+	sub := substratetest.NewServer(t)
+	srv := server.NewServer(memory.NewStore(), newTestReconciler(sub))
 	ctx := context.Background()
 
-	// 1. CreateTask directly calls Reconciler
+	// 1. CreateTask creates the task's actor, suspended
 	task, err := srv.CreateTask(ctx, &v1alpha1.CreateTaskRequest{
 		Task: &v1alpha1.Task{
 			Metadata: &v1alpha1.ObjectMeta{Name: "task-rec"},
@@ -346,44 +416,54 @@ func TestServer_DirectReconcilerLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateTask: %v", err)
 	}
-	if rec.reconcileCount != 1 {
-		t.Errorf("expected 1 reconcile call on CreateTask, got %d", rec.reconcileCount)
+	actor, _ := sub.Actor("default", "task-rec")
+	if state := actor.GetStatus().GetState(); state != ateapipb.ActorState_ACTOR_STATE_SUSPENDED {
+		t.Errorf("actor state after CreateTask = %v, want SUSPENDED", state)
+	}
+	tmpl := actor.GetActorTemplate()
+	if _, ok := sub.Template(tmpl.GetAtespace(), tmpl.GetName()); !ok {
+		t.Errorf("expected ActorTemplate %s/%s to be created", tmpl.GetAtespace(), tmpl.GetName())
 	}
 	if task.GetStatus().GetPhase() != "Suspended" {
 		t.Errorf("expected phase Suspended, got %s", task.GetStatus().GetPhase())
 	}
 
-	// 2. ResumeTask directly calls Reconciler
+	// 2. ResumeTask resumes the actor
 	task, err = srv.ResumeTask(ctx, &v1alpha1.ResumeTaskRequest{Name: "task-rec"})
 	if err != nil {
 		t.Fatalf("ResumeTask: %v", err)
 	}
-	if rec.reconcileCount != 2 {
-		t.Errorf("expected 2 reconcile calls after ResumeTask, got %d", rec.reconcileCount)
+	actor, _ = sub.Actor("default", "task-rec")
+	if state := actor.GetStatus().GetState(); state != ateapipb.ActorState_ACTOR_STATE_RUNNING {
+		t.Errorf("actor state after ResumeTask = %v, want RUNNING", state)
 	}
 	if task.GetStatus().GetPhase() != "Running" {
 		t.Errorf("expected phase Running, got %s", task.GetStatus().GetPhase())
 	}
 
-	// 3. SuspendTask directly calls Reconciler
+	// 3. SuspendTask suspends the actor
 	task, err = srv.SuspendTask(ctx, &v1alpha1.SuspendTaskRequest{Name: "task-rec"})
 	if err != nil {
 		t.Fatalf("SuspendTask: %v", err)
 	}
-	if rec.reconcileCount != 3 {
-		t.Errorf("expected 3 reconcile calls after SuspendTask, got %d", rec.reconcileCount)
+	actor, _ = sub.Actor("default", "task-rec")
+	if state := actor.GetStatus().GetState(); state != ateapipb.ActorState_ACTOR_STATE_SUSPENDED {
+		t.Errorf("actor state after SuspendTask = %v, want SUSPENDED", state)
 	}
 	if task.GetStatus().GetPhase() != "Suspended" {
 		t.Errorf("expected phase Suspended, got %s", task.GetStatus().GetPhase())
 	}
 
-	// 4. DeleteTask directly calls ReconcileDelete
+	// 4. DeleteTask deletes the actor and its ActorTemplate
 	_, err = srv.DeleteTask(ctx, &v1alpha1.DeleteTaskRequest{Name: "task-rec"})
 	if err != nil {
 		t.Fatalf("DeleteTask: %v", err)
 	}
-	if rec.deleteCount != 1 {
-		t.Errorf("expected 1 delete call, got %d", rec.deleteCount)
+	if _, ok := sub.Actor("default", "task-rec"); ok {
+		t.Error("expected the actor to be deleted")
+	}
+	if _, ok := sub.Template(tmpl.GetAtespace(), tmpl.GetName()); ok {
+		t.Errorf("expected ActorTemplate %s/%s to be deleted", tmpl.GetAtespace(), tmpl.GetName())
 	}
 
 	// 5. Verify task is gone
@@ -396,16 +476,14 @@ func TestServer_DirectReconcilerLifecycle(t *testing.T) {
 func TestServer_DeleteTask_BlocksAndSetsPhaseTerminating(t *testing.T) {
 	st := memory.NewStore()
 	var observedPhaseDuringDelete string
-	rec := &fakeReconciler{
-		onDelete: func(ctx context.Context, atespace, taskName string) error {
-			t, err := st.GetTask(ctx, atespace, taskName)
-			if err == nil && t.Status != nil {
-				observedPhaseDuringDelete = t.Status.Phase
-			}
-			return nil
-		},
-	}
-	srv := server.NewServer(st, server.Options{Reconciler: rec})
+	sub := substratetest.NewServer(t)
+	sub.SetOnDeleteActor(func() {
+		task, err := st.GetTask(context.Background(), "default", "task-term")
+		if err == nil && task.Status != nil {
+			observedPhaseDuringDelete = task.Status.Phase
+		}
+	})
+	srv := server.NewServer(st, newTestReconciler(sub))
 	ctx := context.Background()
 
 	_, err := srv.CreateTask(ctx, &v1alpha1.CreateTaskRequest{
@@ -435,10 +513,8 @@ func TestServer_DeleteTask_BlocksAndSetsPhaseTerminating(t *testing.T) {
 
 func TestServer_DeleteTask_ReconcileErrorRetainsTask(t *testing.T) {
 	st := memory.NewStore()
-	rec := &fakeReconciler{
-		deleteErr: errors.New("substrate timeout deleting actor"),
-	}
-	srv := server.NewServer(st, server.Options{Reconciler: rec})
+	sub := substratetest.NewServer(t)
+	srv := server.NewServer(st, newTestReconciler(sub))
 	ctx := context.Background()
 
 	_, err := srv.CreateTask(ctx, &v1alpha1.CreateTaskRequest{
@@ -451,9 +527,10 @@ func TestServer_DeleteTask_ReconcileErrorRetainsTask(t *testing.T) {
 		t.Fatalf("CreateTask: %v", err)
 	}
 
+	sub.SetErrors(substratetest.Errors{DeleteActor: status.Error(codes.Internal, "substrate failure deleting actor")})
 	_, err = srv.DeleteTask(ctx, &v1alpha1.DeleteTaskRequest{Name: "task-err"})
 	if err == nil {
-		t.Fatal("expected DeleteTask to fail when ReconcileDelete fails")
+		t.Fatal("expected DeleteTask to fail when Substrate fails to delete the actor")
 	}
 
 	task, err := srv.GetTask(ctx, &v1alpha1.GetTaskRequest{Name: "task-err"})
@@ -480,8 +557,8 @@ func (f *failUpdateStatusStore) UpdateTaskStatus(ctx context.Context, atespace, 
 func TestServer_DeleteTask_UpdateStatusError(t *testing.T) {
 	base := memory.NewStore()
 	st := &failUpdateStatusStore{Store: base}
-	rec := &fakeReconciler{}
-	srv := server.NewServer(st, server.Options{Reconciler: rec})
+	sub := substratetest.NewServer(t)
+	srv := server.NewServer(st, newTestReconciler(sub))
 	ctx := context.Background()
 
 	_, err := srv.CreateTask(ctx, &v1alpha1.CreateTaskRequest{
@@ -499,7 +576,406 @@ func TestServer_DeleteTask_UpdateStatusError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected DeleteTask to fail when UpdateTaskStatus fails")
 	}
-	if rec.deleteCount != 0 {
-		t.Errorf("expected ReconcileDelete not to be called if UpdateTaskStatus fails, got %d calls", rec.deleteCount)
+	if sub.DeleteActorCalls() != 0 {
+		t.Errorf("expected no DeleteActor call if UpdateTaskStatus fails, got %d", sub.DeleteActorCalls())
+	}
+}
+
+func TestServer_SuspendTask_ReconcileErrorRetainsRunningState(t *testing.T) {
+	// The actor's worker reports its workspace as ready, so the running task is Ready.
+	readySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer readySrv.Close()
+
+	st := memory.NewStore()
+	workerIP := readySrv.Listener.Addr().String()
+	sub := substratetest.NewServer(t)
+	sub.SetWorkerIP(workerIP)
+	srv := server.NewServer(st, newTestReconciler(sub))
+	ctx := context.Background()
+
+	if _, err := srv.CreateTask(ctx, &v1alpha1.CreateTaskRequest{Task: &v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{Name: "task-suspend-err"},
+		Spec:     &v1alpha1.TaskSpec{Image: "alpine"},
+	}}); err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	running, err := srv.ResumeTask(ctx, &v1alpha1.ResumeTaskRequest{Name: "task-suspend-err"})
+	if err != nil {
+		t.Fatalf("ResumeTask: %v", err)
+	}
+	if ready := readyCondition(running); running.GetStatus().GetPhase() != "Running" || ready.GetStatus() != "True" {
+		t.Fatalf("ResumeTask status = %v, want Running with Ready=True", running.GetStatus())
+	}
+
+	sub.SetErrors(substratetest.Errors{SuspendActor: status.Error(codes.Internal, "substrate suspend error")})
+	_, err = srv.SuspendTask(ctx, &v1alpha1.SuspendTaskRequest{Name: "task-suspend-err"})
+	if status.Code(err) != codes.Internal {
+		t.Fatalf("expected Internal error when Substrate fails to suspend the actor, got %v", err)
+	}
+
+	stored, err := srv.GetTask(ctx, &v1alpha1.GetTaskRequest{Name: "task-suspend-err"})
+	if err != nil {
+		t.Fatalf("GetTask: %v", err)
+	}
+	if stored.GetStatus().GetPhase() != "Running" {
+		t.Errorf("stored phase = %q, want Running after failed suspension", stored.GetStatus().GetPhase())
+	}
+	if stored.GetStatus().GetWorkerIp() != workerIP {
+		t.Errorf("stored worker IP = %q, want %s", stored.GetStatus().GetWorkerIp(), workerIP)
+	}
+	if ready := readyCondition(stored); ready.GetStatus() != "True" || ready.GetReason() != v1alpha1.ReasonTaskRunning {
+		t.Errorf("stored conditions = %v, want Ready=True (TaskRunning)", stored.GetStatus().GetConditions())
+	}
+}
+
+func TestServer_SuspendTask_SuccessUpdatesStoredState(t *testing.T) {
+	st := memory.NewStore()
+	srv := server.NewServer(st, newTestReconciler(substratetest.NewServer(t)))
+	ctx := context.Background()
+
+	if _, err := srv.CreateTask(ctx, &v1alpha1.CreateTaskRequest{Task: &v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{Name: "task-suspend-ok"},
+		Spec:     &v1alpha1.TaskSpec{Image: "alpine"},
+	}}); err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	if _, err := srv.ResumeTask(ctx, &v1alpha1.ResumeTaskRequest{Name: "task-suspend-ok"}); err != nil {
+		t.Fatalf("ResumeTask: %v", err)
+	}
+
+	resp, err := srv.SuspendTask(ctx, &v1alpha1.SuspendTaskRequest{Name: "task-suspend-ok"})
+	if err != nil {
+		t.Fatalf("SuspendTask: %v", err)
+	}
+	if resp.GetStatus().GetPhase() != "Suspended" {
+		t.Errorf("response phase = %q, want Suspended", resp.GetStatus().GetPhase())
+	}
+
+	stored, err := st.GetTask(ctx, "default", "task-suspend-ok")
+	if err != nil {
+		t.Fatalf("GetTask: %v", err)
+	}
+	assertNoActorState(t, stored)
+}
+
+// assertNoActorState checks that a stored task holds none of the status that
+// belongs to its actor on Substrate.
+func assertNoActorState(t *testing.T, stored *v1alpha1.Task) {
+	t.Helper()
+	st := stored.GetStatus()
+	if st.GetPhase() != "" || st.GetActor() != "" || st.GetWorkerIp() != "" {
+		t.Errorf("stored status has phase=%q actor=%q workerIP=%q, want all empty", st.GetPhase(), st.GetActor(), st.GetWorkerIp())
+	}
+	for _, c := range st.GetConditions() {
+		if c.GetType() == "Ready" {
+			t.Errorf("stored status has a Ready condition %v, want none", c)
+		}
+	}
+}
+
+// newTestReconciler returns a TaskReconciler that runs tasks on sub.
+func newTestReconciler(sub *substratetest.Server) *controller.TaskReconciler {
+	return controller.NewTaskReconciler(sub.Client(), "test-template", v1alpha1.DefaultSystemNamespace, "")
+}
+
+// readyCondition returns the task's Ready condition, or nil.
+func readyCondition(task *v1alpha1.Task) *v1alpha1.Condition {
+	for _, c := range task.GetStatus().GetConditions() {
+		if c.GetType() == v1alpha1.ConditionReady {
+			return c
+		}
+	}
+	return nil
+}
+
+func TestServer_ReadsActorStateFromSubstrate(t *testing.T) {
+	st := memory.NewStore()
+	sub := substratetest.NewServer(t)
+	srv := server.NewServer(st, newTestReconciler(sub))
+	ctx := context.Background()
+
+	for _, name := range []string{"observed-a", "observed-b"} {
+		if _, err := srv.CreateTask(ctx, &v1alpha1.CreateTaskRequest{Task: &v1alpha1.Task{
+			Metadata: &v1alpha1.ObjectMeta{Name: name},
+			Spec:     &v1alpha1.TaskSpec{Image: "alpine"},
+		}}); err != nil {
+			t.Fatalf("CreateTask(%s): %v", name, err)
+		}
+		// Substrate runs the actor without AX asking it to.
+		sub.SetActor(&ateapipb.Actor{
+			Metadata: &ateapipb.ResourceMetadata{Atespace: "default", Name: name},
+			Status: &ateapipb.ActorStatus{
+				State:            ateapipb.ActorState_ACTOR_STATE_RUNNING,
+				WorkerAssignment: &ateapipb.WorkerAssignment{WorkerPodIps: []string{"10.244.1.7"}},
+			},
+		})
+	}
+
+	got, err := srv.GetTask(ctx, &v1alpha1.GetTaskRequest{Name: "observed-a"})
+	if err != nil {
+		t.Fatalf("GetTask: %v", err)
+	}
+	if got.GetStatus().GetPhase() != "Running" || got.GetStatus().GetWorkerIp() != "10.244.1.7" || got.GetStatus().GetActor() != "observed-a" {
+		t.Errorf("GetTask status = %v, want the actor's state", got.GetStatus())
+	}
+
+	list, err := srv.ListTasks(ctx, &v1alpha1.ListTasksRequest{Atespace: "default"})
+	if err != nil {
+		t.Fatalf("ListTasks: %v", err)
+	}
+	for _, task := range list.GetTasks() {
+		if task.GetStatus().GetPhase() != "Running" || task.GetStatus().GetActor() != task.GetMetadata().GetName() {
+			t.Errorf("ListTasks status for %s = %v, want the actor's state", task.GetMetadata().GetName(), task.GetStatus())
+		}
+	}
+
+	// A change on Substrate alone is visible on the next read.
+	sub.SetActor(&ateapipb.Actor{
+		Metadata: &ateapipb.ResourceMetadata{Atespace: "default", Name: "observed-a"},
+		Status:   &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_SUSPENDED},
+	})
+	got, err = srv.GetTask(ctx, &v1alpha1.GetTaskRequest{Name: "observed-a"})
+	if err != nil {
+		t.Fatalf("GetTask: %v", err)
+	}
+	if got.GetStatus().GetPhase() != "Suspended" {
+		t.Errorf("phase after the actor was suspended on Substrate = %q, want Suspended", got.GetStatus().GetPhase())
+	}
+
+	stored, err := st.GetTask(ctx, "default", "observed-a")
+	if err != nil {
+		t.Fatalf("store GetTask: %v", err)
+	}
+	assertNoActorState(t, stored)
+}
+
+func TestServer_CreateTask_InitialPhaseSuspended(t *testing.T) {
+	st := memory.NewStore()
+	srv := server.NewServer(st, newTestReconciler(substratetest.NewServer(t)))
+	ctx := context.Background()
+
+	task, err := srv.CreateTask(ctx, &v1alpha1.CreateTaskRequest{
+		Task: &v1alpha1.Task{
+			Metadata: &v1alpha1.ObjectMeta{Name: "task-create-suspended"},
+			Spec:     &v1alpha1.TaskSpec{Image: "alpine"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	if task.GetStatus().GetPhase() != "Suspended" {
+		t.Errorf("returned task phase = %q, want Suspended", task.GetStatus().GetPhase())
+	}
+
+	stored, err := st.GetTask(ctx, "default", "task-create-suspended")
+	if err != nil {
+		t.Fatalf("GetTask: %v", err)
+	}
+	assertNoActorState(t, stored)
+}
+
+func TestServer_CreateTask_ReconcileErrorMarksFailed(t *testing.T) {
+	st := memory.NewStore()
+	sub := substratetest.NewServer(t)
+	sub.SetErrors(substratetest.Errors{SuspendActor: status.Error(codes.Internal, "substrate suspend actor failure")})
+	srv := server.NewServer(st, newTestReconciler(sub))
+	ctx := context.Background()
+
+	_, err := srv.CreateTask(ctx, &v1alpha1.CreateTaskRequest{
+		Task: &v1alpha1.Task{
+			Metadata: &v1alpha1.ObjectMeta{Name: "task-create-fail"},
+			Spec:     &v1alpha1.TaskSpec{Image: "alpine"},
+		},
+	})
+	if status.Code(err) != codes.Internal {
+		t.Fatalf("expected Internal error when Substrate fails to suspend the new actor, got %v", err)
+	}
+
+	// Task was saved and updated to Failed phase in store
+	stored, err := srv.GetTask(ctx, &v1alpha1.GetTaskRequest{Name: "task-create-fail"})
+	if err != nil {
+		t.Fatalf("expected task to exist in store after a failed create, got %v", err)
+	}
+	if stored.GetStatus().GetPhase() != v1alpha1.PhaseFailed {
+		t.Errorf("stored phase = %q, want Failed", stored.GetStatus().GetPhase())
+	}
+
+	// Because task already exists in store, attempting to create it again must fail with FailedPrecondition
+	_, err = srv.CreateTask(ctx, &v1alpha1.CreateTaskRequest{
+		Task: &v1alpha1.Task{
+			Metadata: &v1alpha1.ObjectMeta{Name: "task-create-fail"},
+			Spec:     &v1alpha1.TaskSpec{Image: "alpine"},
+		},
+	})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("expected FailedPrecondition on duplicate create, got %v", err)
+	}
+}
+
+func TestServer_TransientSubstrateUnavailableRecovery(t *testing.T) {
+	st := memory.NewStore()
+	sub := substratetest.NewServer(t)
+	sub.SetErrors(substratetest.Errors{CreateAtespace: status.Error(codes.DeadlineExceeded, "substrate control plane timed out")})
+	srv := server.NewServer(st, newTestReconciler(sub))
+	ctx := context.Background()
+
+	// 1. CreateTask while Substrate is unavailable records Phase="Pending" (not "Failed")
+	// and returns codes.Unavailable.
+	_, err := srv.CreateTask(ctx, &v1alpha1.CreateTaskRequest{
+		Task: &v1alpha1.Task{
+			Metadata: &v1alpha1.ObjectMeta{Name: "simple-task"},
+			Spec:     &v1alpha1.TaskSpec{Image: "alpine"},
+		},
+	})
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("expected Unavailable from CreateTask when Substrate is unreachable, got %v", err)
+	}
+
+	stored, err := srv.GetTask(ctx, &v1alpha1.GetTaskRequest{Name: "simple-task"})
+	if err != nil {
+		t.Fatalf("GetTask failed: %v", err)
+	}
+	if stored.GetStatus().GetPhase() != v1alpha1.PhasePending {
+		t.Errorf("expected stored phase 'Pending' after transient Substrate error, got %q", stored.GetStatus().GetPhase())
+	}
+
+	// 2. Re-applying a Pending task with a different spec is rejected to preserve immutability.
+	_, err = srv.CreateTask(ctx, &v1alpha1.CreateTaskRequest{
+		Task: &v1alpha1.Task{
+			Metadata: &v1alpha1.ObjectMeta{Name: "simple-task"},
+			Spec:     &v1alpha1.TaskSpec{Image: "debian"},
+		},
+	})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("expected FailedPrecondition when re-applying Pending task with modified spec, got %v", err)
+	}
+
+	// 3. Re-applying a Pending task with omitted status preserves stored status conditions
+	// rather than dropping them before reconciliation. Steps 3 and 4 fail at SuspendActor,
+	// which leaves the conditions it is given alone; a failing CreateAtespace would
+	// overwrite Ready with SubstrateUnavailable whatever the server passed in.
+	sub.SetErrors(substratetest.Errors{SuspendActor: status.Error(codes.DeadlineExceeded, "substrate timed out suspending actor")})
+	_, err = srv.CreateTask(ctx, &v1alpha1.CreateTaskRequest{
+		Task: &v1alpha1.Task{
+			Metadata: &v1alpha1.ObjectMeta{Name: "simple-task"},
+			Spec:     &v1alpha1.TaskSpec{Image: "alpine"},
+		},
+	})
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("expected Unavailable on retry while Substrate is still down, got %v", err)
+	}
+	retried, err := st.GetTask(ctx, "default", "simple-task")
+	if err != nil {
+		t.Fatalf("store GetTask: %v", err)
+	}
+	if conds := retried.GetStatus().GetConditions(); len(conds) != 1 || conds[0].GetReason() != v1alpha1.ReasonSubstrateUnavailable {
+		t.Errorf("expected stored condition SubstrateUnavailable to be preserved on omitted-status retry, got %v", conds)
+	}
+
+	// 4. Re-applying a Pending task with client-supplied conditions reuses the stored task
+	// rather than overwriting status with client-supplied values.
+	_, err = srv.CreateTask(ctx, &v1alpha1.CreateTaskRequest{
+		Task: &v1alpha1.Task{
+			Metadata: &v1alpha1.ObjectMeta{Name: "simple-task"},
+			Spec:     &v1alpha1.TaskSpec{Image: "alpine"},
+			Status: &v1alpha1.TaskStatus{
+				Phase: "Running",
+				Conditions: []*v1alpha1.Condition{
+					{Type: "Ready", Status: "True", Reason: "ClientForged"},
+				},
+			},
+		},
+	})
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("expected Unavailable on retry while Substrate is still down, got %v", err)
+	}
+	retried, err = st.GetTask(ctx, "default", "simple-task")
+	if err != nil {
+		t.Fatalf("store GetTask: %v", err)
+	}
+	if conds := retried.GetStatus().GetConditions(); len(conds) != 1 || conds[0].GetReason() != v1alpha1.ReasonSubstrateUnavailable {
+		t.Errorf("expected client-supplied conditions to be ignored on Pending retry, got %v", conds)
+	}
+
+	// 5. Once Substrate recovers, re-applying CreateTask with the unchanged spec succeeds
+	// for a Pending task and transitions it to Suspended.
+	sub.SetErrors(substratetest.Errors{})
+	created, err := srv.CreateTask(ctx, &v1alpha1.CreateTaskRequest{
+		Task: &v1alpha1.Task{
+			Metadata: &v1alpha1.ObjectMeta{Name: "simple-task"},
+			Spec:     &v1alpha1.TaskSpec{Image: "alpine"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateTask retry after Substrate recovery failed: %v", err)
+	}
+	if created.GetStatus().GetPhase() != "Suspended" {
+		t.Errorf("expected phase 'Suspended' after recovery, got %q", created.GetStatus().GetPhase())
+	}
+	if !created.GetMetadata().GetCreateTime().AsTime().Equal(stored.GetMetadata().GetCreateTime().AsTime()) {
+		t.Errorf("expected CreateTime to be preserved across Pending re-apply")
+	}
+
+	// 6. ResumeTask during a brief Substrate outage keeps the task Pending instead of Failed.
+	sub.SetErrors(substratetest.Errors{ResumeActor: status.Error(codes.DeadlineExceeded, "substrate worker pool temporarily unreachable")})
+	_, err = srv.ResumeTask(ctx, &v1alpha1.ResumeTaskRequest{Name: "simple-task"})
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("expected Unavailable from ResumeTask when Substrate is unreachable, got %v", err)
+	}
+	storedAfterResumeErr, err := srv.GetTask(ctx, &v1alpha1.GetTaskRequest{Name: "simple-task"})
+	if err != nil {
+		t.Fatalf("GetTask failed: %v", err)
+	}
+	if storedAfterResumeErr.GetStatus().GetPhase() != v1alpha1.PhasePending {
+		t.Errorf("expected stored phase 'Pending' after transient ResumeTask error, got %q", storedAfterResumeErr.GetStatus().GetPhase())
+	}
+}
+
+// A failed create stores phase Failed. A later successful suspend or resume
+// clears it, so the phase is read from the actor again.
+func TestServer_SuccessClearsStoredFailure(t *testing.T) {
+	sub := substratetest.NewServer(t)
+	srv := server.NewServer(memory.NewStore(), newTestReconciler(sub))
+	ctx := context.Background()
+
+	// createFailed creates a task whose actor exists but could not be
+	// suspended, which leaves its stored phase Failed.
+	createFailed := func(name string) {
+		t.Helper()
+		sub.SetErrors(substratetest.Errors{SuspendActor: status.Error(codes.Internal, "substrate suspend failure")})
+		defer sub.SetErrors(substratetest.Errors{})
+		if _, err := srv.CreateTask(ctx, &v1alpha1.CreateTaskRequest{Task: &v1alpha1.Task{
+			Metadata: &v1alpha1.ObjectMeta{Name: name},
+			Spec:     &v1alpha1.TaskSpec{Image: "alpine"},
+		}}); status.Code(err) != codes.Internal {
+			t.Fatalf("CreateTask(%s): got %v, want Internal", name, err)
+		}
+		task, err := srv.GetTask(ctx, &v1alpha1.GetTaskRequest{Name: name})
+		if err != nil {
+			t.Fatalf("GetTask(%s): %v", name, err)
+		}
+		if task.GetStatus().GetPhase() != v1alpha1.PhaseFailed {
+			t.Fatalf("phase of %s after a failed create = %q, want Failed", name, task.GetStatus().GetPhase())
+		}
+	}
+
+	createFailed("task-suspend")
+	task, err := srv.SuspendTask(ctx, &v1alpha1.SuspendTaskRequest{Name: "task-suspend"})
+	if err != nil {
+		t.Fatalf("SuspendTask: %v", err)
+	}
+	if task.GetStatus().GetPhase() != "Suspended" {
+		t.Errorf("phase after SuspendTask = %q, want Suspended", task.GetStatus().GetPhase())
+	}
+
+	createFailed("task-resume")
+	task, err = srv.ResumeTask(ctx, &v1alpha1.ResumeTaskRequest{Name: "task-resume"})
+	if err != nil {
+		t.Fatalf("ResumeTask: %v", err)
+	}
+	if task.GetStatus().GetPhase() != "Running" {
+		t.Errorf("phase after ResumeTask = %q, want Running", task.GetStatus().GetPhase())
 	}
 }

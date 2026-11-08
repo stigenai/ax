@@ -22,6 +22,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/signal"
 	"sort"
 	"strconv"
 	"strings"
@@ -45,52 +46,15 @@ func main() {
 		os.Exit(1)
 	}
 
+	opts := parseGlobalArgs(os.Args[1:])
 	var (
-		cmd            string
-		cleanArgs      []string
-		atespace       = "default"
-		explicitServer = ""
-		kubeContext    = ""
-		axNamespace    = "ax-system"
+		cmd            = opts.cmd
+		cleanArgs      = opts.args
+		atespace       = opts.atespace
+		explicitServer = opts.server
+		kubeContext    = opts.kubeContext
+		axNamespace    = opts.namespace
 	)
-
-	args := os.Args[1:]
-	for i := 0; i < len(args); i++ {
-		arg := args[i]
-		if arg == "-a" || arg == "--atespace" {
-			if i+1 < len(args) {
-				atespace = args[i+1]
-				i++
-			}
-		} else if strings.HasPrefix(arg, "--atespace=") {
-			atespace = strings.TrimPrefix(arg, "--atespace=")
-		} else if arg == "--server" {
-			if i+1 < len(args) {
-				explicitServer = args[i+1]
-				i++
-			}
-		} else if strings.HasPrefix(arg, "--server=") {
-			explicitServer = strings.TrimPrefix(arg, "--server=")
-		} else if arg == "--context" {
-			if i+1 < len(args) {
-				kubeContext = args[i+1]
-				i++
-			}
-		} else if strings.HasPrefix(arg, "--context=") {
-			kubeContext = strings.TrimPrefix(arg, "--context=")
-		} else if arg == "-n" || arg == "--namespace" {
-			if i+1 < len(args) {
-				axNamespace = args[i+1]
-				i++
-			}
-		} else if strings.HasPrefix(arg, "--namespace=") {
-			axNamespace = strings.TrimPrefix(arg, "--namespace=")
-		} else if cmd == "" && !strings.HasPrefix(arg, "-") {
-			cmd = arg
-		} else {
-			cleanArgs = append(cleanArgs, arg)
-		}
-	}
 
 	if cmd == "" {
 		printUsage()
@@ -100,7 +64,7 @@ func main() {
 	// Commands that don't require an AX server connection
 	switch cmd {
 	case "version":
-		fmt.Println("ax version v1alpha1 (standalone redis engine)")
+		fmt.Println("ax version v1alpha1")
 		return
 	case "help", "-h", "--help":
 		printUsage()
@@ -117,6 +81,17 @@ func main() {
 			os.Exit(1)
 		}
 		return
+	case "ssh":
+		// Answer help and usage errors before resolving the server, which may
+		// start a port-forward to the cluster.
+		if _, _, help, err := parseSSHArgs(cleanArgs); help || err != nil {
+			fmt.Println(sshUsage)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
+			return
+		}
 	}
 
 	// Resolve the AX server URL (auto-tunneling to active kube context if not explicitly set)
@@ -132,13 +107,15 @@ func main() {
 
 	switch cmd {
 	case "apply":
-		err = runApply(serverURL, cleanArgs)
+		var atespaceFlag *string
+		if opts.atespaceExplicit {
+			atespaceFlag = &atespace
+		}
+		err = runApply(serverURL, atespaceFlag, cleanArgs)
 	case "get":
 		err = runGet(serverURL, atespace, cleanArgs)
 	case "describe":
 		err = runDescribe(serverURL, atespace, cleanArgs)
-	case "watch":
-		err = runWatch(serverURL, atespace, cleanArgs)
 	case "suspend":
 		err = runSuspend(serverURL, atespace, cleanArgs)
 	case "resume":
@@ -146,7 +123,7 @@ func main() {
 	case "delete":
 		err = runDelete(serverURL, atespace, cleanArgs)
 	case "ssh":
-		err = runSSH(serverURL, atespace, kubeContext, cleanArgs)
+		err = runSSH(serverURL, atespace, kubeContext, axNamespace, cleanArgs)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command: %s\n", cmd)
 		printUsage()
@@ -157,6 +134,71 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// globalArgs holds the command name, the flags shared by every command, and the
+// remaining arguments for the command itself.
+type globalArgs struct {
+	cmd              string
+	args             []string
+	atespace         string
+	atespaceExplicit bool
+	server           string
+	kubeContext      string
+	namespace        string
+}
+
+// parseGlobalArgs extracts the command name and the global flags from args. It
+// stops interpreting flags at "--", so everything after it (for example the
+// command run by `ax ssh <task> -- ...`) is passed through to the command intact.
+func parseGlobalArgs(args []string) globalArgs {
+	defaultNamespace := os.Getenv("AX_SYSTEM_NAMESPACE")
+	if defaultNamespace == "" {
+		defaultNamespace = v1alpha1.DefaultSystemNamespace
+	}
+	g := globalArgs{atespace: "default", namespace: defaultNamespace}
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			g.args = append(g.args, args[i:]...)
+			break
+		} else if arg == "-a" || arg == "--atespace" {
+			if i+1 < len(args) {
+				g.atespace = args[i+1]
+				g.atespaceExplicit = true
+				i++
+			}
+		} else if strings.HasPrefix(arg, "--atespace=") {
+			g.atespace = strings.TrimPrefix(arg, "--atespace=")
+			g.atespaceExplicit = true
+		} else if arg == "--server" {
+			if i+1 < len(args) {
+				g.server = args[i+1]
+				i++
+			}
+		} else if strings.HasPrefix(arg, "--server=") {
+			g.server = strings.TrimPrefix(arg, "--server=")
+		} else if arg == "--context" {
+			if i+1 < len(args) {
+				g.kubeContext = args[i+1]
+				i++
+			}
+		} else if strings.HasPrefix(arg, "--context=") {
+			g.kubeContext = strings.TrimPrefix(arg, "--context=")
+		} else if arg == "-n" || arg == "--namespace" {
+			if i+1 < len(args) {
+				g.namespace = args[i+1]
+				i++
+			}
+		} else if strings.HasPrefix(arg, "--namespace=") {
+			g.namespace = strings.TrimPrefix(arg, "--namespace=")
+		} else if g.cmd == "" && !strings.HasPrefix(arg, "-") {
+			g.cmd = arg
+		} else {
+			g.args = append(g.args, arg)
+		}
+	}
+	return g
 }
 
 func printUsage() {
@@ -176,8 +218,8 @@ Available Commands:
   describe task <name>    Show detailed information about a task
   describe workspace <name> Show detailed information about a workspace
   describe model <name>   Show detailed information about a model
-  watch task <name>       Stream live status and condition updates for a task
   ssh <task-name> [-- cmd] Run a command or shell inside the running task container
+                          (Ctrl-C is forwarded; press it twice quickly, or Ctrl-\, to exit locally)
   suspend task <name>     Suspend execution of a task and checkpoint state
   resume task <name>      Resume execution of a suspended task
   delete task <name>      Delete a task
@@ -204,7 +246,8 @@ func getAXClient(serverURL string) (v1alpha1.AXClient, *grpc.ClientConn, error) 
 	return v1alpha1.NewAXClient(conn), conn, nil
 }
 
-func runApply(serverURL string, args []string) error {
+// A nil atespace leaves manifest atespaces unchanged and lets the server default missing ones.
+func runApply(serverURL string, atespace *string, args []string) error {
 	data, ok, err := manifestFromArgs(args)
 	if err != nil {
 		return err
@@ -244,7 +287,7 @@ func runApply(serverURL string, args []string) error {
 			}
 		}
 
-		kind, name, outcome, err := applyDocument(ctx, client, &doc)
+		kind, name, outcome, err := applyDocument(ctx, client, &doc, atespace)
 		if err != nil {
 			return fmt.Errorf("applying document %d: %w", docIndex, err)
 		}
@@ -253,9 +296,9 @@ func runApply(serverURL string, args []string) error {
 }
 
 // applyDocument decodes one manifest by its kind and submits it with the matching
-// Update RPC. It reports the kind, the resource name, and whether the resource was
+// RPC. It reports the kind, the resource name, and whether the resource was
 // created, configured (spec changed), or unchanged, in the style of kubectl apply.
-func applyDocument(ctx context.Context, client v1alpha1.AXClient, doc *yaml.Node) (kind, name, outcome string, err error) {
+func applyDocument(ctx context.Context, client v1alpha1.AXClient, doc *yaml.Node, atespace *string) (kind, name, outcome string, err error) {
 	var head struct {
 		Kind string `yaml:"kind"`
 	}
@@ -269,6 +312,9 @@ func applyDocument(ctx context.Context, client v1alpha1.AXClient, doc *yaml.Node
 		if err := doc.Decode(&task); err != nil {
 			return "", "", "", err
 		}
+		if err := setApplyAtespace(task.Metadata, atespace); err != nil {
+			return "", "", "", err
+		}
 		res, err := client.CreateTask(ctx, &v1alpha1.CreateTaskRequest{Task: &task})
 		if err != nil {
 			return "", "", "", err
@@ -278,6 +324,9 @@ func applyDocument(ctx context.Context, client v1alpha1.AXClient, doc *yaml.Node
 	case v1alpha1.KindWorkspace:
 		var ws v1alpha1.Workspace
 		if err := doc.Decode(&ws); err != nil {
+			return "", "", "", err
+		}
+		if err := setApplyAtespace(ws.Metadata, atespace); err != nil {
 			return "", "", "", err
 		}
 		existing, err := client.GetWorkspace(ctx, &v1alpha1.GetWorkspaceRequest{Atespace: ws.GetMetadata().GetAtespace(), Name: ws.GetMetadata().GetName()})
@@ -293,6 +342,9 @@ func applyDocument(ctx context.Context, client v1alpha1.AXClient, doc *yaml.Node
 		if err := doc.Decode(&m); err != nil {
 			return "", "", "", err
 		}
+		if err := setApplyAtespace(m.Metadata, atespace); err != nil {
+			return "", "", "", err
+		}
 		existing, err := client.GetModel(ctx, &v1alpha1.GetModelRequest{Atespace: m.GetMetadata().GetAtespace(), Name: m.GetMetadata().GetName()})
 		outcome, err := applyOutcome(err, existing.GetSpec(), m.GetSpec())
 		if err != nil {
@@ -306,6 +358,18 @@ func applyDocument(ctx context.Context, client v1alpha1.AXClient, doc *yaml.Node
 	default:
 		return "", "", "", fmt.Errorf("unsupported kind %q (expected Task, Workspace, or Model)", head.Kind)
 	}
+}
+
+// setApplyAtespace fills a missing atespace or rejects a mismatch with an explicit flag.
+func setApplyAtespace(meta *v1alpha1.ObjectMeta, atespace *string) error {
+	if meta == nil || atespace == nil {
+		return nil
+	}
+	if meta.Atespace != "" && meta.Atespace != *atespace {
+		return fmt.Errorf("metadata.atespace %q does not match --atespace %q", meta.Atespace, *atespace)
+	}
+	meta.Atespace = *atespace
+	return nil
 }
 
 // applyOutcome classifies an apply from the result of looking up the existing
@@ -354,7 +418,7 @@ func runGet(serverURL, atespace string, args []string) error {
 		for _, t := range tasks {
 			workerIP := ""
 			actor := ""
-			phase := "Pending"
+			phase := v1alpha1.PhasePending
 			if t.Status != nil {
 				workerIP = t.Status.WorkerIp
 				actor = t.Status.Actor
@@ -374,8 +438,8 @@ func runGet(serverURL, atespace string, args []string) error {
 			if t.Metadata != nil {
 				name = t.Metadata.Name
 				tAtespace = t.Metadata.Atespace
-				if t.Metadata.CreationTimestamp != nil {
-					age = formatAge(time.Since(t.Metadata.CreationTimestamp.AsTime()))
+				if t.Metadata.CreateTime != nil {
+					age = formatAge(time.Since(t.Metadata.CreateTime.AsTime()))
 				}
 			}
 			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
@@ -634,22 +698,22 @@ func runDescribe(serverURL, atespace string, args []string) error {
 	fmt.Printf("Actor:        %s\n", actor)
 	fmt.Printf("Worker IP:    %s\n", workerIP)
 	if task.Spec != nil {
-		if refs := task.Spec.WorkspaceRefs(); len(refs) > 0 {
-			paths := task.Spec.WorkspacePaths()
-			fmt.Println("Workspaces:")
-			for i, ref := range refs {
-				fmt.Printf("  - %s  path=%s", ref.Name, paths[i])
-				if ref.Goal != "" {
-					fmt.Printf("  goal=%q", ref.Goal)
-				}
-				fmt.Println()
-			}
+		if ref := task.Spec.GetWorkspace(); ref != nil {
+			fmt.Printf("Workspace:    %s  path=%s\n", ref.Name, task.Spec.WorkspacePath())
 		}
 		if task.Spec.Image != "" {
 			fmt.Printf("Image:        %s\n", task.Spec.Image)
 		}
 		if len(task.Spec.Command) > 0 {
 			fmt.Printf("Command:      %v\n", task.Spec.Command)
+		}
+		if config := task.Spec.GetConfig().AsMap(); len(config) > 0 {
+			if out, err := yaml.Marshal(config); err == nil {
+				fmt.Println("Config:")
+				for _, line := range strings.Split(strings.TrimRight(string(out), "\n"), "\n") {
+					fmt.Printf("  %s\n", line)
+				}
+			}
 		}
 	}
 
@@ -663,59 +727,6 @@ func runDescribe(serverURL, atespace string, args []string) error {
 		_ = w.Flush()
 	}
 
-	return nil
-}
-
-func runWatch(serverURL, atespace string, args []string) error {
-	if len(args) < 2 {
-		return fmt.Errorf("usage: ax watch task <name>")
-	}
-	name := args[1]
-
-	client, conn, err := getAXClient(serverURL)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	stream, err := client.WatchTask(context.Background(), &v1alpha1.WatchTaskRequest{Atespace: atespace, Name: name})
-	if err != nil {
-		return fmt.Errorf("watching task: %w", err)
-	}
-
-	fmt.Printf("Watching task %s/%s...\n", atespace, name)
-
-	for {
-		resp, err := stream.Recv()
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return nil
-			}
-			return fmt.Errorf("receiving stream update: %w", err)
-		}
-
-		task := resp.Task
-		if task != nil {
-			phase := ""
-			actor := ""
-			workerIP := ""
-			if task.Status != nil {
-				phase = task.Status.Phase
-				actor = task.Status.Actor
-				workerIP = task.Status.WorkerIp
-			}
-			fmt.Printf("[%s] Phase: %-10s Actor: %-18s WorkerIP: %s\n",
-				time.Now().Format("15:04:05"),
-				phase,
-				actor,
-				workerIP,
-			)
-			if phase == "Completed" || phase == "Failed" {
-				fmt.Printf("Task reached terminal phase %q.\n", phase)
-				break
-			}
-		}
-	}
 	return nil
 }
 
@@ -809,6 +820,14 @@ func manifestFromArgs(args []string) (data []byte, ok bool, err error) {
 	return nil, false, nil
 }
 
+// lifecycleRPCTimeout bounds suspend/resume RPCs, which wait for Substrate to
+// snapshot or restore the task's sandbox. MicroVM-backed sandboxes can take
+// well over a minute to snapshot/restore, so this is deliberately generous.
+// The server renews its per-task lock lease for as long as the RPC is in
+// flight, so this deadline is not constrained by the lock TTL (see
+// postgres.Store.Lock).
+const lifecycleRPCTimeout = 5 * time.Minute
+
 func runSuspend(serverURL, atespace string, args []string) error {
 	name := ""
 	if len(args) == 1 {
@@ -829,7 +848,7 @@ func runSuspend(serverURL, atespace string, args []string) error {
 	}
 	defer conn.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), lifecycleRPCTimeout)
 	defer cancel()
 
 	if _, err := client.SuspendTask(ctx, &v1alpha1.SuspendTaskRequest{Atespace: atespace, Name: name}); err != nil {
@@ -860,7 +879,7 @@ func runResume(serverURL, atespace string, args []string) error {
 	}
 	defer conn.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), lifecycleRPCTimeout)
 	defer cancel()
 
 	if _, err := client.ResumeTask(ctx, &v1alpha1.ResumeTaskRequest{Atespace: atespace, Name: name}); err != nil {
@@ -957,44 +976,50 @@ func runTunnel(args []string) error {
 	}
 }
 
-type sshDialMode int
+const sshUsage = `Usage:
+  ax ssh <task-name> [-- command...]
 
-const (
-	sshDialPortForward sshDialMode = iota
-	sshDialDirect
-	sshDialRouterEnv
-)
+Run a command inside a running task's container, or /bin/sh when no command is
+given. The task must be Running and have spec.debug: true.
 
-// chooseSSHDial picks how ax ssh reaches the guest. A non-empty AX_ROUTER value
-// wins and skips the reachability probe.
-func chooseSSHDial(axRouter string, directReachable func() bool) sshDialMode {
-	if axRouter != "" {
-		return sshDialRouterEnv
+Examples:
+  ax ssh task123
+  ax ssh task123 -- ls -la /workspace
+  ax ssh -a my-atespace task123 -- python3 main.py`
+
+// parseSSHArgs splits the arguments of `ax ssh` into the task name and the command
+// to run, defaulting the command to /bin/sh. help reports a -h or --help given in
+// place of the task name. Arguments after the task name form the command, passed
+// verbatim, with or without a separating "--" directly after the task name.
+func parseSSHArgs(args []string) (taskName string, command []string, help bool, err error) {
+	if len(args) == 0 || args[0] == "--" {
+		return "", nil, false, errors.New("missing task name")
 	}
-	if directReachable() {
-		return sshDialDirect
+	if args[0] == "-h" || args[0] == "--help" {
+		return "", nil, true, nil
 	}
-	return sshDialPortForward
+	if strings.HasPrefix(args[0], "-") {
+		return "", nil, false, fmt.Errorf("unknown flag %q", args[0])
+	}
+
+	taskName = args[0]
+	// Only a "--" directly after the task name is the separator. Any later "--"
+	// belongs to the remote command (for example `git log -- file`).
+	rest := args[1:]
+	if len(rest) > 0 && rest[0] == "--" {
+		rest = rest[1:]
+	}
+	command = append(command, rest...)
+	if len(command) == 0 {
+		command = []string{"/bin/sh"}
+	}
+	return taskName, command, false, nil
 }
 
-func runSSH(serverURL, atespace, kubeContext string, args []string) error {
-	if len(args) == 0 {
-		return fmt.Errorf("usage: ax ssh <task-name> [-- command...]")
-	}
-
-	taskName := args[0]
-	var cmdToRun []string
-	for i := 1; i < len(args); i++ {
-		if args[i] == "--" {
-			cmdToRun = args[i+1:]
-			break
-		} else {
-			cmdToRun = append(cmdToRun, args[i])
-		}
-	}
-
-	if len(cmdToRun) == 0 {
-		cmdToRun = []string{"/bin/sh"}
+func runSSH(serverURL, atespace, kubeContext, axNamespace string, args []string) error {
+	taskName, cmdToRun, _, err := parseSSHArgs(args)
+	if err != nil {
+		return err
 	}
 
 	client, conn, err := getAXClient(serverURL)
@@ -1018,7 +1043,7 @@ func runSSH(serverURL, atespace, kubeContext string, args []string) error {
 		return fmt.Errorf("task %q has no status available", taskName)
 	}
 
-	if task.Status.Phase != "Running" {
+	if task.Status.Phase != v1alpha1.PhaseRunning {
 		return fmt.Errorf("task %q is in phase %q (must be Running to ssh)", taskName, task.Status.Phase)
 	}
 
@@ -1042,57 +1067,38 @@ func runSSH(serverURL, atespace, kubeContext string, args []string) error {
 	}
 
 	targetActor := fmt.Sprintf("%s/%s", task.Metadata.Atespace, task.Status.Actor)
-	var (
-		guestClient *guest.Client
-		cleanup     func()
-	)
-
-	guestEndpoint := net.JoinHostPort(host, fmt.Sprint(port))
-	routerAddr := os.Getenv("AX_ROUTER")
-	switch chooseSSHDial(routerAddr, func() bool {
-		d := net.Dialer{Timeout: 500 * time.Millisecond}
-		conn, dialErr := d.Dial("tcp", guestEndpoint)
-		if dialErr != nil {
-			return false
-		}
-		_ = conn.Close()
-		return true
-	}) {
-	case sshDialRouterEnv:
-		// AX_ROUTER points straight at atenet-router (e.g. from inside a microVM
-		// that can neither dial the worker nor open a port-forward).
-		guestClient, err = guest.DialTarget(routerAddr, targetActor)
-		if err != nil {
-			return fmt.Errorf("connecting to guest via atenet-router at %s: %w", routerAddr, err)
-		}
-	case sshDialDirect:
-		guestClient, err = guest.Dial(guestEndpoint)
-		if err != nil {
-			return fmt.Errorf("connecting to guest at %s: %w", guestEndpoint, err)
-		}
-	default:
-		// Connect via the Substrate atenet-router service in ate-system (port 80)
-		localPort, pfCleanup, err := tunnel.PortForward(context.Background(), kubeContext, "ate-system", "svc/atenet-router", 80)
-		if err != nil {
-			return fmt.Errorf("establishing port-forward to atenet-router: %w", err)
-		}
-		cleanup = pfCleanup
-		routerEndpoint := fmt.Sprintf("127.0.0.1:%d", localPort)
-		guestClient, err = guest.DialTarget(routerEndpoint, targetActor)
-		if err != nil {
-			return fmt.Errorf("connecting to guest via atenet-router at %s: %w", routerEndpoint, err)
-		}
+	guestClient, cleanup, err := dialGuest(host, port, targetActor, kubeContext, axNamespace)
+	if err != nil {
+		return err
 	}
-
 	if cleanup != nil {
 		defer cleanup()
 	}
 	defer guestClient.Close()
 
+	// A bare shell on a terminal runs with -i, so it prompts and Ctrl-C stops the
+	// command it is running rather than the shell itself.
+	if stdinIsTerminal() && len(cmdToRun) == 1 && cmdToRun[0] == "/bin/sh" {
+		cmdToRun = []string{"/bin/sh", "-i"}
+	}
+
+	// Ctrl-C is passed on to the remote command instead of ending ax ssh. Pressing
+	// it twice in quick succession gives up on the session and exits locally, so
+	// a hung connection never traps the terminal.
+	rawSigs := make(chan os.Signal, 4)
+	signal.Notify(rawSigs, os.Interrupt)
+	defer signal.Stop(rawSigs)
+	sigs := escalateInterrupts(rawSigs, interruptExitWindow, func() {
+		fmt.Fprintln(os.Stderr, "\nax ssh: interrupted twice, exiting")
+		os.Exit(130)
+	})
+
 	exitCode, err := guestClient.Exec(context.Background(), guest.ExecOptions{
 		Command: cmdToRun,
+		Stdin:   os.Stdin,
 		Stdout:  os.Stdout,
 		Stderr:  os.Stderr,
+		Signals: sigs,
 	})
 	if err != nil {
 		return err
@@ -1103,4 +1109,105 @@ func runSSH(serverURL, atespace, kubeContext string, args []string) error {
 	}
 
 	return nil
+}
+
+func dialGuest(host string, port int, targetActor, kubeContext, axNamespace string) (*guest.Client, func(), error) {
+	// AX_ROUTER points straight at atenet-router, for example from inside a microVM
+	// that can neither dial the worker nor open a port-forward.
+	if routerAddr := os.Getenv("AX_ROUTER"); routerAddr != "" {
+		client, err := guest.DialTarget(routerAddr, targetActor)
+		if err != nil {
+			return nil, nil, fmt.Errorf("connecting to guest via atenet-router at %s: %w", routerAddr, err)
+		}
+		return client, nil, nil
+	}
+
+	// 1. Connect directly if worker IP is reachable (e.g. within cluster or local mesh).
+	d := net.Dialer{Timeout: 500 * time.Millisecond}
+	guestEndpoint := net.JoinHostPort(host, fmt.Sprint(port))
+	if testConn, err := d.Dial("tcp", guestEndpoint); err == nil {
+		_ = testConn.Close()
+		client, err := guest.Dial(guestEndpoint)
+		if err != nil {
+			return nil, nil, fmt.Errorf("connecting to guest at %s: %w", guestEndpoint, err)
+		}
+		return client, nil, nil
+	}
+
+	// 2. Connect via Substrate atenet-router in ate-system (mTLS on 443, falling back to port 80).
+	if axNamespace == "" {
+		axNamespace = v1alpha1.DefaultSystemNamespace
+	}
+	client, cleanup, setupErr, dialErr := dialRouterTLS(targetActor, kubeContext, axNamespace)
+	if dialErr != nil {
+		return nil, nil, dialErr
+	}
+	if client != nil {
+		return client, cleanup, nil
+	}
+
+	localPort, cleanup, err := tunnel.PortForward(context.Background(), kubeContext, "ate-system", "svc/atenet-router", 80)
+	if err != nil {
+		return nil, nil, fmt.Errorf("establishing port-forward to atenet-router: %w (%v)", err, setupErr)
+	}
+	routerEndpoint := fmt.Sprintf("127.0.0.1:%d", localPort)
+	client, err = guest.DialTarget(routerEndpoint, targetActor)
+	if err != nil {
+		cleanup()
+		return nil, nil, fmt.Errorf("connecting to guest via atenet-router at %s: %w", routerEndpoint, err)
+	}
+	return client, cleanup, nil
+}
+
+func dialRouterTLS(targetActor, kubeContext, axNamespace string) (client *guest.Client, cleanup func(), setupErr, dialErr error) {
+	tlsCfg, err := tunnel.RouterTLSConfig(context.Background(), kubeContext, axNamespace, "ax-server")
+	if err != nil {
+		return nil, nil, fmt.Errorf("mTLS setup error: %w", err), nil
+	}
+	localPort, cleanup, err := tunnel.PortForward(context.Background(), kubeContext, "ate-system", "svc/atenet-router", 443)
+	if err != nil {
+		return nil, nil, fmt.Errorf("port 443 forward error: %w", err), nil
+	}
+	routerEndpoint := fmt.Sprintf("127.0.0.1:%d", localPort)
+	client, err = guest.DialTargetTLS(routerEndpoint, targetActor, tlsCfg)
+	if err != nil {
+		cleanup()
+		return nil, nil, nil, fmt.Errorf("connecting to guest via atenet-router at %s: %w", routerEndpoint, err)
+	}
+	return client, cleanup, nil, nil
+}
+
+// interruptExitWindow is how soon a second Ctrl-C must follow the first to end
+// ax ssh locally instead of being forwarded to the remote command.
+const interruptExitWindow = time.Second
+
+// escalateInterrupts relays each signal from in to the returned channel, except
+// that a signal arriving within window of the previous one calls exit instead.
+// This keeps a single Ctrl-C going to the remote command while a repeated one
+// still works as an escape hatch.
+func escalateInterrupts(in <-chan os.Signal, window time.Duration, exit func()) <-chan os.Signal {
+	out := make(chan os.Signal, 1)
+	go func() {
+		var last time.Time
+		for sig := range in {
+			now := time.Now()
+			if !last.IsZero() && now.Sub(last) < window {
+				exit()
+				return
+			}
+			last = now
+			select {
+			case out <- sig:
+			default:
+			}
+		}
+	}()
+	return out
+}
+
+// stdinIsTerminal reports whether standard input is a terminal rather than a
+// pipe or file.
+func stdinIsTerminal() bool {
+	fi, err := os.Stdin.Stat()
+	return err == nil && fi.Mode()&os.ModeCharDevice != 0
 }

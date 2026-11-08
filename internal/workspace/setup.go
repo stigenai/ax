@@ -33,6 +33,8 @@ const (
 	DefaultAXDir = "/ax"
 	// InitializedMarkerFilename is the base name of the marker file written after a successful maiden run.
 	InitializedMarkerFilename = "initialized"
+	// markerDirName is the directory under the workspace that holds the marker.
+	markerDirName = ".ax"
 
 	defaultWorkspacePath = "/workspace"
 	defaultBranch        = "main"
@@ -42,18 +44,6 @@ const (
 	gitErrorLog   = "git-error.log"
 	gitRetries    = 5
 	gitRetryDelay = 2 * time.Second
-
-	bootstrapScriptPath = "/usr/local/bin/antigravity_bootstrap.py"
-	// bootstrapAPIKeyEnv must be set for the Antigravity agent to run.
-	bootstrapAPIKeyEnv = "GEMINI_API_KEY"
-	// bootstrapTimeoutEnv overrides the default bootstrap timeout with a Go duration string.
-	bootstrapTimeoutEnv = "AX_BOOTSTRAP_TIMEOUT"
-	// bootstrapDataDir, under AXDir, is where the agent keeps its own state so
-	// conversation logs and caches stay out of the workspace.
-	bootstrapDataDir = "antigravity"
-	// defaultBootstrapTimeout allows the agent enough time to install toolchains and
-	// dependencies. The workspace reports not-ready until it finishes.
-	defaultBootstrapTimeout = 10 * time.Minute
 
 	dirPerm  = 0o755
 	filePerm = 0o644
@@ -69,23 +59,19 @@ type SetupResult struct {
 	ClonedRepos   []string
 	SkillsMounted string
 	IsMaidenRun   bool
-	// BootstrapRan reports whether the Antigravity agent ran to completion for the goal.
-	BootstrapRan bool
 }
 
 // SetupWorkspace prepares the workspace directory on its maiden run: it clones the
-// declared Git repositories, creates the skills path, and invokes the Antigravity
-// bootstrap when a goal is provided. A marker file under AXDir records a completed
-// maiden run so subsequent calls are no-ops.
+// declared Git repositories and creates the skills path. A marker file under the workspace
+// (see workspaceMarkerPath) records a completed maiden run so subsequent calls are no-ops.
 //
 // Git failures are logged and recorded under AXDir but do not abort setup. The marker
 // is withheld in that case so the next start retries the clone.
-func SetupWorkspace(ctx context.Context, ws *v1alpha1.Workspace, targetPath string, goal string) (*SetupResult, error) {
+func SetupWorkspace(ctx context.Context, ws *v1alpha1.Workspace, targetPath string) (*SetupResult, error) {
 	if targetPath == "" {
 		targetPath = defaultWorkspacePath
 	}
-	// Tooling downstream (git, the Antigravity agent) scopes itself to this path,
-	// so it must be absolute.
+	// Tooling downstream (git) scopes itself to this path, so it must be absolute.
 	if abs, err := filepath.Abs(targetPath); err == nil {
 		targetPath = abs
 	}
@@ -98,9 +84,19 @@ func SetupWorkspace(ctx context.Context, ws *v1alpha1.Workspace, targetPath stri
 		slog.Warn("creating ax state directory", "dir", AXDir, "error", err)
 	}
 
-	markerPath := filepath.Join(AXDir, MarkerName(targetPath))
+	markerPath := workspaceMarkerPath(targetPath)
+	if markerLinked(markerPath) {
+		return nil, fmt.Errorf("marker path %s is a symbolic link; refusing to trust or write it", markerPath)
+	}
 	if _, err := os.Stat(markerPath); err == nil {
 		slog.Info("workspace already initialized; skipping maiden run setup", "path", targetPath)
+		return res, nil
+	}
+	// A marker from before the workspace-volume change lives under AXDir. Migrate it, so a
+	// container that still has AXDir does not rerun setup over the agent's edits.
+	if data, err := os.ReadFile(filepath.Join(AXDir, MarkerName(targetPath))); err == nil && legacyOwnedBy(data, ws) {
+		slog.Info("migrating legacy workspace marker", "path", targetPath)
+		writeMarker(workspaceMarkerPath(targetPath), ws)
 		return res, nil
 	}
 
@@ -114,16 +110,12 @@ func SetupWorkspace(ctx context.Context, ws *v1alpha1.Workspace, targetPath stri
 		res.SkillsMounted = setupSkills(ws.Spec.Skills)
 	}
 
-	if goal != "" {
-		res.BootstrapRan = runBootstrap(ctx, goal, targetPath)
-	}
-
 	if !gitOK {
 		slog.Warn("maiden run workspace setup completed with errors; marker omitted to allow retry", "path", targetPath)
 		return res, nil
 	}
 
-	writeMarker(markerPath, ws)
+	writeMarker(workspaceMarkerPath(targetPath), ws)
 	slog.Info("maiden run workspace setup completed successfully", "path", targetPath)
 	return res, nil
 }
@@ -270,78 +262,28 @@ func setupSkills(skills *v1alpha1.SkillsConfig) string {
 	return skills.Path
 }
 
-// runBootstrap hands the goal to the Antigravity agent so it can prepare the workspace.
-// It reports whether the agent ran to completion. The agent needs the bootstrap script
-// installed and an API key in the environment; when either is missing the step is
-// skipped with a log line. Failures are logged and otherwise ignored so the task's own
-// command still starts.
-func runBootstrap(ctx context.Context, goal, targetPath string) bool {
-	if _, err := os.Stat(bootstrapScriptPath); err != nil {
-		slog.Info("Antigravity bootstrap script not installed; skipping", "script", bootstrapScriptPath)
-		return false
-	}
-	if os.Getenv(bootstrapAPIKeyEnv) == "" {
-		slog.Warn("workspace goal set but no API key available; skipping Antigravity bootstrap", "env", bootstrapAPIKeyEnv)
-		return false
-	}
-
-	timeout := bootstrapTimeout()
-	slog.Info("invoking Antigravity workspace bootstrap with goal", "goal", goal, "dir", targetPath, "timeout", timeout)
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	dataDir := filepath.Join(AXDir, bootstrapDataDir)
-	if err := os.MkdirAll(dataDir, dirPerm); err != nil {
-		slog.Warn("creating Antigravity data dir", "dir", dataDir, "error", err)
-	}
-
-	cmd := exec.CommandContext(ctx, "python3", bootstrapScriptPath,
-		"--goal", goal,
-		"--workspace", targetPath,
-		"--data-dir", dataDir,
-	)
-	cmd.Dir = targetPath
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		if ctx.Err() != nil {
-			slog.Warn("Antigravity bootstrap timed out (continuing)", "timeout", timeout)
-		} else {
-			slog.Warn("Antigravity bootstrap failed (continuing)", "error", err)
-		}
-		return false
-	}
-	slog.Info("Antigravity bootstrap completed successfully")
-	return true
-}
-
-// bootstrapTimeout returns the configured bootstrap timeout, falling back to the default
-// when the override is unset or unparsable.
-func bootstrapTimeout() time.Duration {
-	raw := os.Getenv(bootstrapTimeoutEnv)
-	if raw == "" {
-		return defaultBootstrapTimeout
-	}
-	d, err := time.ParseDuration(raw)
-	if err != nil || d <= 0 {
-		slog.Warn("invalid bootstrap timeout; using default", "env", bootstrapTimeoutEnv, "value", raw, "default", defaultBootstrapTimeout)
-		return defaultBootstrapTimeout
-	}
-	return d
-}
-
 // MarkerName returns the maiden-run marker file name for a workspace mounted at
-// path. The name is derived from the path so several workspaces in one
-// container track their setup independently.
+// path. The name is derived from the path so a workspace mounted somewhere
+// other than the default tracks its setup independently.
 func MarkerName(path string) string {
 	if path == "" {
 		path = defaultWorkspacePath
 	}
-	clean := strings.Trim(filepath.Clean(path), "/")
+	clean := strings.Trim(filepath.ToSlash(filepath.Clean(path)), "/")
 	if clean == "" {
 		clean = "root"
 	}
 	return InitializedMarkerFilename + "-" + strings.ReplaceAll(clean, "/", "-")
+}
+
+// workspaceMarkerPath returns where the maiden-run marker lives: on the workspace volume, so
+// it survives a volumes-only resume. For a Git repo it sits in the Git directory, which
+// `git add -A` and `git clean -fdx` never touch. Otherwise it sits in .ax.
+func workspaceMarkerPath(targetPath string) string {
+	if info, err := os.Lstat(filepath.Join(targetPath, ".git")); err == nil && info.IsDir() {
+		return filepath.Join(targetPath, ".git", markerDirName, InitializedMarkerFilename)
+	}
+	return filepath.Join(targetPath, markerDirName, InitializedMarkerFilename)
 }
 
 // writeMarker records a completed maiden run.
@@ -351,6 +293,10 @@ func writeMarker(path string, ws *v1alpha1.Workspace) {
 		name = ws.GetMetadata().GetName()
 	}
 	content := fmt.Sprintf("workspace: %s\ninitialized_at: %s\n", name, time.Now().UTC().Format(time.RFC3339))
+	if err := os.MkdirAll(filepath.Dir(path), dirPerm); err != nil {
+		slog.Warn("failed to create initialized marker directory", "path", path, "error", err)
+		return
+	}
 	if err := os.WriteFile(path, []byte(content), filePerm); err != nil {
 		slog.Warn("failed to write initialized marker file", "path", path, "error", err)
 	}
@@ -398,4 +344,25 @@ func writeFiles(files []*v1alpha1.File, targetPath string) {
 		}
 		slog.Info("wrote inlined workspace file", "path", dest)
 	}
+}
+
+// markerLinked reports whether the marker's directory or the marker itself is a symbolic
+// link. The agent can create one, and reading or writing through it would leave the workspace.
+func markerLinked(path string) bool {
+	for _, p := range []string{filepath.Dir(path), path} {
+		if info, err := os.Lstat(p); err == nil && info.Mode()&os.ModeSymlink != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// legacyOwnedBy reports whether a legacy marker was written for this workspace. Two paths can
+// share a legacy name (/a/b and /a-b), so the recorded name is checked too.
+func legacyOwnedBy(data []byte, ws *v1alpha1.Workspace) bool {
+	name := ws.GetMetadata().GetName()
+	if name == "" {
+		name = "unknown"
+	}
+	return strings.HasPrefix(string(data), "workspace: "+name+"\n")
 }

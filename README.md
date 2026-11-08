@@ -1,5 +1,5 @@
 <h1>
-  <img src="assets/axolotl.svg" width="70" align="absmiddle" alt="AX axolotl">
+  <img src="assets/axel.svg" width="70" align="absmiddle" alt="AX axolotl">
   AX
 </h1>
 
@@ -10,7 +10,7 @@
 
 **Declare an agentic task with workspaces and model specifications. AX sandboxes it, wires up its workspace, and helps running it at scale.**
 
-AX is a high-throughput, declarative orchestrator to run billions of autonomous agent workloads in a cluster. It runs on top of [Agent Substrate](https://github.com/agent-substrate/substrate) for sandboxed execution and is built to run billions of tasks per cluster. If you have used Kubernetes, `ax` will feel similar.
+AX is a highly efficient, declarative orchestrator to run millions of autonomous agent workloads in a cluster. It runs on top of [Agent Substrate](https://github.com/agent-substrate/substrate) for sandboxed execution and is built to run millions of tasks per cluster. If you have used Kubernetes, `ax` will feel similar.
 
 ```yaml
 # task.yaml
@@ -22,23 +22,30 @@ spec:
   git:
     - repo: https://github.com/golang/go.git
       branch: "my-fix"
+  files:
+    - path: "AGENTS.md"
+      content: |
+        - Run `go test` to ensure that tests are passing.
+        - Do not modify the public API.
 ---
 apiVersion: ax.io/v1alpha1
 kind: Task
 metadata:
   name: test
 spec:
-  workspaces:
-    - name: golang
-      goal: "Ensure that Go tool chain is available and is built from source"
-  debug: true   # lets you `ax ssh` into the sandbox
+  image: "ghcr.io/my-org/my-coding-agent@sha256:..."
+  config:
+    goal: "Fix what's broken please."
+  workspace:
+    name: golang
+  debug: true   # enables `ax ssh`
 ```
 
-Then apply it, watch it come up, and look over the agent's shoulder:
+Then apply it, check on it, and look over the agent's shoulder:
 
 ```bash
 ax apply -f task.yaml
-ax watch task test
+ax describe task test
 ax ssh test -- ls -al /workspace
 ```
 
@@ -64,7 +71,7 @@ AX schedules every task as a sandboxed actor on [Agent Substrate](https://github
 
 - A Kubernetes cluster with **Agent Substrate** installed (see below)
 - [Go](https://go.dev/doc/install) and `kubectl`
-- [`ko`](https://ko.build/) (`brew install ko`) and a container registry your cluster can pull from
+- [Podman](https://podman.io/) or [Docker](https://docs.docker.com/get-docker/), authenticated to a container registry your cluster can pull from
 
 To install Agent Substrate, follow the instructions in the [Substrate README](https://github.com/agent-substrate/substrate#readme). Substrate lands in the `ate-system` namespace and exposes its Control API at `api.ate-system.svc.cluster.local:443`, which is where AX expects to find it. Verify it is up before moving on:
 
@@ -80,31 +87,50 @@ go install github.com/google/ax/cmd/ax@latest
 
 This puts the `ax` binary in `$(go env GOPATH)/bin`. Make sure that directory is on your `PATH`.
 
-### 2. Deploy the control plane
+### 2. Build and push the images
+
+Point `AX_IMAGE_REPO` at your registry, then build the `ax-server` and `ax-task-runner` images and push them to it:
+
+```bash
+export AX_IMAGE_REPO=<your-registry>   # e.g. gcr.io/my-project
+make images
+```
+
+### 3. Deploy the control plane
 
 With the [prerequisites](#prerequisites) in place — most importantly a reachable Agent Substrate Control API — deploy the AX control plane:
 
 ```bash
-make deploy AX_IMAGE_REPO=<your-registry>
+make deploy
 ```
 
-This deploys Redis, then builds and deploys the control plane images with `ko`. Everything lands in the `ax-system` namespace.
+This deploys PostgreSQL and the `ax-server` image you just pushed, configured to use your `ax-task-runner` image for tasks that do not set `spec.image`. Everything lands in the `ax-system` namespace.
 
-### 3. Run your first task
+### 4. Create a WorkerPool
+
+Every task runs as a Substrate actor, and an actor needs a free worker from a `WorkerPool`. Nothing creates one for you — not `make deploy`, and not the Substrate installer — so without a pool, the first `ax resume` fails with `ResourceExhausted: no free workers available` (the task itself stays `Suspended`).
+
+Create a small gVisor pool from [`examples/workerpool.yaml`](examples/workerpool.yaml) (its header explains how to apply it), or follow the WorkerPool step in the [installation guide](docs/installation.md#substrate-setup). Then wait until `kubectl get workerpools -A` shows the workers ready.
+
+### 5. Run your first task
+
+From your ax checkout:
 
 ```bash
-ax apply -f examples/task.yaml       # Task + Workspace + Model in one file
+ax apply -f examples/simple.yaml         # the smallest useful Task
+ax resume task simple-task               # new tasks start Suspended; resume schedules the actor and starts it
 ax get tasks
-# NAME      ATESPACE   PHASE     ACTOR           WORKER-IP    AGE
-# task123   default    Running   task123         10.20.3.67   1m
+# NAME          ATESPACE   PHASE     ACTOR         WORKER-IP    AGE
+# simple-task   default    Running   simple-task   10.20.3.67   1m
 
-ax watch task task123                # stream phase and condition changes live
-ax ssh task123 -- ls -la /workspace  # poke around inside the sandbox
-ax suspend task task123              # checkpoint and pause
-ax resume task task123               # pick up where it left off
+ax ssh simple-task -- ls -la /workspace  # poke around inside the sandbox
+ax suspend task simple-task              # checkpoint and pause
+ax resume task simple-task               # pick up where it left off
 ```
 
-Want to see the whole lifecycle end to end? Run [`./demo.sh`](demo.sh). It applies a custom workspace, waits for readiness, runs commands over `ax ssh`, and suspends the task.
+The first resume also waits for the workspace to initialize (cloning its git repos), so it can take a while; if the CLI gives up first, the task keeps coming up in the background — `ax get tasks` tells you where it is.
+
+Want to see the whole lifecycle end to end? Run [`./demo.sh`](demo.sh). It applies a custom workspace, resumes the task, runs commands over `ax ssh`, and suspends it again.
 
 ## Documentation
 
@@ -121,20 +147,19 @@ Want to see the whole lifecycle end to end? Run [`./demo.sh`](demo.sh). It appli
 
 ## CLI usage
 
-`ax` talks to the control plane over gRPC. It is deliberately `kubectl`-shaped: `apply`, `get`, `describe`, `watch`, `delete`, plus a few agent-specific verbs.
+`ax` talks to the control plane over gRPC. It is deliberately `kubectl`-shaped: `apply`, `get`, `describe`, `delete`, plus a few agent-specific verbs.
 
 ### Everyday commands
 
 ```bash
 # Apply anything (multi-document YAML, file or stdin)
-ax apply -f examples/task.yaml
+ax apply -f examples/simple.yaml
 
 # Tasks
 ax get tasks                          # list
 ax get tasks -a my-atespace           # list in another atespace
 ax get task task123                   # full spec + live status as YAML
 ax describe task task123              # human-readable detail
-ax watch task task123                 # stream status and condition transitions
 ax suspend task task123               # checkpoint actor state and pause
 ax resume task task123                # resume a suspended task
 ax delete task task123

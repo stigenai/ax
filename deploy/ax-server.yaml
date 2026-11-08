@@ -16,6 +16,8 @@ apiVersion: v1
 kind: Namespace
 metadata:
   name: ax-system
+  labels:
+    ate.dev/api-access: "true"
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -66,11 +68,11 @@ spec:
       serviceAccountName: ax-server
       containers:
         - name: ax-server
-          image: ko://github.com/google/ax/cmd/ax-server
-          imagePullPolicy: IfNotPresent
+          image: ${AX_SERVER_IMAGE}
+          imagePullPolicy: Always
           args:
             - "--addr=:8080"
-            - "--redis-addr=ax-redis.ax-system.svc.cluster.local:6379"
+            - "--store=postgres://ax@ax-postgres.ax-system.svc.cluster.local:5432/ax?sslmode=disable"
             - "--substrate-endpoint=api.ate-system.svc.cluster.local:443"
             - "--substrate-authority=api.ate-system.svc"
             - "--substrate-token-file=/var/run/secrets/ateapi/token"
@@ -78,10 +80,15 @@ spec:
             - "--template=default-template"
             - "--template-atespace=ax-system"
           env:
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: ax-postgres
+                  key: password
             - name: ATENET_ROUTER_ADDR
-              value: "atenet-router.ate-system.svc.cluster.local:80"
-            - name: AX_SNAPSHOTS_BUCKET
-              value: "gs://dberkov-gke-dev3/ate-env/"
+              value: "https://atenet-router.ate-system.svc.cluster.local:443"
+            - name: AX_DEFAULT_TASK_IMAGE
+              value: "${AX_DEFAULT_TASK_IMAGE}"
           ports:
             - containerPort: 8080
               name: http
@@ -111,6 +118,9 @@ spec:
             - mountPath: /run/servicedns-ca
               name: servicedns-ca
               readOnly: true
+            - mountPath: /run/podidentity.podcert.ate.dev
+              name: podidentity
+              readOnly: true
       volumes:
         - name: ate-token
           projected:
@@ -130,6 +140,14 @@ spec:
                       podcert.ate.dev/canarying: live
                   path: trust-bundle.pem
                   signerName: servicedns.podcert.ate.dev/identity
+        - name: podidentity
+          projected:
+            defaultMode: 420
+            sources:
+              - podCertificate:
+                  credentialBundlePath: credential-bundle.pem
+                  keyType: ECDSAP256
+                  signerName: podidentity.podcert.ate.dev/identity
 ---
 apiVersion: v1
 kind: Service

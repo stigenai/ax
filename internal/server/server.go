@@ -21,25 +21,24 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/google/ax/internal/controller"
 	"github.com/google/ax/internal/lock"
 	"github.com/google/ax/internal/store"
+	"github.com/google/ax/internal/substrate"
 	"github.com/google/ax/pkg/apis/v1alpha1"
+	ateapipb "go.ate.dev/substrate/api/ateapi/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
-// Reconciler coordinates sandbox/actor lifecycles on Agent Substrate directly.
-type Reconciler interface {
-	Reconcile(ctx context.Context, task *v1alpha1.Task, workspaces ...*v1alpha1.Workspace) (*v1alpha1.Task, error)
-	ReconcileDelete(ctx context.Context, atespace, taskName string) error
-}
-
 // Options configures the AX API Server.
 type Options struct {
-	Locker     lock.Locker
-	Reconciler Reconciler
+	// Locker serializes changes to a resource. It must be shared by all
+	// ax-server replicas; it defaults to an in-process lock.MemoryLocker.
+	Locker lock.Locker
 }
 
 // Server provides the gRPC API for AX.
@@ -47,12 +46,18 @@ type Server struct {
 	v1alpha1.UnimplementedAXServer
 	store      store.Store
 	locker     lock.Locker
-	reconciler Reconciler
+	reconciler *controller.TaskReconciler
+	// substrate is the reconciler's client. It is read for the parts of a
+	// task's status owned by its actor, which the store never holds.
+	substrate  *substrate.Client
 	grpcServer *grpc.Server
 }
 
 // NewServer creates a new AX API server.
-func NewServer(s store.Store, opts ...Options) *Server {
+func NewServer(s store.Store, reconciler *controller.TaskReconciler, opts ...Options) *Server {
+	if reconciler == nil || reconciler.Client() == nil {
+		panic("server: NewServer requires a non-nil TaskReconciler with a Substrate client")
+	}
 	var opt Options
 	if len(opts) > 0 {
 		opt = opts[0]
@@ -65,7 +70,8 @@ func NewServer(s store.Store, opts ...Options) *Server {
 	srv := &Server{
 		store:      s,
 		locker:     locker,
-		reconciler: opt.Reconciler,
+		reconciler: reconciler,
+		substrate:  reconciler.Client(),
 		grpcServer: grpc.NewServer(),
 	}
 	v1alpha1.RegisterAXServer(srv.grpcServer, srv)
@@ -105,7 +111,7 @@ func (s *Server) GetTask(ctx context.Context, req *v1alpha1.GetTaskRequest) (*v1
 	if atespace == "" {
 		atespace = "default"
 	}
-	task, err := s.store.GetTask(ctx, atespace, req.Name)
+	task, err := s.getTask(ctx, atespace, req.Name)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			return nil, status.Errorf(codes.NotFound, "task %q not found in atespace %q", req.Name, atespace)
@@ -128,7 +134,7 @@ func (s *Server) ListTasks(ctx context.Context, req *v1alpha1.ListTasksRequest) 
 			offset = req.Offset
 		}
 	}
-	tasks, err := s.store.ListTasks(ctx, atespace, limit, offset)
+	tasks, err := s.listTasks(ctx, atespace, limit, offset)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "listing tasks: %v", err)
 	}
@@ -160,41 +166,54 @@ func (s *Server) CreateTask(ctx context.Context, req *v1alpha1.CreateTaskRequest
 	}
 	defer unlock()
 
-	_, err = s.store.GetTask(ctx, atespace, taskName)
+	existing, err := s.getTask(ctx, atespace, taskName)
 	if err == nil {
-		return nil, status.Errorf(codes.FailedPrecondition, "task %s/%s already exists and is immutable", atespace, taskName)
+		if existing.GetStatus().GetPhase() != v1alpha1.PhasePending || !proto.Equal(existing.GetSpec(), task.GetSpec()) {
+			return nil, status.Errorf(codes.FailedPrecondition, "task %s/%s already exists and is immutable", atespace, taskName)
+		}
+		task = existing
 	}
-	if !errors.Is(err, store.ErrNotFound) {
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		return nil, status.Errorf(codes.Internal, "checking existing task: %v", err)
 	}
 
-	if task.Metadata.CreationTimestamp == nil {
-		task.Metadata.CreationTimestamp = timestamppb.Now()
+	// Tasks are immutable, so a task created before its Workspace would keep
+	// an empty workspace for its whole life. Reject it instead.
+	var workspace *v1alpha1.Workspace
+	if wsName := task.GetSpec().GetWorkspace().GetName(); wsName != "" {
+		workspace, err = s.store.GetWorkspace(ctx, atespace, wsName)
+		if errors.Is(err, store.ErrNotFound) {
+			return nil, status.Errorf(codes.FailedPrecondition, "workspace %q not found in atespace %q", wsName, atespace)
+		}
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "getting workspace %q: %v", wsName, err)
+		}
+	}
+
+	if task.Metadata.CreateTime == nil {
+		task.Metadata.CreateTime = timestamppb.Now()
 	}
 	if task.Status == nil {
 		task.Status = &v1alpha1.TaskStatus{}
 	}
-	task.Status.Phase = "Suspended"
-	if err := s.store.SaveTask(ctx, task); err != nil {
+	// The task is Pending until its actor exists.
+	task.Status.Phase = v1alpha1.PhasePending
+	if err := s.saveTask(ctx, task); err != nil {
 		return nil, status.Errorf(codes.Internal, "saving task: %v", err)
 	}
 
-	// Directly reconcile with Substrate
-	if s.reconciler != nil {
-		workspaces := s.fetchWorkspaces(ctx, atespace, task)
-		reconciled, err := s.reconciler.Reconcile(ctx, task, workspaces...)
-		if err != nil {
-			slog.Error("direct reconcile error on create task", "task", taskName, "error", err)
-			task.Status.Phase = "Failed"
-			_ = s.store.UpdateTaskStatus(ctx, atespace, taskName, task.Status)
-			return nil, status.Errorf(codes.Internal, "provisioning task on substrate: %v", err)
-		}
-		task.Status = reconciled.Status
-		if err := s.store.UpdateTaskStatus(ctx, atespace, taskName, task.Status); err != nil {
-			return nil, status.Errorf(codes.Internal, "updating task status: %v", err)
-		}
+	// New tasks start suspended.
+	if err := s.reconciler.Suspend(ctx, task, workspace); err != nil {
+		return nil, s.recordFailure(ctx, task, "provisioning", err)
+	}
+	// The actor exists, so reads take the task's phase from it from now on.
+	task.Status.Phase = ""
+	if err := s.updateTask(ctx, atespace, taskName, task.Status); err != nil {
+		return nil, status.Errorf(codes.Internal, "updating task status: %v", err)
 	}
 
+	// Report the actor as it is now, as GetTask would.
+	s.applyActor(ctx, task)
 	return task, nil
 }
 
@@ -215,7 +234,7 @@ func (s *Server) DeleteTask(ctx context.Context, req *v1alpha1.DeleteTaskRequest
 	}
 	defer unlock()
 
-	task, err := s.store.GetTask(ctx, atespace, taskName)
+	task, err := s.getTask(ctx, atespace, taskName)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			return nil, status.Errorf(codes.NotFound, "task %q not found in atespace %q", taskName, atespace)
@@ -228,28 +247,12 @@ func (s *Server) DeleteTask(ctx context.Context, req *v1alpha1.DeleteTaskRequest
 		task.Status = &v1alpha1.TaskStatus{}
 	}
 	task.Status.Phase = v1alpha1.PhaseTerminating
-	if err := s.store.UpdateTaskStatus(ctx, atespace, taskName, task.Status); err != nil {
+	if err := s.updateTask(ctx, atespace, taskName, task.Status); err != nil {
 		return nil, status.Errorf(codes.Internal, "updating task status: %v", err)
 	}
 
-	// Directly clean up Substrate actor and templates
-	if s.reconciler != nil {
-		if err := s.reconciler.ReconcileDelete(ctx, atespace, taskName); err != nil {
-			if errors.Is(err, context.Canceled) {
-				return nil, status.Error(codes.Canceled, err.Error())
-			}
-			if errors.Is(err, context.DeadlineExceeded) {
-				return nil, status.Error(codes.DeadlineExceeded, err.Error())
-			}
-			if st, ok := status.FromError(err); ok && st.Code() != codes.Unknown {
-				return nil, err
-			}
-			return nil, status.Errorf(codes.Internal, "cleaning up substrate resources for task %s/%s: %v", atespace, taskName, err)
-		}
-	}
-
-	if err := s.store.DeleteTask(ctx, atespace, taskName); err != nil {
-		return nil, status.Errorf(codes.Internal, "deleting task record: %v", err)
+	if err := s.deleteTask(ctx, atespace, taskName); err != nil {
+		return nil, err
 	}
 	return &v1alpha1.DeleteTaskResponse{}, nil
 }
@@ -271,7 +274,7 @@ func (s *Server) SuspendTask(ctx context.Context, req *v1alpha1.SuspendTaskReque
 	}
 	defer unlock()
 
-	task, err := s.store.GetTask(ctx, atespace, taskName)
+	task, err := s.getTask(ctx, atespace, taskName)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			return nil, status.Errorf(codes.NotFound, "task %q not found in atespace %q", taskName, atespace)
@@ -281,24 +284,25 @@ func (s *Server) SuspendTask(ctx context.Context, req *v1alpha1.SuspendTaskReque
 	if task.Status == nil {
 		task.Status = &v1alpha1.TaskStatus{}
 	}
-	task.Status.Phase = "Suspended"
 
-	if s.reconciler != nil {
-		workspaces := s.fetchWorkspaces(ctx, atespace, task)
-		reconciled, err := s.reconciler.Reconcile(ctx, task, workspaces...)
-		if err != nil {
-			return nil, status.Errorf(codes.Internal, "suspending task on substrate: %v", err)
+	if err := s.reconciler.Suspend(ctx, task, s.fetchWorkspace(ctx, atespace, task)); err != nil {
+		// Store nothing: the actor keeps its state on Substrate, and a stored
+		// Pending or Failed would hide it.
+		if substrate.IsTransientError(err) {
+			return nil, status.Errorf(codes.Unavailable, "suspending task on substrate: %v", err)
 		}
-		task.Status = reconciled.Status
-		if err := s.store.UpdateTaskStatus(ctx, atespace, taskName, task.Status); err != nil {
-			return nil, status.Errorf(codes.Internal, "updating task status: %v", err)
-		}
-	} else {
-		if err := s.store.SaveTask(ctx, task); err != nil {
-			return nil, status.Errorf(codes.Internal, "suspending task: %v", err)
-		}
+		return nil, status.Errorf(codes.Internal, "suspending task on substrate: %v", err)
+	}
+	// Clear any Pending or Failed left by an earlier failure, so reads take the
+	// phase from the actor. This also clears the Terminating left by a failed
+	// DeleteTask, which cancels that deletion.
+	task.Status.Phase = ""
+	if err := s.updateTask(ctx, atespace, taskName, task.Status); err != nil {
+		return nil, status.Errorf(codes.Internal, "updating task status: %v", err)
 	}
 
+	// Report the actor as it is now, as GetTask would.
+	s.applyActor(ctx, task)
 	return task, nil
 }
 
@@ -319,7 +323,7 @@ func (s *Server) ResumeTask(ctx context.Context, req *v1alpha1.ResumeTaskRequest
 	}
 	defer unlock()
 
-	task, err := s.store.GetTask(ctx, atespace, taskName)
+	task, err := s.getTask(ctx, atespace, taskName)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			return nil, status.Errorf(codes.NotFound, "task %q not found in atespace %q", taskName, atespace)
@@ -329,82 +333,269 @@ func (s *Server) ResumeTask(ctx context.Context, req *v1alpha1.ResumeTaskRequest
 	if task.Status == nil {
 		task.Status = &v1alpha1.TaskStatus{}
 	}
-	task.Status.Phase = "Running"
 
-	if s.reconciler != nil {
-		workspaces := s.fetchWorkspaces(ctx, atespace, task)
-		reconciled, err := s.reconciler.Reconcile(ctx, task, workspaces...)
-		if err != nil {
-			task.Status.Phase = "Failed"
-			_ = s.store.UpdateTaskStatus(ctx, atespace, taskName, task.Status)
-			return nil, status.Errorf(codes.Internal, "resuming task on substrate: %v", err)
-		}
-		task.Status = reconciled.Status
-		if err := s.store.UpdateTaskStatus(ctx, atespace, taskName, task.Status); err != nil {
-			return nil, status.Errorf(codes.Internal, "updating task status: %v", err)
-		}
-	} else {
-		if err := s.store.SaveTask(ctx, task); err != nil {
-			return nil, status.Errorf(codes.Internal, "resuming task: %v", err)
-		}
+	if err := s.reconciler.Resume(ctx, task, s.fetchWorkspace(ctx, atespace, task)); err != nil {
+		return nil, s.recordFailure(ctx, task, "resuming", err)
+	}
+	// Clear any Pending or Failed left by an earlier failure, so reads take the
+	// phase from the actor. This also clears the Terminating left by a failed
+	// DeleteTask, which cancels that deletion.
+	task.Status.Phase = ""
+	if err := s.updateTask(ctx, atespace, taskName, task.Status); err != nil {
+		return nil, status.Errorf(codes.Internal, "updating task status: %v", err)
 	}
 
+	// Report the actor as it is now, as GetTask would.
+	s.applyActor(ctx, task)
 	return task, nil
 }
 
-func (s *Server) fetchWorkspaces(ctx context.Context, atespace string, task *v1alpha1.Task) []*v1alpha1.Workspace {
-	var workspaces []*v1alpha1.Workspace
-	if task.Spec == nil {
-		return workspaces
+// recordFailure stores the status of a task that could not be provisioned or
+// resumed: phase Pending if err is a transient Substrate error, which a retry
+// may fix, and Failed otherwise. It returns the gRPC error for action.
+func (s *Server) recordFailure(ctx context.Context, task *v1alpha1.Task, action string, err error) error {
+	atespace, name := task.GetMetadata().GetAtespace(), task.GetMetadata().GetName()
+	slog.Error(action+" task on substrate failed", "atespace", atespace, "task", name, "error", err)
+	code, phase := codes.Internal, v1alpha1.PhaseFailed
+	if substrate.IsTransientError(err) {
+		code, phase = codes.Unavailable, v1alpha1.PhasePending
 	}
-	for _, ref := range task.Spec.WorkspaceRefs() {
-		if ref.Name == "" {
-			continue
-		}
-		if wsp, err := s.store.GetWorkspace(ctx, atespace, ref.Name); err == nil {
-			workspaces = append(workspaces, wsp)
-		}
-	}
-	return workspaces
+	task.Status.Phase = phase
+	_ = s.updateTask(ctx, atespace, name, task.Status)
+	return status.Errorf(code, "%s task on substrate: %v", action, err)
 }
 
-func (s *Server) WatchTask(req *v1alpha1.WatchTaskRequest, stream grpc.ServerStreamingServer[v1alpha1.WatchTaskResponse]) error {
-	if req == nil {
-		return status.Error(codes.InvalidArgument, "missing request")
-	}
-	atespace := req.Atespace
-	if atespace == "" {
-		atespace = "default"
-	}
-	ctx := stream.Context()
-	ch, closer, err := s.store.WatchTask(ctx, atespace, req.Name)
-	if err != nil {
-		return status.Errorf(codes.Internal, "watching task: %v", err)
-	}
-	defer closer.Close()
+// Task storage and Substrate.
+//
+// A task's actor on Agent Substrate is the source of truth for whether the task
+// is running, where, and whether it is healthy. The store keeps only what AX
+// itself knows.
+//
+// Handlers never call s.store for tasks; they use the methods below. saveTask
+// and updateTask drop the actor-owned status before writing. getTask and
+// listTasks fill it in from Substrate.
 
-	if initial, err := s.store.GetTask(ctx, atespace, req.Name); err == nil {
-		if err := stream.Send(&v1alpha1.WatchTaskResponse{Task: initial, Action: "INITIAL"}); err != nil {
+// getTask returns a task with its Substrate-owned status filled in.
+func (s *Server) getTask(ctx context.Context, atespace, name string) (*v1alpha1.Task, error) {
+	task, err := s.store.GetTask(ctx, atespace, name)
+	if err != nil {
+		return nil, err
+	}
+	s.applyActor(ctx, task)
+	return task, nil
+}
+
+// listTasks returns a page of tasks with their Substrate-owned status filled
+// in, using one ListActors call per atespace.
+func (s *Server) listTasks(ctx context.Context, atespace string, limit, offset int64) ([]*v1alpha1.Task, error) {
+	tasks, err := s.store.ListTasks(ctx, atespace, limit, offset)
+	if err != nil {
+		return tasks, err
+	}
+	byAtespace := make(map[string][]*v1alpha1.Task)
+	for _, t := range tasks {
+		ns := t.GetMetadata().GetAtespace()
+		byAtespace[ns] = append(byAtespace[ns], t)
+	}
+	for ns, group := range byAtespace {
+		actors, err := s.substrate.ListActors(ctx, ns)
+		byName := make(map[string]*ateapipb.Actor, len(actors))
+		for _, a := range actors {
+			byName[a.GetMetadata().GetName()] = a
+		}
+		for _, t := range group {
+			setActorStatus(t, byName[t.GetMetadata().GetName()], err)
+		}
+	}
+	return tasks, nil
+}
+
+// saveTask stores task without its Substrate-owned status. task is not modified.
+func (s *Server) saveTask(ctx context.Context, task *v1alpha1.Task) error {
+	stored := proto.Clone(task).(*v1alpha1.Task)
+	stored.Status = storedStatus(task.Status)
+	return s.store.SaveTask(ctx, stored)
+}
+
+// updateTask stores a task's status without its Substrate-owned parts. st is
+// not modified.
+func (s *Server) updateTask(ctx context.Context, atespace, name string, st *v1alpha1.TaskStatus) error {
+	return s.store.UpdateTaskStatus(ctx, atespace, name, storedStatus(st))
+}
+
+// deleteTask removes a task's actor and templates from Substrate, then its
+// record from the store. It returns a gRPC status error.
+func (s *Server) deleteTask(ctx context.Context, atespace, name string) error {
+	if err := s.reconciler.Delete(ctx, atespace, name); err != nil {
+		if errors.Is(err, context.Canceled) {
+			return status.Error(codes.Canceled, err.Error())
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			return status.Error(codes.DeadlineExceeded, err.Error())
+		}
+		if st, ok := status.FromError(err); ok && st.Code() != codes.Unknown {
 			return err
 		}
+		return status.Errorf(codes.Internal, "cleaning up substrate resources for task %s/%s: %v", atespace, name, err)
 	}
+	if err := s.store.DeleteTask(ctx, atespace, name); err != nil {
+		return status.Errorf(codes.Internal, "deleting task record: %v", err)
+	}
+	return nil
+}
 
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case task, ok := <-ch:
-			if !ok {
-				return nil
+// applyActor fills in the Substrate-owned status of task from its actor.
+func (s *Server) applyActor(ctx context.Context, task *v1alpha1.Task) {
+	actor, err := s.substrate.GetActor(ctx, task.GetMetadata().GetAtespace(), task.GetMetadata().GetName())
+	if status.Code(err) == codes.NotFound {
+		actor, err = nil, nil
+	}
+	setActorStatus(task, actor, err)
+}
+
+// setActorStatus overlays the actor's state on the task's status: actor,
+// workerIP, and, unless the phase is one of AX's own, the phase and Ready
+// condition. actor is nil when the task has no actor; err is set when the actor
+// could not be looked up, in which case the task is reported with phase
+// Unknown.
+func setActorStatus(task *v1alpha1.Task, actor *ateapipb.Actor, err error) {
+	if task.Status == nil {
+		task.Status = &v1alpha1.TaskStatus{}
+	}
+	st := task.Status
+	st.Actor = ""
+	st.WorkerIp = ""
+
+	switch {
+	case err != nil:
+		slog.Warn("could not read task actor", "atespace", task.GetMetadata().GetAtespace(), "task", task.GetMetadata().GetName(), "error", err)
+		if !v1alpha1.IsAXPhase(st.Phase) {
+			st.Phase = v1alpha1.PhaseUnknown
+			setReady(task, "Unknown", v1alpha1.ReasonSubstrateUnavailable, err.Error())
+		}
+	case actor == nil:
+		// A task that finished provisioning always has an actor, so a missing one
+		// was removed outside AX.
+		if !v1alpha1.IsAXPhase(st.Phase) {
+			st.Phase = v1alpha1.PhaseFailed
+			setReady(task, "False", v1alpha1.ReasonActorNotFound, "The task's actor no longer exists on Substrate")
+		}
+	default:
+		st.Actor = actor.GetMetadata().GetName()
+		st.WorkerIp = substrate.WorkerIP(actor)
+		if v1alpha1.IsAXPhase(st.Phase) {
+			return
+		}
+		state := actor.GetStatus().GetState()
+		st.Phase = actorPhase(state)
+		switch st.Phase {
+		case v1alpha1.PhaseRunning:
+			if conditionTrue(task, v1alpha1.ConditionWorkspaceReady) {
+				setReady(task, "True", v1alpha1.ReasonTaskRunning, "Task is running and its workspace is ready")
+			} else {
+				setReady(task, "False", v1alpha1.ReasonWorkspaceInitializing, "Waiting for workspace setup to complete")
 			}
-			if err := stream.Send(&v1alpha1.WatchTaskResponse{Task: task, Action: "MODIFIED"}); err != nil {
-				return err
+		case v1alpha1.PhaseUnknown:
+			setReady(task, "Unknown", v1alpha1.PhaseUnknown, "Actor is in state "+state.String())
+		default:
+			// The task is not ready, and its phase says why.
+			message := actor.GetStatus().GetCrash().GetMessage()
+			if message == "" {
+				message = "Actor is " + strings.ToLower(strings.TrimPrefix(state.String(), "ACTOR_STATE_"))
 			}
-			if task.Status != nil && (task.Status.Phase == "Failed" || task.Status.Phase == "Completed") {
-				return nil
-			}
+			setReady(task, "False", st.Phase, message)
 		}
 	}
+}
+
+// actorPhase maps an actor's state to the task's phase.
+func actorPhase(state ateapipb.ActorState) string {
+	switch state {
+	case ateapipb.ActorState_ACTOR_STATE_RUNNING:
+		return v1alpha1.PhaseRunning
+	case ateapipb.ActorState_ACTOR_STATE_RESUMING, ateapipb.ActorState_ACTOR_STATE_REVERTING:
+		return v1alpha1.PhaseResuming
+	case ateapipb.ActorState_ACTOR_STATE_SUSPENDING:
+		return v1alpha1.PhaseSuspending
+	case ateapipb.ActorState_ACTOR_STATE_SUSPENDED:
+		return v1alpha1.PhaseSuspended
+	case ateapipb.ActorState_ACTOR_STATE_CRASHED:
+		return v1alpha1.PhaseFailed
+	case ateapipb.ActorState_ACTOR_STATE_DELETING:
+		return v1alpha1.PhaseTerminating
+	default:
+		return v1alpha1.PhaseUnknown
+	}
+}
+
+// conditionTrue reports whether the task has the given condition with status
+// True.
+func conditionTrue(task *v1alpha1.Task, condType string) bool {
+	for _, c := range task.GetStatus().GetConditions() {
+		if c.GetType() == condType {
+			return c.GetStatus() == "True"
+		}
+	}
+	return false
+}
+
+// setReady sets the task's Ready condition. Its update time changes only when
+// the condition does, so that repeated reads report a stable timestamp.
+func setReady(task *v1alpha1.Task, condStatus, reason, message string) {
+	for _, c := range task.Status.Conditions {
+		if c.GetType() != v1alpha1.ConditionReady {
+			continue
+		}
+		if c.Status != condStatus || c.Reason != reason || c.Message != message {
+			c.Status, c.Reason, c.Message = condStatus, reason, message
+			c.UpdateTime = timestamppb.Now()
+		}
+		return
+	}
+	task.Status.Conditions = append(task.Status.Conditions, &v1alpha1.Condition{
+		Type:       v1alpha1.ConditionReady,
+		Status:     condStatus,
+		Reason:     reason,
+		Message:    message,
+		UpdateTime: timestamppb.Now(),
+	})
+}
+
+// storedStatus returns the part of a task's status that AX owns and stores. The
+// actor, its worker, and the phase and Ready condition that follow from the
+// actor's state are dropped. st is not modified.
+func storedStatus(st *v1alpha1.TaskStatus) *v1alpha1.TaskStatus {
+	out := &v1alpha1.TaskStatus{}
+	if st != nil {
+		out = proto.Clone(st).(*v1alpha1.TaskStatus)
+	}
+	out.Actor = ""
+	out.WorkerIp = ""
+	if !v1alpha1.IsAXPhase(out.Phase) {
+		out.Phase = ""
+		conds := out.Conditions[:0]
+		for _, c := range out.Conditions {
+			if c.GetType() != v1alpha1.ConditionReady {
+				conds = append(conds, c)
+			}
+		}
+		out.Conditions = conds
+	}
+	return out
+}
+
+// fetchWorkspace loads the Workspace the task binds, or nil when the task
+// binds none or the Workspace does not exist.
+func (s *Server) fetchWorkspace(ctx context.Context, atespace string, task *v1alpha1.Task) *v1alpha1.Workspace {
+	name := task.GetSpec().GetWorkspace().GetName()
+	if name == "" {
+		return nil
+	}
+	ws, err := s.store.GetWorkspace(ctx, atespace, name)
+	if err != nil {
+		return nil
+	}
+	return ws
 }
 
 // --- Workspaces ---
@@ -586,17 +777,16 @@ func defaultMetadata(meta *v1alpha1.ObjectMeta, existing func(atespace, name str
 	if meta.Atespace == "" {
 		meta.Atespace = "default"
 	}
-	if meta.CreationTimestamp == nil {
+	if meta.CreateTime == nil {
 		var prev *v1alpha1.ObjectMeta
 		if existing != nil {
 			prev = existing(meta.Atespace, meta.Name)
 		}
-		if prev.GetCreationTimestamp() != nil {
-			meta.CreationTimestamp = prev.GetCreationTimestamp()
+		if prev.GetCreateTime() != nil {
+			meta.CreateTime = prev.GetCreateTime()
 		} else {
-			meta.CreationTimestamp = timestamppb.Now()
+			meta.CreateTime = timestamppb.Now()
 		}
 	}
 	return meta
 }
-

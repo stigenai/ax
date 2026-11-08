@@ -17,26 +17,28 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
 	"github.com/google/ax/internal/controller"
-	"github.com/google/ax/internal/lock"
 	"github.com/google/ax/internal/server"
-	"github.com/google/ax/internal/store/redis"
+	"github.com/google/ax/internal/store/postgres"
 	"github.com/google/ax/internal/substrate"
-	goredis "github.com/redis/go-redis/v9"
+	"github.com/google/ax/pkg/apis/v1alpha1"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 func main() {
 	var (
 		listenAddr              string
-		redisAddr               string
-		redisPassword           string
+		storeURL                string
 		substrateEndpoint       string
 		substrateAuthority      string
 		substrateTokenFile      string
@@ -45,11 +47,11 @@ func main() {
 		substratePlaintext      bool
 		defaultTemplate         string
 		defaultTemplateAtespace string
+		defaultTaskImage        string
 	)
 
 	flag.StringVar(&listenAddr, "addr", ":8080", "HTTP listen address")
-	flag.StringVar(&redisAddr, "redis-addr", "localhost:6379", "Redis server address")
-	flag.StringVar(&redisPassword, "redis-password", "", "Redis password")
+	flag.StringVar(&storeURL, "store", "postgres://ax@localhost:5432/ax?sslmode=disable", "PostgreSQL connection URL (env: AX_STORE). libpq variables such as PGPASSWORD fill in what it leaves out")
 	flag.StringVar(&substrateEndpoint, "substrate-endpoint", "api.ate-system.svc.cluster.local:443", "Agent Substrate Control API endpoint")
 	flag.StringVar(&substrateAuthority, "substrate-authority", "api.ate-system.svc", "Authority / TLS ServerName for Substrate endpoint")
 	flag.StringVar(&substrateTokenFile, "substrate-token-file", "", "Path to bearer token file for Substrate auth")
@@ -57,17 +59,21 @@ func main() {
 	flag.BoolVar(&substrateInsecureTLS, "substrate-insecure-tls", false, "Skip Substrate TLS verification")
 	flag.BoolVar(&substratePlaintext, "substrate-plaintext", false, "Use insecure plaintext gRPC connection to Substrate")
 	flag.StringVar(&defaultTemplate, "template", "default-template", "Default Substrate ActorTemplate name")
-	flag.StringVar(&defaultTemplateAtespace, "template-atespace", "ax-system", "Default Substrate ActorTemplate atespace")
+	flag.StringVar(&defaultTemplateAtespace, "template-atespace", v1alpha1.DefaultSystemNamespace, "Default Substrate ActorTemplate atespace")
+	flag.StringVar(&defaultTaskImage, "default-task-image", v1alpha1.DefaultTaskImage, "Container image for tasks that do not set spec.image (env: AX_DEFAULT_TASK_IMAGE)")
 	flag.Parse()
 
 	if envAddr := os.Getenv("ADDR"); envAddr != "" {
 		listenAddr = envAddr
 	}
-	if envRedis := os.Getenv("REDIS_ADDR"); envRedis != "" {
-		redisAddr = envRedis
+	// TODO: Reject or warn on passwords embedded in the store URL. They end up
+	// in process args and pod specs; credentials should come from PGPASSWORD,
+	// a password file, or a Secret instead.
+	if envStore := os.Getenv("AX_STORE"); envStore != "" {
+		storeURL = envStore
 	}
-	if envPass := os.Getenv("REDIS_PASSWORD"); envPass != "" {
-		redisPassword = envPass
+	if envImage := os.Getenv("AX_DEFAULT_TASK_IMAGE"); envImage != "" {
+		defaultTaskImage = envImage
 	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -75,21 +81,21 @@ func main() {
 
 	slog.Info("starting ax-server",
 		"listenAddr", listenAddr,
-		"redisAddr", redisAddr,
+		"store", describeStore(storeURL),
 		"substrateEndpoint", substrateEndpoint,
 		"template", defaultTemplate,
+		"defaultTaskImage", defaultTaskImage,
 	)
 
-	rClient := goredis.NewClient(&goredis.Options{
-		Addr:     redisAddr,
-		Password: redisPassword,
-	})
-	defer rClient.Close()
+	openCtx, openCancel := context.WithTimeout(context.Background(), time.Minute)
+	backend, err := postgres.Open(openCtx, storeURL, postgres.Options{})
+	openCancel()
+	if err != nil {
+		slog.Error("opening store", "store", describeStore(storeURL), "error", err)
+		os.Exit(1)
+	}
+	defer backend.Close()
 
-	rStore := redis.NewStore(rClient, redis.Options{})
-	rLocker := lock.NewRedisLocker(rClient, lock.RedisLockerOptions{})
-
-	var reconciler server.Reconciler
 	subClient, err := substrate.NewClientWithOptions(substrate.ClientOptions{
 		Target:      substrateEndpoint,
 		Authority:   substrateAuthority,
@@ -99,15 +105,14 @@ func main() {
 		Plaintext:   substratePlaintext,
 	})
 	if err != nil {
-		slog.Warn("could not initialize substrate client; running without substrate reconciliation", "error", err)
-	} else {
-		defer subClient.Close()
-		reconciler = controller.NewTaskReconciler(subClient, defaultTemplate, defaultTemplateAtespace)
+		slog.Error("initializing substrate client", "error", err)
+		os.Exit(1)
 	}
+	defer subClient.Close()
 
-	srv := server.NewServer(rStore, server.Options{
-		Locker:     rLocker,
-		Reconciler: reconciler,
+	reconciler := controller.NewTaskReconciler(subClient, defaultTemplate, defaultTemplateAtespace, defaultTaskImage)
+	srv := server.NewServer(backend, reconciler, server.Options{
+		Locker: backend,
 	})
 
 	httpServer := &http.Server{
@@ -134,4 +139,16 @@ func main() {
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
 	_ = httpServer.Shutdown(shutdownCtx)
+}
+
+// describeStore summarizes a store connection string for logs. It parses the
+// string the way the store does, so URLs, query parameters and keyword/value
+// DSNs are all handled, and reports only the user, host, port and database.
+// Passwords and other connection parameters are never included.
+func describeStore(connString string) string {
+	cfg, err := pgconn.ParseConfig(connString)
+	if err != nil {
+		return "<unparseable>"
+	}
+	return fmt.Sprintf("%s@%s/%s", cfg.User, net.JoinHostPort(cfg.Host, strconv.Itoa(int(cfg.Port))), cfg.Database)
 }
