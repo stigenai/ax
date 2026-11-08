@@ -146,7 +146,9 @@ func main() {
 	case "delete":
 		err = runDelete(serverURL, atespace, cleanArgs)
 	case "ssh":
-		err = runSSH(serverURL, atespace, kubeContext, cleanArgs)
+		err = runSSH(serverURL, atespace, kubeContext, cleanArgs, false)
+	case "stdio":
+		err = runSSH(serverURL, atespace, kubeContext, cleanArgs, true)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command: %s\n", cmd)
 		printUsage()
@@ -178,6 +180,7 @@ Available Commands:
   describe model <name>   Show detailed information about a model
   watch task <name>       Stream live status and condition updates for a task
   ssh <task-name> [-- cmd] Run a command or shell inside the running task container
+  stdio <task-name> -- cmd Run cmd with local stdin/stdout attached (e.g. ssh ProxyCommand ... -- sshd -i)
   suspend task <name>     Suspend execution of a task and checkpoint state
   resume task <name>      Resume execution of a suspended task
   delete task <name>      Delete a task
@@ -1019,9 +1022,13 @@ func chooseSSHDial(axRouter string, directReachable func() bool) sshDialMode {
 	return sshDialPortForward
 }
 
-func runSSH(serverURL, atespace, kubeContext string, args []string) error {
+// stdioTimeout replaces the 1h guest watchdog for ax stdio, so a long ssh
+// session is not killed. ponytail: fixed value, add a flag if 30 days is wrong.
+const stdioTimeout = 30 * 24 * time.Hour
+
+func runSSH(serverURL, atespace, kubeContext string, args []string, stdio bool) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: ax ssh <task-name> [-- command...]")
+		return fmt.Errorf("usage: ax ssh|stdio <task-name> [-- command...]")
 	}
 
 	taskName := args[0]
@@ -1036,6 +1043,9 @@ func runSSH(serverURL, atespace, kubeContext string, args []string) error {
 	}
 
 	if len(cmdToRun) == 0 {
+		if stdio {
+			return fmt.Errorf("usage: ax stdio <task-name> -- command...")
+		}
 		cmdToRun = []string{"/bin/sh"}
 	}
 
@@ -1131,11 +1141,16 @@ func runSSH(serverURL, atespace, kubeContext string, args []string) error {
 	}
 	defer guestClient.Close()
 
-	exitCode, err := guestClient.Exec(context.Background(), guest.ExecOptions{
+	opts := guest.ExecOptions{
 		Command: cmdToRun,
 		Stdout:  os.Stdout,
 		Stderr:  os.Stderr,
-	})
+	}
+	if stdio {
+		opts.Stdin = os.Stdin
+		opts.Timeout = stdioTimeout
+	}
+	exitCode, err := guestClient.Exec(context.Background(), opts)
 	if err != nil {
 		return err
 	}

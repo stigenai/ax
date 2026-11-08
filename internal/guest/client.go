@@ -26,6 +26,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/protobuf/types/known/durationpb"
 )
 
 // Client interacts with the in-actor guest daemon.
@@ -87,6 +88,10 @@ type ExecOptions struct {
 	Env     map[string]string
 	Stdout  io.Writer
 	Stderr  io.Writer
+	// Stdin, if set, feeds the process stdin. EOF on Stdin closes the remote stdin.
+	Stdin io.Reader
+	// Timeout overrides the guest watchdog (default 1h). Zero keeps the default.
+	Timeout time.Duration
 }
 
 // Exec runs a command inside the task container and streams stdout/stderr until completion.
@@ -100,12 +105,21 @@ func (c *Client) Exec(ctx context.Context, opts ExecOptions) (int, error) {
 		Command: opts.Command,
 		Cwd:     opts.Cwd,
 		Env:     opts.Env,
+		Stdin:   opts.Stdin != nil,
+		Timeout: timeout(opts.Timeout),
 	})
 	if err != nil {
 		return 1, fmt.Errorf("starting process: %w", err)
 	}
 
 	pid := proc.GetProcessId()
+	if opts.Stdin != nil {
+		in, err := c.process.WriteProcessInput(ctx)
+		if err != nil {
+			return 1, fmt.Errorf("opening process stdin: %w", err)
+		}
+		go pumpStdin(in, pid, opts.Stdin, opts.Stderr)
+	}
 	stream, err := c.process.StreamProcessOutput(ctx, &ateenvv1alpha.StreamProcessOutputRequest{
 		ProcessId: pid,
 		Follow:    true,
@@ -147,6 +161,40 @@ func (c *Client) Exec(ctx context.Context, opts ExecOptions) (int, error) {
 		case <-ctx.Done():
 			return 1, ctx.Err()
 		case <-time.After(50 * time.Millisecond):
+		}
+	}
+}
+
+func timeout(d time.Duration) *durationpb.Duration {
+	if d <= 0 {
+		return nil
+	}
+	return durationpb.New(d)
+}
+
+// pumpStdin copies r to the process stdin and closes the remote stdin on EOF.
+// The process exit ends Exec, so pumpStdin only reports errors to errOut.
+func pumpStdin(in ateenvv1alpha.ProcessService_WriteProcessInputClient, pid string, r io.Reader, errOut io.Writer) {
+	buf := make([]byte, 32*1024)
+	first := true
+	for {
+		n, rerr := r.Read(buf)
+		req := &ateenvv1alpha.WriteProcessInputRequest{Data: buf[:n], Close: rerr != nil}
+		if n > 0 || req.Close {
+			if first {
+				req.ProcessId = pid
+				first = false
+			}
+			if err := in.Send(req); err != nil {
+				return // The process exited; the output stream reports it.
+			}
+		}
+		if rerr != nil {
+			if !errors.Is(rerr, io.EOF) && errOut != nil {
+				fmt.Fprintf(errOut, "reading stdin: %v\n", rerr)
+			}
+			_, _ = in.CloseAndRecv()
+			return
 		}
 	}
 }
