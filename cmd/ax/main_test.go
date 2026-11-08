@@ -23,6 +23,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -555,8 +556,16 @@ func TestDialGuest_RouterEnv(t *testing.T) {
 	t.Setenv("KUBECONFIG", filepath.Join(t.TempDir(), "none"))
 	t.Setenv("AX_ROUTER", "127.0.0.1:1")
 
-	start := time.Now()
-	client, cleanup, err := dialGuest("192.0.2.1", 1, "default/t1", "no-such-context", "")
+	// A listener at the worker address shows whether dialGuest probes it.
+	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer probe.Close()
+	host, portStr, _ := net.SplitHostPort(probe.Addr().String())
+	port, _ := strconv.Atoi(portStr)
+
+	client, cleanup, err := dialGuest(host, port, "default/t1", "no-such-context", "")
 	if err != nil {
 		t.Fatalf("dialGuest with AX_ROUTER set: %v", err)
 	}
@@ -564,7 +573,9 @@ func TestDialGuest_RouterEnv(t *testing.T) {
 	if cleanup != nil {
 		t.Errorf("cleanup is not nil, want nil")
 	}
-	if d := time.Since(start); d > 400*time.Millisecond {
-		t.Errorf("dialGuest took %v, want it to skip the direct probe", d)
+	probe.(*net.TCPListener).SetDeadline(time.Now().Add(100 * time.Millisecond))
+	if conn, err := probe.Accept(); err == nil {
+		conn.Close()
+		t.Errorf("dialGuest probed the worker address, want it to dial only AX_ROUTER")
 	}
 }
