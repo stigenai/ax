@@ -22,9 +22,11 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/signal"
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"text/tabwriter"
 	"time"
 
@@ -1150,7 +1152,10 @@ func runSSH(serverURL, atespace, kubeContext string, args []string, stdio bool) 
 		opts.Stdin = os.Stdin
 		opts.Timeout = stdioTimeout
 	}
-	exitCode, err := guestClient.Exec(context.Background(), opts)
+	// ssh sends SIGHUP to its ProxyCommand on exit; Exec then stops the remote process.
+	sigCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	exitCode, err := guestClient.Exec(sigCtx, opts)
 	if err != nil {
 		return err
 	}

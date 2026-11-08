@@ -113,6 +113,17 @@ func (c *Client) Exec(ctx context.Context, opts ExecOptions) (int, error) {
 	}
 
 	pid := proc.GetProcessId()
+	// If ctx ends first (ax ssh/stdio got a signal; ssh sends SIGHUP to its
+	// ProxyCommand), stop the remote process. Else it stays as an orphan that
+	// holds a guest process slot until its timeout.
+	defer func() {
+		if ctx.Err() == nil {
+			return
+		}
+		sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		_, _ = c.process.SignalProcess(sctx, &ateenvv1alpha.SignalProcessRequest{ProcessId: pid, Signal: ateenvv1alpha.Signal_SIGNAL_TERM})
+	}()
 	if opts.Stdin != nil {
 		in, err := c.process.WriteProcessInput(ctx)
 		if err != nil {
