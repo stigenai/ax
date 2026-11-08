@@ -315,6 +315,7 @@ func TestClient_EnsureActorTemplateWithImage_Success(t *testing.T) {
 		"task-1-tmpl-abcd",
 		"custom-image:v1",
 		nil,
+		"",
 		map[string]string{"FOO": "BAR"},
 	)
 	if err != nil {
@@ -350,6 +351,7 @@ func TestClient_EnsureActorTemplateWithImage_PropagatesError(t *testing.T) {
 		"task-1-tmpl-abcd",
 		"custom-image:v1",
 		nil,
+		"",
 	)
 	if err == nil {
 		t.Fatal("expected error, got nil")
@@ -510,5 +512,17 @@ func TestBuildActorTemplate_Resources(t *testing.T) {
 	tmpl = BuildActorTemplate("default", "task-tmpl-01234567", "ghcr.io/my-org/agent@sha256:abc", nil, nil, "", nil)
 	if !proto.Equal(tmpl.GetResources(), wantDefault) {
 		t.Fatalf("template without limits has resources %v, want %v", tmpl.GetResources(), wantDefault)
+	}
+}
+
+func TestSandboxSelector(t *testing.T) {
+	if got := sandboxSelector(""); got != nil {
+		t.Errorf("sandboxSelector(\"\") = %v, want nil", got)
+	}
+	for _, class := range []string{"gvisor", "microvm", "kata"} {
+		got := sandboxSelector(class).GetMatchLabels()
+		if len(got) != 1 || got["ate.dev/sandboxClass"] != class {
+			t.Errorf("sandboxSelector(%q).MatchLabels = %v, want only ate.dev/sandboxClass=%s", class, got, class)
+		}
 	}
 }

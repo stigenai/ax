@@ -86,6 +86,8 @@ message TaskSpec {
   // It is stored in plain text and shown by `ax get task`, so it must not
   // hold secrets.
   google.protobuf.Struct config = 7;
+  // sandbox_class pins the task to WorkerPools labelled ate.dev/sandboxClass=<class>: "gvisor" or "microvm". Empty means any pool.
+  string sandbox_class = 8;
 }
 
 message EnvVar {

@@ -405,7 +405,7 @@ func BuildActorTemplate(atespace, name, image string, envMap map[string]string, 
 
 // EnsureActorTemplateWithImage creates an ActorTemplate using the specified container image,
 // resource limits (nil for default limits), and optional environment variables.
-func (c *Client) EnsureActorTemplateWithImage(ctx context.Context, baseAtespace, baseTemplate, targetAtespace, targetTemplate, image string, resources *ateapipb.ResourceRequirements, extraEnv ...map[string]string) (*ateapipb.ActorTemplate, error) {
+func (c *Client) EnsureActorTemplateWithImage(ctx context.Context, baseAtespace, baseTemplate, targetAtespace, targetTemplate, image string, resources *ateapipb.ResourceRequirements, sandboxClass string, extraEnv ...map[string]string) (*ateapipb.ActorTemplate, error) {
 	existing, err := c.GetActorTemplate(ctx, targetAtespace, targetTemplate)
 	if err == nil && existing != nil {
 		return existing, nil
@@ -702,3 +702,6 @@ func (c *Client) DeleteActorTemplate(ctx context.Context, atespace, templateName
 	}
 	return nil
 }
+
+// sandboxSelector is a stub until the next commit.
+func sandboxSelector(class string) *ateapipb.Selector { return nil }

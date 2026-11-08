@@ -1115,3 +1115,56 @@ func TestTaskReconciler_TransientSubstrateUnavailable(t *testing.T) {
 	assertCondition(t, task4, "Ready", "False", v1alpha1.ReasonActorCreationFailed)
 	mockSrv.createActorErr = nil
 }
+
+func TestTaskReconciler_SandboxClass(t *testing.T) {
+	ctx := context.Background()
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer lis.Close()
+
+	mockSrv := &mockControlServer{}
+	grpcServer := grpc.NewServer()
+	ateapipb.RegisterControlServer(grpcServer, mockSrv)
+	go grpcServer.Serve(lis)
+	defer grpcServer.Stop()
+
+	client, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("failed to create substrate client: %v", err)
+	}
+	defer client.Close()
+
+	reconciler := controller.NewTaskReconciler(client, "test-template", "ax-system", "")
+	reconciler.WorkspaceReadyTimeout = 200 * time.Millisecond
+
+	task := &v1alpha1.Task{
+		ApiVersion: v1alpha1.APIVersion,
+		Kind:       v1alpha1.KindTask,
+		Metadata:   &v1alpha1.ObjectMeta{Name: "t1", Atespace: "default"},
+		Spec:       &v1alpha1.TaskSpec{Image: "img", SandboxClass: "gvisor"},
+	}
+	if err := reconciler.Suspend(ctx, task, nil); err != nil {
+		t.Fatalf("Suspend failed: %v", err)
+	}
+	task.Spec.SandboxClass = "microvm"
+	if err := reconciler.Suspend(ctx, task, nil); err != nil {
+		t.Fatalf("Suspend with changed class failed: %v", err)
+	}
+
+	if len(mockSrv.createdTemplates) != 2 {
+		t.Fatalf("created %d templates, want 2", len(mockSrv.createdTemplates))
+	}
+	first, second := mockSrv.createdTemplates[0], mockSrv.createdTemplates[1]
+	if first.GetMetadata().GetName() == second.GetMetadata().GetName() {
+		t.Errorf("class change reused template name %q, want a distinct name", first.GetMetadata().GetName())
+	}
+	if got := first.GetWorkerSelector().GetMatchLabels()["ate.dev/sandboxClass"]; got != "gvisor" {
+		t.Errorf("first template class label = %q, want gvisor", got)
+	}
+	if got := second.GetWorkerSelector().GetMatchLabels()["ate.dev/sandboxClass"]; got != "microvm" {
+		t.Errorf("second template class label = %q, want microvm", got)
+	}
+}

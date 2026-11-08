@@ -711,3 +711,29 @@ func TestUnmarshalYAMLLenient_NormalizesWorkspace(t *testing.T) {
 		t.Errorf("mcp servers = %v, want one named srv", got)
 	}
 }
+
+func TestValidateTask_SandboxClass(t *testing.T) {
+	for _, class := range []string{"", "gvisor", "microvm"} {
+		task := &v1alpha1.Task{Metadata: &v1alpha1.ObjectMeta{Name: "t1"}, Spec: &v1alpha1.TaskSpec{SandboxClass: class}}
+		if err := v1alpha1.ValidateTask(task); err != nil {
+			t.Errorf("ValidateTask with sandboxClass %q: %v", class, err)
+		}
+	}
+	for _, class := range []string{"GVISOR", "kata", " gvisor"} {
+		task := &v1alpha1.Task{Metadata: &v1alpha1.ObjectMeta{Name: "t1"}, Spec: &v1alpha1.TaskSpec{SandboxClass: class}}
+		err := v1alpha1.ValidateTask(task)
+		if err == nil || !strings.Contains(err.Error(), "spec.sandboxClass") {
+			t.Errorf("ValidateTask with sandboxClass %q = %v, want an error naming spec.sandboxClass", class, err)
+		}
+	}
+}
+
+func TestTaskSpec_FieldNumbers(t *testing.T) {
+	fields := (&v1alpha1.TaskSpec{}).ProtoReflect().Descriptor().Fields()
+	if got := fields.ByName("sandbox_class").Number(); got != 8 {
+		t.Errorf("sandbox_class field number = %d, want 8", got)
+	}
+	if got := fields.ByName("config").Number(); got != 7 {
+		t.Errorf("config field number = %d, want 7", got)
+	}
+}
