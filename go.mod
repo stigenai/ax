@@ -27,3 +27,5 @@ require (
 )
 
 replace github.com/agent-substrate/substrate => github.com/stigenai/substrate v0.3.1-0.20261014142909-6fbe6ab2aeed
+
+replace github.com/agent-substrate/env => github.com/stigenai/env v0.0.11-0.20261109021355-45314510bec4
