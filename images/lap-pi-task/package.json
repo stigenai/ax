@@ -1,0 +1,14 @@
+{
+  "name": "lap-ax-pi-task",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test *.test.mjs",
+    "check": "node --check server.mjs && node --check pi.mjs"
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "0.80.3",
+    "@modelcontextprotocol/sdk": "1.29.0"
+  }
+}
