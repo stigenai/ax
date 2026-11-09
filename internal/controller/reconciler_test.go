@@ -669,6 +669,37 @@ func TestTaskReconciler_SandboxClass(t *testing.T) {
 	}
 }
 
+// spec.guestDevices sets the template's WorkerSelector and its name digest,
+// but stays out of AX_TASK_YAML, which a runner built before the field would refuse.
+func TestTaskReconciler_GuestDevices(t *testing.T) {
+	reconcile := func(devices []string) *ateapipb.ActorTemplate {
+		mockSrv := &mockControlServer{}
+		task := envTask("x")
+		task.Spec.SandboxClass = v1alpha1.SandboxClassMicroVM
+		task.Spec.GuestDevices = devices
+		if _, err := newTestReconciler(t, mockSrv).Reconcile(context.Background(), task); err != nil {
+			t.Fatalf("Reconcile(%v) failed: %v", devices, err)
+		}
+		return mockSrv.lastTemplate
+	}
+	plain, fuse := reconcile(nil), reconcile([]string{v1alpha1.GuestDeviceFUSE})
+
+	if got := plain.GetWorkerSelector(); got != nil {
+		t.Errorf("no guest devices: WorkerSelector = %v, want nil", got)
+	}
+	if got := fuse.GetWorkerSelector().GetMatchLabels()["ate.dev/guest-device-fuse"]; got != "true" {
+		t.Errorf("fuse: WorkerSelector = %v", fuse.GetWorkerSelector())
+	}
+	if plain.GetMetadata().GetName() == fuse.GetMetadata().GetName() {
+		t.Errorf("guest devices did not change the template name %q", plain.GetMetadata().GetName())
+	}
+	for _, e := range fuse.GetContainers()[0].GetEnv() {
+		if e.GetName() == "AX_TASK_YAML" && strings.Contains(e.GetValue(), "fuse") {
+			t.Errorf("AX_TASK_YAML carries the guest devices: %q", e.GetValue())
+		}
+	}
+}
+
 // taskTopLevelMemory returns the top-level memory limit quantity the mock
 // server captured, or "" if the template carries no top-level Resources.
 func taskTopLevelMemory(tmpl *ateapipb.ActorTemplate) string {

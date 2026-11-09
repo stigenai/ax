@@ -200,7 +200,13 @@ type TaskSpec struct {
 	// with a real Linux kernel, for work gVisor cannot run, such as Nix builds).
 	// A microvm task needs a WorkerPool with sandboxClass microvm and the
 	// cluster-scoped SandboxConfig named "microvm".
-	SandboxClass  string `protobuf:"bytes,13,opt,name=sandbox_class,json=sandboxClass,proto3" json:"sandbox_class,omitempty"`
+	SandboxClass string `protobuf:"bytes,13,opt,name=sandbox_class,json=sandboxClass,proto3" json:"sandbox_class,omitempty"`
+	// guest_devices adds device nodes to a microvm task's guest. The only value
+	// is "fuse" (/dev/fuse). For each device, the task's ActorTemplate selects
+	// WorkerPools with the label ate.dev/guest-device-<name>: "true". The
+	// operator puts that label on a pool with the same Substrate
+	// spec.guestDevices. A FUSE mount also needs SYS_ADMIN in capabilities.
+	GuestDevices  []string `protobuf:"bytes,14,rep,name=guest_devices,json=guestDevices,proto3" json:"guest_devices,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -303,6 +309,13 @@ func (x *TaskSpec) GetSandboxClass() string {
 		return x.SandboxClass
 	}
 	return ""
+}
+
+func (x *TaskSpec) GetGuestDevices() []string {
+	if x != nil {
+		return x.GuestDevices
+	}
+	return nil
 }
 
 type EnvVar struct {
@@ -2572,7 +2585,7 @@ const file_pkg_apis_v1alpha1_ax_proto_rawDesc = "" +
 	"\x04kind\x18\x02 \x01(\tR\x04kind\x123\n" +
 	"\bmetadata\x18\x03 \x01(\v2\x17.ax.v1alpha1.ObjectMetaR\bmetadata\x12)\n" +
 	"\x04spec\x18\x04 \x01(\v2\x15.ax.v1alpha1.TaskSpecR\x04spec\x12/\n" +
-	"\x06status\x18\x05 \x01(\v2\x17.ax.v1alpha1.TaskStatusR\x06status\"\xa8\x03\n" +
+	"\x06status\x18\x05 \x01(\v2\x17.ax.v1alpha1.TaskStatusR\x06status\"\xcd\x03\n" +
 	"\bTaskSpec\x12\x18\n" +
 	"\asuspend\x18\x02 \x01(\bR\asuspend\x12\x14\n" +
 	"\x05image\x18\x03 \x01(\tR\x05image\x12\x18\n" +
@@ -2586,7 +2599,8 @@ const file_pkg_apis_v1alpha1_ax_proto_rawDesc = "" +
 	" \x01(\bR\x05debug\x12\"\n" +
 	"\fcapabilities\x18\v \x03(\tR\fcapabilities\x12-\n" +
 	"\x12supervisor_profile\x18\f \x01(\tR\x11supervisorProfile\x12#\n" +
-	"\rsandbox_class\x18\r \x01(\tR\fsandboxClassJ\x04\b\x01\x10\x02J\x04\b\b\x10\tJ\x04\b\t\x10\n" +
+	"\rsandbox_class\x18\r \x01(\tR\fsandboxClass\x12#\n" +
+	"\rguest_devices\x18\x0e \x03(\tR\fguestDevicesJ\x04\b\x01\x10\x02J\x04\b\b\x10\tJ\x04\b\t\x10\n" +
 	"R\x04goalR\agatewayR\bpolicies\"2\n" +
 	"\x06EnvVar\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x14\n" +
