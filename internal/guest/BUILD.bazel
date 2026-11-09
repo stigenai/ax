@@ -14,6 +14,7 @@ go_library(
         "@org_golang_google_grpc//credentials",
         "@org_golang_google_grpc//credentials/insecure",
         "@org_golang_google_grpc//metadata",
+        "@org_golang_google_protobuf//types/known/durationpb",
     ],
 )
 
@@ -28,10 +29,12 @@ go_test(
     deps = [
         "@com_github_agent_substrate_env//proto/ateenv/v1alpha",
         "@org_golang_google_grpc//:grpc",
+        "@org_golang_google_grpc//codes",
         "@org_golang_google_grpc//credentials/insecure",
         "@org_golang_google_grpc//health",
         "@org_golang_google_grpc//health/grpc_health_v1",
         "@org_golang_google_grpc//metadata",
+        "@org_golang_google_grpc//status",
         "@org_golang_google_grpc//test/bufconn",
     ],
 )
