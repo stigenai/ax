@@ -11,3 +11,5 @@ ax
 ax-server
 ax-task-runner
 ax-controller
+
+images/lap-pi-task/node_modules/

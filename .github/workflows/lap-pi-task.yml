@@ -16,13 +16,11 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-      - name: Test turn server
-        run: node --test images/lap-pi-task/*.test.mjs
       - name: Log in to GHCR
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
-      - name: Build task image
+      - name: Build and test task image
         run: docker build --platform linux/amd64 -f images/lap-pi-task/Dockerfile -t ghcr.io/stigenai/ax/lap-pi-task:${{ github.sha }} .
       - name: Publish task image
         if: github.event_name != 'pull_request'
