@@ -11,6 +11,7 @@ go_library(
     deps = [
         "//pkg/apis/v1alpha1",
         "@com_github_agent_substrate_substrate//pkg/proto/ateapipb",
+        "@io_k8s_apimachinery//pkg/api/validate/content",
         "@org_golang_google_grpc//:grpc",
         "@org_golang_google_grpc//codes",
         "@org_golang_google_grpc//credentials",
@@ -35,5 +36,7 @@ go_test(
         "@org_golang_google_grpc//codes",
         "@org_golang_google_grpc//credentials/insecure",
         "@org_golang_google_grpc//status",
+        "@org_golang_google_protobuf//proto",
+        "@org_golang_google_protobuf//types/known/timestamppb",
     ],
 )
