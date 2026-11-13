@@ -420,6 +420,7 @@ func sameTemplateSpec(a, b *ateapipb.ActorTemplate) bool {
 // The bool is true when that actor is already SUSPENDED.
 // A new actor returns false, so the caller still suspends it.
 // On that path, any other state returns an error.
+// An empty actor record returns an error.
 // A missing uid or version returns an error.
 // An empty desired template returns an error.
 // Those errors do not delete the actor.
@@ -454,7 +455,8 @@ func (c *Client) EnsureActor(ctx context.Context, atespace, actorName, templateA
 	if suspend && getErr != nil {
 		return nil, false, fmt.Errorf("template update: %w", getErr)
 	}
-	if suspend && existing == nil {
+	// gRPC delivers a nil body as an empty actor.
+	if suspend && (existing == nil || (existing.GetMetadata().GetUid() == "" && existing.GetStatus() == nil && existing.GetActorTemplate() == nil)) {
 		return nil, false, fmt.Errorf("template update: actor %s/%s has no record", atespace, actorName)
 	}
 	if getErr == nil && existing != nil {

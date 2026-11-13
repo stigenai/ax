@@ -321,7 +321,7 @@ func TestTaskReconciler_TemplateUpdateGuard(t *testing.T) {
 			getActorNil:   true,
 		}
 		reconciled, err := newTestReconciler(t, mock).Reconcile(context.Background(), task)
-		if err == nil || !strings.Contains(err.Error(), "template update") {
+		if err == nil || !strings.Contains(err.Error(), "no record") {
 			t.Fatalf("err %v", err)
 		}
 		assertIdle(t, mock, 0)
