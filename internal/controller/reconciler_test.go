@@ -294,6 +294,7 @@ func TestReconcileDeleteRetainsTaggedTemplates(t *testing.T) {
 		{"none", nil, false, false},
 		{"other UID", []*ateapipb.Tag{tag("default", "backup", "other", true)}, false, false},
 		{"owned golden", []*ateapipb.Tag{tag("ate-golden", uid, uid, true)}, false, false},
+		{"other golden name", []*ateapipb.Tag{tag("ate-golden", "user-backup", uid, true)}, false, true},
 		{"golden plus user", []*ateapipb.Tag{tag("ate-golden", uid, uid, true), tag("default", "backup", uid, true)}, false, true},
 		{"golden name elsewhere", []*ateapipb.Tag{tag("other", uid, uid, true)}, false, true},
 	} {

@@ -80,12 +80,18 @@ func TestListTagsPages(t *testing.T) {
 }
 
 func TestListTagsFailure(t *testing.T) {
-	for _, mode := range []string{"RPC", "cancel", "repeat", "cycle"} {
+	for _, mode := range []string{"RPC", "cancel", "canceled before call", "repeat", "cycle"} {
 		t.Run(mode, func(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
+			if mode == "canceled before call" {
+				cancel()
+			}
 			calls := 0
 			client := &Client{control: tagListClient{list: func(ctx context.Context, req *ateapipb.ListTagsRequest) (*ateapipb.ListTagsResponse, error) {
+				if mode == "canceled before call" {
+					t.Fatal("RPC on canceled context")
+				}
 				calls++
 				if calls > 3 {
 					t.Fatal("did not stop after repeated token")
@@ -95,6 +101,7 @@ func TestListTagsFailure(t *testing.T) {
 				}
 				if mode == "cancel" {
 					cancel()
+					return &ateapipb.ListTagsResponse{Tags: []*ateapipb.Tag{{}}}, nil
 				}
 				token := "one"
 				if mode == "cycle" && calls == 2 {
@@ -109,7 +116,7 @@ func TestListTagsFailure(t *testing.T) {
 			if mode == "RPC" && status.Code(err) != codes.PermissionDenied {
 				t.Fatalf("lost RPC status: %v", err)
 			}
-			if mode == "cancel" && status.Code(err) != codes.Canceled {
+			if (mode == "cancel" || mode == "canceled before call") && status.Code(err) != codes.Canceled {
 				t.Fatalf("lost cancellation: %v", err)
 			}
 		})

@@ -506,8 +506,7 @@ func taskTemplatePattern(taskName string) *regexp.Regexp {
 	return regexp.MustCompile(fmt.Sprintf("^%s-tmpl-[0-9a-f]{%d}$", regexp.QuoteMeta(taskName), 2*templateDigestBytes))
 }
 
-// ReconcileDelete cleans up Substrate resources when a Task is deleted: the actor,
-// which shares the task's name, then every ActorTemplate provisioned for the task.
+// ReconcileDelete deletes the task actor, then its templates without tag references.
 func (r *TaskReconciler) ReconcileDelete(ctx context.Context, atespace, taskName string, actorUID ...string) error {
 	if atespace == "" {
 		atespace = "default"
@@ -527,20 +526,46 @@ func (r *TaskReconciler) ReconcileDelete(ctx context.Context, atespace, taskName
 	return nil
 }
 
-// deleteTaskTemplates removes all ActorTemplates belonging to the task. Templates
-// accumulate across spec revisions, so this matches by name pattern rather than
-// recomputing a single digest. If an actor deletion is still finishing in Substrate,
-// template deletion may briefly return Aborted, so we retry with backoff.
+// deleteTaskTemplates retains templates that tags reference, except their own golden tags.
+// It validates the complete inventory and all candidates before the first delete.
+// Template delete retries allow Substrate to finish the actor delete.
 func (r *TaskReconciler) deleteTaskTemplates(ctx context.Context, atespace, taskName string) error {
 	templates, err := r.client.ListActorTemplates(ctx, atespace)
 	if err != nil {
 		return err
 	}
 	pattern := taskTemplatePattern(taskName)
-	var errs []error
+	var candidates []*ateapipb.ActorTemplate
 	for _, tmpl := range templates {
+		if pattern.MatchString(tmpl.GetMetadata().GetName()) {
+			if tmpl.GetMetadata().GetUid() == "" {
+				return fmt.Errorf("template cleanup requires a candidate UID")
+			}
+			candidates = append(candidates, tmpl)
+		}
+	}
+	tags, err := r.client.ListTags(ctx, "")
+	if err != nil {
+		return fmt.Errorf("tag inventory unavailable: %s", status.Code(err))
+	}
+	for _, tag := range tags {
+		if tag.GetMetadata().GetName() == "" || tag.GetMetadata().GetAtespace() == "" || tag.GetStatus().GetActorTemplateUid() == "" {
+			return fmt.Errorf("tag inventory lacks required identity fields")
+		}
+	}
+	var errs []error
+	for _, tmpl := range candidates {
 		name := tmpl.GetMetadata().GetName()
-		if !pattern.MatchString(name) {
+		uid := tmpl.GetMetadata().GetUid()
+		retained := false
+		for _, tag := range tags {
+			if tag.GetStatus().GetActorTemplateUid() == uid && !(tag.GetMetadata().GetAtespace() == "ate-golden" && tag.GetMetadata().GetName() == uid) {
+				retained = true
+				break
+			}
+		}
+		if retained {
+			slog.Info("retaining Substrate actor template for task", "atespace", atespace, "task", taskName, "template", name, "template_uid", uid, "reason", "tag_reference")
 			continue
 		}
 		slog.Info("deleting Substrate actor template for task", "atespace", atespace, "task", taskName, "template", name)
