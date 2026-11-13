@@ -33,7 +33,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
-	"k8s.io/apimachinery/pkg/util/validation"
+	"k8s.io/apimachinery/pkg/api/validate/content"
 )
 
 // ClientOptions configures connection to the Substrate Control API server.
@@ -664,7 +664,7 @@ func (c *Client) ListTags(ctx context.Context, atespace string) ([]*ateapipb.Tag
 }
 
 func taskTagNameValid(name string) bool {
-	return len(validation.IsDNS1123Label(name)) == 0
+	return len(content.IsDNS1123Label(name)) == 0
 }
 
 func taskTagInput(atespace string, names ...string) error {

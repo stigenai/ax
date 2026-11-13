@@ -11,7 +11,7 @@ go_library(
     deps = [
         "//pkg/apis/v1alpha1",
         "@com_github_agent_substrate_substrate//pkg/proto/ateapipb",
-        "@io_k8s_apimachinery//pkg/util/validation",
+        "@io_k8s_apimachinery//pkg/api/validate/content",
         "@org_golang_google_grpc//:grpc",
         "@org_golang_google_grpc//codes",
         "@org_golang_google_grpc//credentials",
