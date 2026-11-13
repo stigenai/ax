@@ -411,72 +411,127 @@ func sameTemplateSpec(a, b *ateapipb.ActorTemplate) bool {
 	return proto.Equal(a, b)
 }
 
-// EnsureActor creates an Actor in the specified atespace deriving from an ActorTemplate.
-func (c *Client) EnsureActor(ctx context.Context, atespace, actorName, templateAtespace, templateName string, protectedSupervisor bool) (*ateapipb.Actor, error) {
+// EnsureActor returns the actor for atespace and actorName.
+// It creates the actor when none exists.
+// suspend is true when the task asks to stay suspended.
+// A suspended actor with a different template is repointed in place.
+// The call clones the actor and changes only ActorTemplate.
+// UpdateActor requires the current uid and a non-zero version.
+// The bool is true when that actor is already SUSPENDED.
+// A new actor returns false, so the caller still suspends it.
+// On that path, any other state returns an error.
+// A missing uid or version returns an error.
+// An empty desired template returns an error.
+// Those errors do not delete the actor.
+// They do not create a replacement.
+func (c *Client) EnsureActor(ctx context.Context, atespace, actorName, templateAtespace, templateName string, protectedSupervisor, suspend bool) (*ateapipb.Actor, bool, error) {
+	desired := &ateapipb.ObjectRef{
+		Atespace: templateAtespace,
+		Name:     templateName,
+	}
 	req := &ateapipb.CreateActorRequest{
 		Actor: &ateapipb.Actor{
 			Metadata: &ateapipb.ResourceMetadata{
 				Atespace: atespace,
 				Name:     actorName,
 			},
-			ActorTemplate: &ateapipb.ObjectRef{
-				Atespace: templateAtespace,
-				Name:     templateName,
-			},
+			ActorTemplate: desired,
 		},
 	}
 	actor, err := c.control.CreateActor(ctx, req)
-	if err != nil {
-		if status.Code(err) == codes.AlreadyExists {
-			existing, getErr := c.control.GetActor(ctx, &ateapipb.GetActorRequest{
+	if err == nil {
+		return actor, false, nil
+	}
+	if status.Code(err) != codes.AlreadyExists {
+		return nil, false, fmt.Errorf("creating actor %s/%s: %w", atespace, actorName, err)
+	}
+	existing, getErr := c.control.GetActor(ctx, &ateapipb.GetActorRequest{
+		Actor: &ateapipb.ObjectRef{
+			Atespace: atespace,
+			Name:     actorName,
+		},
+	})
+	if suspend && getErr != nil {
+		return nil, false, fmt.Errorf("template update: %w", getErr)
+	}
+	if suspend && existing == nil {
+		return nil, false, fmt.Errorf("template update: actor %s/%s has no record", atespace, actorName)
+	}
+	if getErr == nil && existing != nil {
+		same := proto.Equal(existing.GetActorTemplate(), desired)
+		if suspend && !same {
+			if existing.GetStatus().GetState() != ateapipb.ActorState_ACTOR_STATE_SUSPENDED {
+				return nil, false, fmt.Errorf("template update: actor %s/%s state %s", atespace, actorName, existing.GetStatus().GetState())
+			}
+			if existing.GetMetadata().GetUid() == "" || existing.GetMetadata().GetVersion() == 0 {
+				return nil, false, fmt.Errorf("template update: actor %s/%s has no uid or version", atespace, actorName)
+			}
+			if templateAtespace == "" || templateName == "" {
+				return nil, false, fmt.Errorf("template update: desired template is empty")
+			}
+			next := proto.Clone(existing).(*ateapipb.Actor)
+			next.ActorTemplate = desired
+			updated, upErr := c.control.UpdateActor(ctx, &ateapipb.UpdateActorRequest{Actor: next})
+			if upErr != nil {
+				return nil, false, fmt.Errorf("template update: %w", upErr)
+			}
+			// gRPC delivers a nil body as an empty actor.
+			if updated == nil || updated.GetMetadata().GetUid() == "" {
+				return nil, false, fmt.Errorf("template update: empty response")
+			}
+			slog.Info("updated suspended actor template",
+				"atespace", atespace,
+				"actor", actorName,
+				"uid", existing.GetMetadata().GetUid(),
+				"oldTemplateAtespace", existing.GetActorTemplate().GetAtespace(),
+				"oldTemplateName", existing.GetActorTemplate().GetName(),
+				"templateAtespace", templateAtespace,
+				"templateName", templateName,
+			)
+			return updated, updated.GetStatus().GetState() == ateapipb.ActorState_ACTOR_STATE_SUSPENDED, nil
+		}
+		if suspend && existing.GetStatus().GetState() == ateapipb.ActorState_ACTOR_STATE_SUSPENDED {
+			return existing, true, nil
+		}
+		if protectedSupervisor {
+			if !same {
+				return nil, false, fmt.Errorf("existing supervisor actor references another template")
+			}
+			return existing, false, nil
+		}
+		state := existing.GetStatus().GetState()
+		if state == ateapipb.ActorState_ACTOR_STATE_CRASHED {
+			slog.Warn("existing actor is crashed, deleting and recreating", "actor", actorName)
+			_, _ = c.control.DeleteActor(ctx, &ateapipb.DeleteActorRequest{
 				Actor: &ateapipb.ObjectRef{
 					Atespace: atespace,
 					Name:     actorName,
 				},
+				AnyState: true,
 			})
-			if getErr == nil && existing != nil {
-				if protectedSupervisor {
-					if !proto.Equal(existing.GetActorTemplate(), req.Actor.ActorTemplate) {
-						return nil, fmt.Errorf("existing supervisor actor references another template")
-					}
-					return existing, nil
+			state = ateapipb.ActorState_ACTOR_STATE_DELETING
+		}
+		if state == ateapipb.ActorState_ACTOR_STATE_DELETING {
+			// Wait briefly for previous actor deletion to finalize before recreating
+			for i := 0; i < 20; i++ {
+				select {
+				case <-ctx.Done():
+					return nil, false, ctx.Err()
+				case <-time.After(500 * time.Millisecond):
 				}
-				state := existing.GetStatus().GetState()
-				if state == ateapipb.ActorState_ACTOR_STATE_CRASHED {
-					slog.Warn("existing actor is crashed, deleting and recreating", "actor", actorName)
-					_, _ = c.control.DeleteActor(ctx, &ateapipb.DeleteActorRequest{
-						Actor: &ateapipb.ObjectRef{
-							Atespace: atespace,
-							Name:     actorName,
-						},
-						AnyState: true,
-					})
-					state = ateapipb.ActorState_ACTOR_STATE_DELETING
+				created, createErr := c.control.CreateActor(ctx, req)
+				if createErr == nil {
+					return created, false, nil
 				}
-				if state == ateapipb.ActorState_ACTOR_STATE_DELETING {
-					// Wait briefly for previous actor deletion to finalize before recreating
-					for i := 0; i < 20; i++ {
-						select {
-						case <-ctx.Done():
-							return nil, ctx.Err()
-						case <-time.After(500 * time.Millisecond):
-						}
-						actor, err = c.control.CreateActor(ctx, req)
-						if err == nil {
-							return actor, nil
-						}
-						if status.Code(err) != codes.AlreadyExists {
-							break
-						}
-					}
-					return nil, fmt.Errorf("actor %s/%s is still deleting; please retry", atespace, actorName)
+				if status.Code(createErr) != codes.AlreadyExists {
+					break
 				}
 			}
-			return existing, getErr
+			return nil, false, fmt.Errorf("actor %s/%s is still deleting; please retry", atespace, actorName)
 		}
-		return nil, fmt.Errorf("creating actor %s/%s: %w", atespace, actorName, err)
+		return existing, false, nil
 	}
-	return actor, nil
+	return existing, false, getErr
 }
 
 // ResumeActor resumes the specified actor onto a worker and returns the worker details.
