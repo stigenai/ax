@@ -45,6 +45,35 @@ type taskTagControl struct {
 	call func() error
 }
 
+type cancelAtCheck struct {
+	context.Context
+	cancel context.CancelFunc
+	checks int
+}
+
+func (c *cancelAtCheck) Err() error {
+	c.checks--
+	if c.checks == 0 {
+		c.cancel()
+	}
+	return c.Context.Err()
+}
+
+func TestListTaskTagsCanceledProjection(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	controlled := &cancelAtCheck{Context: ctx, cancel: cancel, checks: 4}
+	client := &Client{control: taskTagControl{call: func() error { return nil }}}
+	a, ok := any(client).(taskTagAdapter)
+	if !ok {
+		t.Fatal("Client lacks the task tag adapter contract")
+	}
+	got, err := a.ListTaskTags(controlled, "space")
+	if got != nil || status.Code(err) != codes.Canceled {
+		t.Fatalf("got=%v err=%v", got, err)
+	}
+}
+
 func (c taskTagControl) CreateTag(context.Context, *ateapipb.CreateTagRequest, ...grpc.CallOption) (*ateapipb.Tag, error) {
 	return completedTaskTag(), c.call()
 }
