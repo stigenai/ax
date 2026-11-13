@@ -72,6 +72,16 @@ type Client struct {
 	control ateapipb.ControlClient
 }
 
+// TaskTag contains the identity of a completed task snapshot.
+type TaskTag struct {
+	Atespace         string
+	Name             string
+	UID              string
+	SourceActorName  string
+	ActorTemplateUID string
+	CreateTime       time.Time
+}
+
 // NewClientWithOptions connects to Substrate with full TLS and auth configuration.
 func NewClientWithOptions(opts ClientOptions, extraDialOpts ...grpc.DialOption) (*Client, error) {
 	if opts.Target == "" {
