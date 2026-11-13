@@ -297,6 +297,7 @@ func TestTaskTagReadiness(t *testing.T) {
 		omit   bool
 	}{
 		{"complete", func(*ateapipb.Tag) {}, codes.OK, false},
+		{"complete-without-nested-template", func(v *ateapipb.Tag) { v.Status.Snapshot.ActorTemplateUid = "" }, codes.OK, false},
 		{"pending", func(v *ateapipb.Tag) { v.Status.Snapshot = nil }, codes.FailedPrecondition, true},
 		{"empty-uri", func(v *ateapipb.Tag) { v.Status.Snapshot.SnapshotUri = "" }, codes.FailedPrecondition, true},
 		{"published", func(v *ateapipb.Tag) { v.Scope = ateapipb.TagScope_TAG_SCOPE_PUBLISHED }, codes.NotFound, true},
