@@ -12,6 +12,7 @@ import (
 	"github.com/google/ax/internal/store"
 	"github.com/google/ax/pkg/apis/v1alpha1"
 	redisclient "github.com/redis/go-redis/v9"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -285,4 +286,137 @@ func TestProtectedDeleteRedisConcurrentReplacement(t *testing.T) {
 			t.Fatal("failed transaction published deletion")
 		}
 	}
+}
+
+func newDeleteRedis(t *testing.T) (context.Context, *Store, *redisclient.Client) {
+	t.Helper()
+	address := os.Getenv("AX_DELETE_TEST_REDIS_ADDRESS")
+	if address == "" {
+		t.Skip("requires explicit disposable AX_DELETE_TEST_REDIS_ADDRESS")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	t.Cleanup(cancel)
+	client := redisclient.NewClient(&redisclient.Options{Addr: address})
+	t.Cleanup(func() { client.Close() })
+	if err := client.Ping(ctx).Err(); err != nil {
+		t.Fatal(err)
+	}
+	prefix := fmt.Sprintf("ax-1wy-%d", time.Now().UnixNano())
+	s := NewStore(client, Options{KeyPrefix: prefix, StreamName: prefix + ":events"})
+	return ctx, s, client
+}
+
+// TestSaveTaskRejectsTerminatingRedis checks the Redis transaction form of
+// the Terminating SaveTask guard.
+func TestSaveTaskRejectsTerminatingRedis(t *testing.T) {
+	profiles := []struct {
+		name    string
+		profile string
+	}{
+		{"ordinary", ""},
+		{"supervisor", v1alpha1.FabriekSupervisorProfile},
+	}
+	statuses := []struct {
+		name   string
+		status *v1alpha1.TaskStatus
+	}{
+		{"nil", nil},
+		{"pending", &v1alpha1.TaskStatus{Phase: "Pending"}},
+		{"suspended", &v1alpha1.TaskStatus{Phase: "Suspended"}},
+		{"running", &v1alpha1.TaskStatus{Phase: "Running"}},
+	}
+	for _, profile := range profiles {
+		for _, incoming := range statuses {
+			t.Run(profile.name+"/"+incoming.name, func(t *testing.T) {
+				ctx, s, client := newDeleteRedis(t)
+				created := time.Date(2026, 11, 12, 12, 0, 0, 0, time.UTC)
+				stored := &v1alpha1.Task{
+					Metadata: &v1alpha1.ObjectMeta{Name: "job", Atespace: "private", CreationTimestamp: timestamppb.New(created)},
+					Spec:     &v1alpha1.TaskSpec{Image: "ghcr.io/example/app:a", SupervisorProfile: profile.profile},
+					Status:   &v1alpha1.TaskStatus{Phase: "Running"},
+				}
+				if err := s.SaveTask(ctx, stored); err != nil {
+					t.Fatal(err)
+				}
+				if profile.profile == "" {
+					if err := s.MarkTaskDeleting(ctx, "private", "job"); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					pre := store.TaskDeletePreconditions{ActorUID: "actor-uid", CreationTimestamp: created.Format(time.RFC3339Nano)}
+					if err := s.MarkTaskDeleting(ctx, "private", "job", pre); err != nil {
+						t.Fatal(err)
+					}
+				}
+				before, err := s.GetTask(ctx, "private", "job")
+				if err != nil {
+					t.Fatal(err)
+				}
+				count, err := client.XLen(ctx, s.opts.StreamName).Result()
+				if err != nil {
+					t.Fatal(err)
+				}
+				replacement := &v1alpha1.Task{
+					Metadata: &v1alpha1.ObjectMeta{Name: "job", Atespace: "private"},
+					Spec: &v1alpha1.TaskSpec{
+						Image:             "ghcr.io/example/app:b",
+						Suspend:           true,
+						SupervisorProfile: profile.profile,
+					},
+					Status: incoming.status,
+				}
+				if err := s.SaveTask(ctx, replacement); !errors.Is(err, store.ErrConflict) {
+					t.Fatalf("err %v", err)
+				}
+				after, err := s.GetTask(ctx, "private", "job")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !proto.Equal(before, after) {
+					t.Fatalf("stored task changed\nbefore %v\nafter  %v", before, after)
+				}
+				got, err := client.XLen(ctx, s.opts.StreamName).Result()
+				if err != nil || got != count {
+					t.Fatalf("stream len %d, want %d (%v)", got, count, err)
+				}
+			})
+		}
+	}
+
+	t.Run("create", func(t *testing.T) {
+		ctx, s, _ := newDeleteRedis(t)
+		if err := s.SaveTask(ctx, &v1alpha1.Task{Metadata: &v1alpha1.ObjectMeta{Name: "new", Atespace: "private"}}); err != nil {
+			t.Fatal(err)
+		}
+		got, err := s.GetTask(ctx, "private", "new")
+		if err != nil || got.GetStatus().GetPhase() != "Pending" {
+			t.Fatalf("create: %v phase %q", err, got.GetStatus().GetPhase())
+		}
+	})
+
+	t.Run("update live", func(t *testing.T) {
+		ctx, s, client := newDeleteRedis(t)
+		if err := s.SaveTask(ctx, &v1alpha1.Task{
+			Metadata: &v1alpha1.ObjectMeta{Name: "job", Atespace: "private"},
+			Spec:     &v1alpha1.TaskSpec{Image: "ghcr.io/example/app:a"},
+			Status:   &v1alpha1.TaskStatus{Phase: "Running"},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.SaveTask(ctx, &v1alpha1.Task{
+			Metadata: &v1alpha1.ObjectMeta{Name: "job", Atespace: "private"},
+			Spec:     &v1alpha1.TaskSpec{Image: "ghcr.io/example/app:b"},
+			Status:   &v1alpha1.TaskStatus{Phase: "Running"},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		got, err := s.GetTask(ctx, "private", "job")
+		if err != nil || got.GetSpec().GetImage() != "ghcr.io/example/app:b" {
+			t.Fatalf("update: %v image %q", err, got.GetSpec().GetImage())
+		}
+		count, err := client.XLen(ctx, s.opts.StreamName).Result()
+		if err != nil || count != 2 {
+			t.Fatalf("stream len %d (%v)", count, err)
+		}
+	})
 }

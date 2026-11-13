@@ -307,7 +307,9 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 		}
 	}
 
-	actor, err := r.client.EnsureActor(ctx, atespace, actorName, templateAtespace, templateName, task.Spec.SupervisorProfile != "")
+	// alreadySuspended is true only for an existing SUSPENDED actor.
+	// A new actor still needs SuspendActor.
+	actor, alreadySuspended, err := r.client.EnsureActor(ctx, atespace, actorName, templateAtespace, templateName, task.Spec.SupervisorProfile != "", task.Spec.GetSuspend())
 	if err != nil {
 		r.setNotReady(task, "ActorCreationFailed", err.Error(), now)
 		task.Status.Phase = "Failed"
@@ -316,11 +318,13 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 
 	// 4. Suspend or Resume the Actor
 	if task.Spec != nil && task.Spec.Suspend {
-		slog.Info("suspending actor on Substrate", "actor", actorName)
-		if err := r.client.SuspendActor(ctx, atespace, actorName); err != nil {
-			r.setNotReady(task, "ActorSuspendFailed", err.Error(), now)
-			task.Status.Phase = "Failed"
-			return task, fmt.Errorf("suspending actor: %w", err)
+		if !alreadySuspended {
+			slog.Info("suspending actor on Substrate", "actor", actorName)
+			if err := r.client.SuspendActor(ctx, atespace, actorName); err != nil {
+				r.setNotReady(task, "ActorSuspendFailed", err.Error(), now)
+				task.Status.Phase = "Failed"
+				return task, fmt.Errorf("suspending actor: %w", err)
+			}
 		}
 		task.Status.WorkerIp = ""
 		task.Status.Phase = "Suspended"

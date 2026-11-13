@@ -64,7 +64,9 @@ func TestMetadataServer(t *testing.T) {
 		Spec:       &v1alpha1.WorkspaceSpec{},
 	}
 
-	srv := metadata.NewServer(9999, task, []*v1alpha1.Workspace{ws, ws2})
+	srv := metadata.NewServer(9999, task, []*v1alpha1.Workspace{ws, ws2}, metadata.ServerOptions{
+		LogDir: t.TempDir(),
+	})
 	if err := srv.Start(); err != nil {
 		t.Fatalf("failed to start server: %v", err)
 	}
