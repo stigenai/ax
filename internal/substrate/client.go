@@ -33,6 +33,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
+	"k8s.io/apimachinery/pkg/util/validation"
 )
 
 // ClientOptions configures connection to the Substrate Control API server.
@@ -660,6 +661,144 @@ func (c *Client) ListTags(ctx context.Context, atespace string) ([]*ateapipb.Tag
 		}
 		seen[token] = true
 	}
+}
+
+func taskTagNameValid(name string) bool {
+	return len(validation.IsDNS1123Label(name)) == 0
+}
+
+func taskTagInput(atespace string, names ...string) error {
+	if !taskTagNameValid(atespace) || atespace == "ate-golden" {
+		return status.Error(codes.InvalidArgument, "invalid task tag atespace")
+	}
+	for _, name := range names {
+		if !taskTagNameValid(name) {
+			return status.Error(codes.InvalidArgument, "invalid task tag name")
+		}
+	}
+	return nil
+}
+
+func taskTagError(ctx context.Context, err error) error {
+	if ctx.Err() != nil {
+		return status.FromContextError(ctx.Err()).Err()
+	}
+	if err == nil {
+		return nil
+	}
+	code := status.Code(err)
+	switch code {
+	case codes.Canceled, codes.DeadlineExceeded, codes.NotFound, codes.AlreadyExists,
+		codes.FailedPrecondition, codes.Unauthenticated, codes.PermissionDenied,
+		codes.Unavailable, codes.ResourceExhausted:
+	default:
+		code = codes.Internal
+	}
+	return status.Error(code, "task tag request failed")
+}
+
+func projectTaskTag(tag *ateapipb.Tag, atespace, name, source string) (*TaskTag, error) {
+	metadata, actor, state := tag.GetMetadata(), tag.GetSourceActor(), tag.GetStatus()
+	bad := status.Error(codes.DataLoss, "invalid task tag response")
+	if metadata.GetAtespace() != atespace || !taskTagNameValid(metadata.GetName()) || metadata.GetUid() == "" {
+		return nil, bad
+	}
+	if actor.GetAtespace() != atespace || !taskTagNameValid(actor.GetName()) || state.GetActorTemplateUid() == "" {
+		return nil, bad
+	}
+	if (name != "" && metadata.GetName() != name) || (source != "" && actor.GetName() != source) {
+		return nil, bad
+	}
+	if tag.GetScope() != ateapipb.TagScope_TAG_SCOPE_ATESPACE && tag.GetScope() != ateapipb.TagScope_TAG_SCOPE_PUBLISHED {
+		return nil, bad
+	}
+	var created time.Time
+	if timestamp := metadata.GetCreateTime(); timestamp != nil {
+		if timestamp.CheckValid() != nil {
+			return nil, bad
+		}
+		created = timestamp.AsTime()
+	}
+	snapshot := state.GetSnapshot()
+	if snapshot.GetSnapshotUri() != "" && snapshot.GetActorTemplateUid() != state.GetActorTemplateUid() {
+		return nil, bad
+	}
+	if tag.GetScope() == ateapipb.TagScope_TAG_SCOPE_PUBLISHED {
+		return nil, status.Error(codes.NotFound, "task tag not found")
+	}
+	if snapshot.GetSnapshotUri() == "" {
+		return nil, status.Error(codes.FailedPrecondition, "task tag copy is incomplete")
+	}
+	return &TaskTag{
+		Atespace: atespace, Name: metadata.GetName(), UID: metadata.GetUid(),
+		SourceActorName: actor.GetName(), ActorTemplateUID: state.GetActorTemplateUid(), CreateTime: created,
+	}, nil
+}
+
+// CreateTaskTag copies a suspended actor snapshot into one ATESPACE tag.
+// The caller must hold the task operation barrier through copy completion.
+// An error can leave a pending tag. This method does not retry or delete it.
+func (c *Client) CreateTaskTag(ctx context.Context, atespace, actorName, tagName string) (*TaskTag, error) {
+	if err := taskTagInput(atespace, actorName, tagName); err != nil {
+		return nil, err
+	}
+	if err := taskTagError(ctx, nil); err != nil {
+		return nil, err
+	}
+	tag, err := c.control.CreateTag(ctx, &ateapipb.CreateTagRequest{Tag: &ateapipb.Tag{
+		Metadata:    &ateapipb.ResourceMetadata{Atespace: atespace, Name: tagName},
+		Scope:       ateapipb.TagScope_TAG_SCOPE_ATESPACE,
+		SourceActor: &ateapipb.ObjectRef{Atespace: atespace, Name: actorName},
+	}})
+	if err := taskTagError(ctx, err); err != nil {
+		return nil, err
+	}
+	if tag.GetScope() != ateapipb.TagScope_TAG_SCOPE_ATESPACE {
+		return nil, status.Error(codes.DataLoss, "invalid task tag response")
+	}
+	return projectTaskTag(tag, atespace, tagName, actorName)
+}
+
+// GetTaskTag returns a completed ATESPACE tag without storage details.
+func (c *Client) GetTaskTag(ctx context.Context, atespace, tagName string) (*TaskTag, error) {
+	if err := taskTagInput(atespace, tagName); err != nil {
+		return nil, err
+	}
+	if err := taskTagError(ctx, nil); err != nil {
+		return nil, err
+	}
+	tag, err := c.control.GetTag(ctx, &ateapipb.GetTagRequest{Tag: &ateapipb.ObjectRef{Atespace: atespace, Name: tagName}})
+	if err := taskTagError(ctx, err); err != nil {
+		return nil, err
+	}
+	return projectTaskTag(tag, atespace, tagName, "")
+}
+
+// ListTaskTags returns all completed ATESPACE tags in one explicit atespace.
+// An error returns no partial result. The raw cleanup inventory stays unchanged.
+func (c *Client) ListTaskTags(ctx context.Context, atespace string) ([]*TaskTag, error) {
+	if err := taskTagInput(atespace); err != nil {
+		return nil, err
+	}
+	tags, err := c.ListTags(ctx, atespace)
+	if err := taskTagError(ctx, err); err != nil {
+		return nil, err
+	}
+	var result []*TaskTag
+	for _, tag := range tags {
+		value, err := projectTaskTag(tag, atespace, "", "")
+		if status.Code(err) == codes.NotFound || status.Code(err) == codes.FailedPrecondition {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, value)
+	}
+	if err := taskTagError(ctx, nil); err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 // ListActorTemplates returns all ActorTemplates in the given atespace.

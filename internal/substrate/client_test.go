@@ -40,6 +40,53 @@ type taskTagAdapter interface {
 	ListTaskTags(context.Context, string) ([]*TaskTag, error)
 }
 
+type taskTagControl struct {
+	ateapipb.ControlClient
+	call func() error
+}
+
+func (c taskTagControl) CreateTag(context.Context, *ateapipb.CreateTagRequest, ...grpc.CallOption) (*ateapipb.Tag, error) {
+	return completedTaskTag(), c.call()
+}
+func (c taskTagControl) GetTag(context.Context, *ateapipb.GetTagRequest, ...grpc.CallOption) (*ateapipb.Tag, error) {
+	return completedTaskTag(), c.call()
+}
+func (c taskTagControl) ListTags(context.Context, *ateapipb.ListTagsRequest, ...grpc.CallOption) (*ateapipb.ListTagsResponse, error) {
+	return &ateapipb.ListTagsResponse{Tags: []*ateapipb.Tag{completedTaskTag()}}, c.call()
+}
+
+func TestTaskTagCanceledResponse(t *testing.T) {
+	for _, op := range []string{"create", "get", "list"} {
+		for _, before := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/%v", op, before), func(t *testing.T) {
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				calls := 0
+				client := &Client{control: taskTagControl{call: func() error {
+					calls++
+					cancel()
+					return nil
+				}}}
+				a, ok := any(client).(taskTagAdapter)
+				if !ok {
+					t.Fatal("Client lacks the task tag adapter contract")
+				}
+				if before {
+					cancel()
+				}
+				err := tagOperations(a)[op](ctx, "space", "actor", "tag")
+				want := 1
+				if before {
+					want = 0
+				}
+				if status.Code(err) != codes.Canceled || calls != want {
+					t.Fatalf("err=%v calls=%d", err, calls)
+				}
+			})
+		}
+	}
+}
+
 type taskTagServer struct {
 	ateapipb.UnimplementedControlServer
 	call  func(context.Context, string, any) (any, error)
@@ -238,6 +285,11 @@ func TestTaskTagReadiness(t *testing.T) {
 		{"no-metadata", func(v *ateapipb.Tag) { v.Metadata = nil }, codes.DataLoss, false},
 		{"no-source", func(v *ateapipb.Tag) { v.SourceActor = nil }, codes.DataLoss, false},
 		{"no-status", func(v *ateapipb.Tag) { v.Status = nil }, codes.DataLoss, false},
+		{"pending-invalid-uid", func(v *ateapipb.Tag) { v.Status.Snapshot = nil; v.Metadata.Uid = "" }, codes.DataLoss, false},
+		{"published-invalid-source", func(v *ateapipb.Tag) {
+			v.Scope = ateapipb.TagScope_TAG_SCOPE_PUBLISHED
+			v.SourceActor.Atespace = "other"
+		}, codes.DataLoss, false},
 	} {
 		for _, op := range []string{"create", "get", "list"} {
 			t.Run(tc.name+"/"+op, func(t *testing.T) {
@@ -472,6 +524,20 @@ func TestListTaskTagsPages(t *testing.T) {
 				t.Fatal(calls)
 			}
 		})
+	}
+}
+
+func TestListTaskTagsEmpty(t *testing.T) {
+	s := &taskTagServer{call: func(_ context.Context, _ string, req any) (any, error) {
+		if !proto.Equal(req.(*ateapipb.ListTagsRequest), &ateapipb.ListTagsRequest{Atespace: "space", PageSize: 500}) {
+			t.Errorf("unexpected request: %v", req)
+		}
+		return &ateapipb.ListTagsResponse{}, nil
+	}}
+	_, a := taskTagClient(t, s)
+	got, err := a.ListTaskTags(context.Background(), "space")
+	if err != nil || len(got) != 0 || s.count("") != 1 {
+		t.Fatalf("got=%v err=%v", got, err)
 	}
 }
 
