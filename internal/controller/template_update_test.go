@@ -346,6 +346,25 @@ func TestTaskReconciler_TemplateUpdateGuard(t *testing.T) {
 		}
 	})
 
+	t.Run("empty template atespace", func(t *testing.T) {
+		task := ordinaryImageTask("ghcr.io/example/app:b", true)
+		mock := &mockControlServer{
+			existingActor:         fullSuspendedActor("default", "job", "old-template"),
+			blankTemplateAtespace: true,
+		}
+		reconciled, err := newTestReconciler(t, mock).Reconcile(context.Background(), task)
+		if err == nil || !strings.Contains(err.Error(), "desired template is empty") {
+			t.Fatalf("err %v", err)
+		}
+		assertIdle(t, mock, 0)
+		if readyReason(reconciled) == "TaskSuspended" {
+			t.Fatal("claimed TaskSuspended")
+		}
+		if mock.liveActor != nil || mock.existingActor.GetActorTemplate().GetName() != "old-template" {
+			t.Fatal("empty atespace stored a new actor")
+		}
+	})
+
 	t.Run("suspend false running ordinary", func(t *testing.T) {
 		task := ordinaryImageTask("ghcr.io/example/app:b", false)
 		actor := fullSuspendedActor("default", "job", "old-template")

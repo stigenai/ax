@@ -82,6 +82,8 @@ type mockControlServer struct {
 	getActorNil bool
 	// blankTemplateName makes CreateActorTemplate return an empty name.
 	blankTemplateName bool
+	// blankTemplateAtespace makes CreateActorTemplate return an empty atespace.
+	blankTemplateAtespace bool
 	// suspendErr makes SuspendActor fail.
 	suspendErr error
 	// calls lists Control method names in call order.
@@ -114,12 +116,17 @@ func (m *mockControlServer) CreateActorTemplate(_ context.Context, req *ateapipb
 		m.actorTemplates = make(map[string]bool)
 	}
 	tmpl := req.GetActorTemplate()
-	if m.blankTemplateName {
+	if m.blankTemplateName || m.blankTemplateAtespace {
 		tmpl = proto.Clone(tmpl).(*ateapipb.ActorTemplate)
 		if tmpl.Metadata == nil {
 			tmpl.Metadata = &ateapipb.ResourceMetadata{}
 		}
-		tmpl.Metadata.Name = ""
+		if m.blankTemplateName {
+			tmpl.Metadata.Name = ""
+		}
+		if m.blankTemplateAtespace {
+			tmpl.Metadata.Atespace = ""
+		}
 	}
 	m.lastTemplate = tmpl
 	m.actorTemplates[tmpl.GetMetadata().GetName()] = true
