@@ -67,6 +67,25 @@ type mockControlServer struct {
 	// bounds the call with its own timeout instead of hanging forever
 	// (ax-9qu.11).
 	getActorDelay time.Duration
+	// liveActor is the actor stored by a successful UpdateActor.
+	// GetActor returns it ahead of existingActor.
+	liveActor *ateapipb.Actor
+	// updateRequests keeps every UpdateActor body. A rejected call stays in the list.
+	updateRequests []*ateapipb.Actor
+	// updateErr makes UpdateActor fail before it stores the actor.
+	updateErr error
+	// updateNil makes UpdateActor return a nil actor and a nil error.
+	updateNil bool
+	// loseUpdateResponse stores one actor, then returns Unavailable.
+	loseUpdateResponse bool
+	// getActorNil makes GetActor return a nil actor and a nil error.
+	getActorNil bool
+	// blankTemplateName makes CreateActorTemplate return an empty name.
+	blankTemplateName bool
+	// suspendErr makes SuspendActor fail.
+	suspendErr error
+	// calls lists Control method names in call order.
+	calls []string
 }
 
 // noSecrets is a SecretResolver for tests: it never finds a key and never touches a cluster.
@@ -75,6 +94,7 @@ func noSecrets(context.Context, string, string, string) (string, error) {
 }
 
 func (m *mockControlServer) GetActorTemplate(_ context.Context, req *ateapipb.GetActorTemplateRequest) (*ateapipb.ActorTemplate, error) {
+	m.calls = append(m.calls, "GetActorTemplate")
 	ref := req.GetActorTemplate()
 	if !m.actorTemplates[ref.GetName()] {
 		return nil, status.Error(codes.NotFound, "template not found")
@@ -86,6 +106,7 @@ func (m *mockControlServer) GetActorTemplate(_ context.Context, req *ateapipb.Ge
 }
 
 func (m *mockControlServer) CreateActorTemplate(_ context.Context, req *ateapipb.CreateActorTemplateRequest) (*ateapipb.ActorTemplate, error) {
+	m.calls = append(m.calls, "CreateActorTemplate")
 	if m.rejectTemplates != nil {
 		return nil, m.rejectTemplates
 	}
@@ -93,6 +114,13 @@ func (m *mockControlServer) CreateActorTemplate(_ context.Context, req *ateapipb
 		m.actorTemplates = make(map[string]bool)
 	}
 	tmpl := req.GetActorTemplate()
+	if m.blankTemplateName {
+		tmpl = proto.Clone(tmpl).(*ateapipb.ActorTemplate)
+		if tmpl.Metadata == nil {
+			tmpl.Metadata = &ateapipb.ResourceMetadata{}
+		}
+		tmpl.Metadata.Name = ""
+	}
 	m.lastTemplate = tmpl
 	m.actorTemplates[tmpl.GetMetadata().GetName()] = true
 	return tmpl, nil
@@ -107,7 +135,15 @@ func (m *mockControlServer) CreateAtespace(ctx context.Context, req *ateapipb.Cr
 	return &ateapipb.Atespace{Metadata: &ateapipb.ResourceMetadata{Name: name}}, nil
 }
 
+func cloneActor(actor *ateapipb.Actor) *ateapipb.Actor {
+	if actor == nil {
+		return nil
+	}
+	return proto.Clone(actor).(*ateapipb.Actor)
+}
+
 func (m *mockControlServer) GetActor(ctx context.Context, _ *ateapipb.GetActorRequest) (*ateapipb.Actor, error) {
+	m.calls = append(m.calls, "GetActor")
 	if m.getActorDelay > 0 {
 		select {
 		case <-time.After(m.getActorDelay):
@@ -118,14 +154,57 @@ func (m *mockControlServer) GetActor(ctx context.Context, _ *ateapipb.GetActorRe
 	if m.getActorErr != nil {
 		return nil, m.getActorErr
 	}
-	if m.getActorActor != nil {
-		return m.getActorActor, nil
+	if m.getActorNil {
+		return nil, nil
 	}
-	return m.existingActor, nil
+	if m.getActorActor != nil {
+		return cloneActor(m.getActorActor), nil
+	}
+	if m.liveActor != nil {
+		return cloneActor(m.liveActor), nil
+	}
+	return cloneActor(m.existingActor), nil
+}
+
+func (m *mockControlServer) currentActor() *ateapipb.Actor {
+	if m.liveActor != nil {
+		return m.liveActor
+	}
+	return m.existingActor
+}
+
+// UpdateActor enforces uid and version against the stored actor.
+// A match stores the request body and increments version.
+func (m *mockControlServer) UpdateActor(_ context.Context, req *ateapipb.UpdateActorRequest) (*ateapipb.Actor, error) {
+	m.calls = append(m.calls, "UpdateActor")
+	got := cloneActor(req.GetActor())
+	m.updateRequests = append(m.updateRequests, got)
+	current := m.currentActor()
+	if got.GetMetadata().GetUid() == "" || got.GetMetadata().GetVersion() == 0 {
+		return nil, status.Error(codes.InvalidArgument, "uid and version are required")
+	}
+	if current == nil || current.GetMetadata().GetUid() != got.GetMetadata().GetUid() || current.GetMetadata().GetVersion() != got.GetMetadata().GetVersion() {
+		return nil, status.Error(codes.Aborted, "uid or version conflict")
+	}
+	if m.updateErr != nil {
+		return nil, m.updateErr
+	}
+	if m.updateNil {
+		return nil, nil
+	}
+	stored := cloneActor(got)
+	stored.Metadata.Version = current.GetMetadata().GetVersion() + 1
+	m.liveActor = stored
+	if m.loseUpdateResponse {
+		m.loseUpdateResponse = false
+		return nil, status.Error(codes.Unavailable, "lost update response")
+	}
+	return cloneActor(stored), nil
 }
 
 func (m *mockControlServer) CreateActor(ctx context.Context, req *ateapipb.CreateActorRequest) (*ateapipb.Actor, error) {
-	if m.existingActor != nil {
+	m.calls = append(m.calls, "CreateActor")
+	if m.existingActor != nil || m.liveActor != nil {
 		return nil, status.Error(codes.AlreadyExists, "actor exists")
 	}
 	name := ""
@@ -142,6 +221,7 @@ func (m *mockControlServer) CreateActor(ctx context.Context, req *ateapipb.Creat
 }
 
 func (m *mockControlServer) ResumeActor(ctx context.Context, req *ateapipb.ResumeActorRequest) (*ateapipb.ResumeActorResponse, error) {
+	m.calls = append(m.calls, "ResumeActor")
 	m.resumeAttempts.Add(1)
 	if m.resumeErr != nil {
 		return nil, m.resumeErr
@@ -171,15 +251,20 @@ func (m *mockControlServer) ResumeActor(ctx context.Context, req *ateapipb.Resum
 }
 
 func (m *mockControlServer) SuspendActor(ctx context.Context, req *ateapipb.SuspendActorRequest) (*ateapipb.SuspendActorResponse, error) {
+	m.calls = append(m.calls, "SuspendActor")
 	name := ""
 	if req.Actor != nil {
 		name = req.Actor.Name
 	}
 	m.suspendedActors = append(m.suspendedActors, name)
+	if m.suspendErr != nil {
+		return nil, m.suspendErr
+	}
 	return &ateapipb.SuspendActorResponse{}, nil
 }
 
 func (m *mockControlServer) DeleteActor(ctx context.Context, req *ateapipb.DeleteActorRequest) (*ateapipb.Actor, error) {
+	m.calls = append(m.calls, "DeleteActor")
 	m.deleteUID = req.GetOptions().GetUid()
 	if m.expectedDeleteUID != "" && m.deleteUID != m.expectedDeleteUID {
 		return nil, status.Error(codes.Aborted, "actor UID differs")
@@ -194,6 +279,12 @@ func (m *mockControlServer) DeleteActor(ctx context.Context, req *ateapipb.Delet
 		}
 	}
 	m.deletedActors = append(m.deletedActors, name)
+	if name != "" && m.existingActor.GetMetadata().GetName() == name {
+		m.existingActor = nil
+	}
+	if name != "" && m.liveActor.GetMetadata().GetName() == name {
+		m.liveActor = nil
+	}
 	return &ateapipb.Actor{Metadata: &ateapipb.ResourceMetadata{Name: name}}, nil
 }
 
