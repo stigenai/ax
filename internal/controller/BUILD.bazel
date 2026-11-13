@@ -36,6 +36,7 @@ go_test(
         "reconciler_test.go",
         "task_monitor_sweep_test.go",
         "task_monitor_test.go",
+        "template_update_test.go",
         "worker_delete_test.go",
         "worker_test.go",
     ],
