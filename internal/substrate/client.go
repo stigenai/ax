@@ -566,6 +566,35 @@ func (c *Client) ListActors(ctx context.Context, atespace string) ([]*ateapipb.A
 	}
 }
 
+// ListTags returns all tags. An empty atespace selects all atespaces.
+// An error returns no partial inventory.
+func (c *Client) ListTags(ctx context.Context, atespace string) ([]*ateapipb.Tag, error) {
+	var tags []*ateapipb.Tag
+	var token string
+	seen := make(map[string]bool)
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, status.FromContextError(err).Err()
+		}
+		resp, err := c.control.ListTags(ctx, &ateapipb.ListTagsRequest{Atespace: atespace, PageSize: 500, PageToken: token})
+		if err != nil {
+			return nil, err
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, status.FromContextError(err).Err()
+		}
+		tags = append(tags, resp.GetTags()...)
+		token = resp.GetNextPageToken()
+		if token == "" {
+			return tags, nil
+		}
+		if seen[token] {
+			return nil, fmt.Errorf("tag inventory repeats a page token")
+		}
+		seen[token] = true
+	}
+}
+
 // ListActorTemplates returns all ActorTemplates in the given atespace.
 func (c *Client) ListActorTemplates(ctx context.Context, atespace string) ([]*ateapipb.ActorTemplate, error) {
 	resp, err := c.control.ListActorTemplates(ctx, &ateapipb.ListActorTemplatesRequest{Atespace: atespace})

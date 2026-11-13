@@ -15,8 +15,10 @@
 package controller_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"net"
 	"net/http"
 	"strings"
@@ -66,7 +68,13 @@ type mockControlServer struct {
 	// the caller's context is done, before replying. This proves a caller
 	// bounds the call with its own timeout instead of hanging forever
 	// (ax-9qu.11).
-	getActorDelay time.Duration
+	getActorDelay  time.Duration
+	tagPages       map[string]*ateapipb.ListTagsResponse
+	tagErr         error
+	tagCalls       int
+	deleteTagCalls int
+	templateList   []*ateapipb.ActorTemplate
+	deleteActorErr error
 }
 
 // noSecrets is a SecretResolver for tests: it never finds a key and never touches a cluster.
@@ -180,6 +188,9 @@ func (m *mockControlServer) SuspendActor(ctx context.Context, req *ateapipb.Susp
 }
 
 func (m *mockControlServer) DeleteActor(ctx context.Context, req *ateapipb.DeleteActorRequest) (*ateapipb.Actor, error) {
+	if m.deleteActorErr != nil {
+		return nil, m.deleteActorErr
+	}
 	m.deleteUID = req.GetOptions().GetUid()
 	if m.expectedDeleteUID != "" && m.deleteUID != m.expectedDeleteUID {
 		return nil, status.Error(codes.Aborted, "actor UID differs")
@@ -217,7 +228,7 @@ func TestProtectedDeleteCannotTargetReplacementActor(t *testing.T) {
 	if err := reconciler.ReconcileDelete(context.Background(), "private", "job", "original-uid"); err != nil {
 		t.Fatal(err)
 	}
-	if mock.deleteUID != "original-uid" || len(mock.deletedActors) != 1 || len(mock.deletedTemplates) != 0 {
+	if mock.deleteUID != "original-uid" || len(mock.deletedActors) != 1 || len(mock.deletedTemplates) != 0 || mock.tagCalls != 0 {
 		t.Fatal("protected identity or template retention lost")
 	}
 	mock.expectedDeleteUID = "replacement-uid"
@@ -230,13 +241,145 @@ func TestProtectedDeleteCannotTargetReplacementActor(t *testing.T) {
 }
 
 func (m *mockControlServer) ListActorTemplates(ctx context.Context, req *ateapipb.ListActorTemplatesRequest) (*ateapipb.ListActorTemplatesResponse, error) {
+	if m.templateList != nil {
+		return &ateapipb.ListActorTemplatesResponse{ActorTemplates: m.templateList}, nil
+	}
 	resp := &ateapipb.ListActorTemplatesResponse{}
 	for name := range m.actorTemplates {
 		resp.ActorTemplates = append(resp.ActorTemplates, &ateapipb.ActorTemplate{
-			Metadata: &ateapipb.ResourceMetadata{Name: name, Atespace: req.GetAtespace()},
+			Metadata: &ateapipb.ResourceMetadata{Name: name, Atespace: req.GetAtespace(), Uid: name + "-uid"},
 		})
 	}
 	return resp, nil
+}
+
+func (m *mockControlServer) ListTags(ctx context.Context, req *ateapipb.ListTagsRequest) (*ateapipb.ListTagsResponse, error) {
+	m.tagCalls++
+	if req.GetAtespace() != "" {
+		return nil, status.Error(codes.InvalidArgument, "must list all atespaces")
+	}
+	if m.tagErr != nil {
+		return nil, m.tagErr
+	}
+	if page := m.tagPages[req.GetPageToken()]; page != nil {
+		return page, nil
+	}
+	return &ateapipb.ListTagsResponse{}, nil
+}
+
+func (m *mockControlServer) DeleteTag(context.Context, *ateapipb.DeleteTagRequest) (*ateapipb.Tag, error) {
+	m.deleteTagCalls++
+	return nil, status.Error(codes.Unimplemented, "must not delete tags")
+}
+
+func TestReconcileDeleteRetainsTaggedTemplates(t *testing.T) {
+	const name = "job-tmpl-0a1b2c3d"
+	const uid = name + "-uid"
+	tag := func(space, name, uid string, complete bool) *ateapipb.Tag {
+		v := &ateapipb.Tag{Metadata: &ateapipb.ResourceMetadata{Atespace: space, Name: name}, Status: &ateapipb.TagStatus{ActorTemplateUid: uid}}
+		if complete {
+			v.Status.Snapshot = &ateapipb.ExternalSnapshot{SnapshotUri: "private-snapshot-uri"}
+		}
+		return v
+	}
+	for _, tc := range []struct {
+		name        string
+		tags        []*ateapipb.Tag
+		later, keep bool
+	}{
+		{"complete", []*ateapipb.Tag{tag("default", "backup", uid, true)}, false, true},
+		{"pending", []*ateapipb.Tag{tag("default", "backup", uid, false)}, false, true},
+		{"later page", []*ateapipb.Tag{tag("default", "backup", uid, true)}, true, true},
+		{"other atespace", []*ateapipb.Tag{tag("other", "backup", uid, true)}, false, true},
+		{"none", nil, false, false},
+		{"other UID", []*ateapipb.Tag{tag("default", "backup", "other", true)}, false, false},
+		{"owned golden", []*ateapipb.Tag{tag("ate-golden", uid, uid, true)}, false, false},
+		{"other golden name", []*ateapipb.Tag{tag("ate-golden", "user-backup", uid, true)}, false, true},
+		{"golden plus user", []*ateapipb.Tag{tag("ate-golden", uid, uid, true), tag("default", "backup", uid, true)}, false, true},
+		{"golden name elsewhere", []*ateapipb.Tag{tag("other", uid, uid, true)}, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &mockControlServer{actorTemplates: map[string]bool{name: true}, tagPages: map[string]*ateapipb.ListTagsResponse{"": {Tags: tc.tags}}}
+			if tc.later {
+				m.tagPages = map[string]*ateapipb.ListTagsResponse{"": {NextPageToken: "opaque"}, "opaque": {Tags: tc.tags}}
+			}
+			var logs bytes.Buffer
+			old := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+			defer slog.SetDefault(old)
+			if err := newTestReconciler(t, m).ReconcileDelete(context.Background(), "default", "job"); err != nil {
+				t.Fatal(err)
+			}
+			if m.actorTemplates[name] != tc.keep {
+				t.Fatalf("template retained=%v, want %v", m.actorTemplates[name], tc.keep)
+			}
+			if len(m.deletedActors) != 1 || m.deleteTagCalls != 0 {
+				t.Fatal("actor or tag deletion differs")
+			}
+			if tc.keep {
+				for _, want := range []string{"atespace=default", "task=job", "template=" + name, "template_uid=" + uid, "reason=tag_reference"} {
+					if !strings.Contains(logs.String(), want) {
+						t.Errorf("log lacks %s", want)
+					}
+				}
+			}
+			if strings.Contains(logs.String(), "private-snapshot-uri") {
+				t.Fatal("snapshot URI in log")
+			}
+		})
+	}
+}
+
+func TestReconcileDeleteTagInventoryFailure(t *testing.T) {
+	valid := &ateapipb.Tag{Metadata: &ateapipb.ResourceMetadata{Name: "backup", Atespace: "default"}, Status: &ateapipb.TagStatus{ActorTemplateUid: "other"}}
+	for _, tc := range []struct {
+		name       string
+		tag        *ateapipb.Tag
+		err        error
+		missingUID bool
+	}{
+		{"RPC", valid, status.Error(codes.Unavailable, "private-snapshot-uri"), false},
+		{"cancel", valid, status.Error(codes.Canceled, "private-snapshot-uri"), false},
+		{"nil", nil, nil, false},
+		{"metadata", &ateapipb.Tag{Status: valid.Status}, nil, false},
+		{"name", &ateapipb.Tag{Metadata: &ateapipb.ResourceMetadata{Atespace: "default"}, Status: valid.Status}, nil, false},
+		{"atespace", &ateapipb.Tag{Metadata: &ateapipb.ResourceMetadata{Name: "backup"}, Status: valid.Status}, nil, false},
+		{"template UID", &ateapipb.Tag{Metadata: valid.Metadata}, nil, false},
+		{"candidate UID", valid, nil, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &mockControlServer{tagErr: tc.err, tagPages: map[string]*ateapipb.ListTagsResponse{"": {NextPageToken: "later"}, "later": {Tags: []*ateapipb.Tag{tc.tag}}}, templateList: []*ateapipb.ActorTemplate{
+				{Metadata: &ateapipb.ResourceMetadata{Name: "job-tmpl-0a1b2c3d", Uid: "one"}},
+				{Metadata: &ateapipb.ResourceMetadata{Name: "job-tmpl-deadbeef", Uid: "two"}},
+			}}
+			if tc.missingUID {
+				m.templateList[1].Metadata.Uid = ""
+			}
+			var logs bytes.Buffer
+			old := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+			defer slog.SetDefault(old)
+			if err := newTestReconciler(t, m).ReconcileDelete(context.Background(), "default", "job"); err != nil {
+				t.Fatal(err)
+			}
+			if len(m.deletedTemplates) != 0 || len(m.deletedActors) != 1 {
+				t.Fatal("cleanup did not fail closed after actor delete")
+			}
+			if !strings.Contains(logs.String(), "could not clean up actor templates for task") || strings.Contains(logs.String(), "private-snapshot-uri") {
+				t.Fatal("unsafe or absent cleanup warning")
+			}
+		})
+	}
+}
+
+func TestReconcileDeleteActorFailureSkipsTemplates(t *testing.T) {
+	m := &mockControlServer{deleteActorErr: status.Error(codes.Unavailable, "delete failed")}
+	if err := newTestReconciler(t, m).ReconcileDelete(context.Background(), "default", "job"); status.Code(err) != codes.Unavailable {
+		t.Fatalf("want actor delete error, got %v", err)
+	}
+	if m.tagCalls != 0 || len(m.deletedTemplates) != 0 {
+		t.Fatal("cleanup followed failed actor delete")
+	}
 }
 
 func (m *mockControlServer) DeleteActorTemplate(ctx context.Context, req *ateapipb.DeleteActorTemplateRequest) (*ateapipb.ActorTemplate, error) {
