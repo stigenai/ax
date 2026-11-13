@@ -15,11 +15,106 @@
 package substrate
 
 import (
+	"context"
 	"testing"
 
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"github.com/google/ax/pkg/apis/v1alpha1"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
+
+type tagListClient struct {
+	ateapipb.ControlClient
+	list func(context.Context, *ateapipb.ListTagsRequest) (*ateapipb.ListTagsResponse, error)
+}
+
+func (c tagListClient) ListTags(ctx context.Context, req *ateapipb.ListTagsRequest, _ ...grpc.CallOption) (*ateapipb.ListTagsResponse, error) {
+	return c.list(ctx, req)
+}
+
+func TestListTagsPages(t *testing.T) {
+	for _, space := range []string{"", "explicit"} {
+		for _, count := range []int{0, 1, 2, 4} {
+			t.Run(space+"/"+string(rune('0'+count)), func(t *testing.T) {
+				tokens := []string{"", "opaque/one", "opaque two", "opaque:three"}
+				calls := 0
+				client := &Client{control: tagListClient{list: func(ctx context.Context, req *ateapipb.ListTagsRequest) (*ateapipb.ListTagsResponse, error) {
+					if req.GetAtespace() != space || req.GetPageSize() != 500 || calls >= len(tokens) || req.GetPageToken() != tokens[calls] {
+						t.Fatalf("unexpected request: %v", req)
+					}
+					calls++
+					resp := &ateapipb.ListTagsResponse{}
+					if count > 0 && calls == 1 {
+						resp.Tags = []*ateapipb.Tag{{Metadata: &ateapipb.ResourceMetadata{Name: "first"}}}
+					}
+					if count > 2 && calls == 3 {
+						resp.Tags = []*ateapipb.Tag{{Metadata: &ateapipb.ResourceMetadata{Name: "last"}}}
+					}
+					if calls < count {
+						resp.NextPageToken = tokens[calls]
+					}
+					return resp, nil
+				}}}
+				tags, err := client.ListTags(context.Background(), space)
+				want := 0
+				if count > 0 {
+					want = 1
+				}
+				if count > 2 {
+					want = 2
+				}
+				if err != nil || len(tags) != want || calls != max(1, count) {
+					t.Fatalf("tags=%v calls=%d error=%v", tags, calls, err)
+				}
+				if want > 0 && tags[0].GetMetadata().GetName() != "first" {
+					t.Fatal("lost first page")
+				}
+				if want > 1 && tags[1].GetMetadata().GetName() != "last" {
+					t.Fatal("lost later page")
+				}
+			})
+		}
+	}
+}
+
+func TestListTagsFailure(t *testing.T) {
+	for _, mode := range []string{"RPC", "cancel", "repeat", "cycle"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			calls := 0
+			client := &Client{control: tagListClient{list: func(ctx context.Context, req *ateapipb.ListTagsRequest) (*ateapipb.ListTagsResponse, error) {
+				calls++
+				if calls > 3 {
+					t.Fatal("did not stop after repeated token")
+				}
+				if calls == 2 && mode == "RPC" {
+					return nil, status.Error(codes.PermissionDenied, "RPC failed")
+				}
+				if mode == "cancel" {
+					cancel()
+				}
+				token := "one"
+				if mode == "cycle" && calls == 2 {
+					token = "two"
+				}
+				return &ateapipb.ListTagsResponse{Tags: []*ateapipb.Tag{{}}, NextPageToken: token}, nil
+			}}}
+			tags, err := client.ListTags(ctx, "")
+			if err == nil || tags != nil {
+				t.Fatalf("want error without partial inventory, got %v, %v", tags, err)
+			}
+			if mode == "RPC" && status.Code(err) != codes.PermissionDenied {
+				t.Fatalf("lost RPC status: %v", err)
+			}
+			if mode == "cancel" && status.Code(err) != codes.Canceled {
+				t.Fatalf("lost cancellation: %v", err)
+			}
+		})
+	}
+}
 
 // limitQuantity returns the quantity string for a named limit, or "" if the
 // limit is absent.
