@@ -33,6 +33,7 @@ spec:
   debug: true   # serve guest services inside the sandbox so `ax ssh` works; off by default
   capabilities: ["SETUID", "SETGID"]   # added to the container's default set; see below
   sandboxClass: gvisor   # gvisor (default) or microvm; see below
+  guestDevices: [fuse]   # microvm only: add /dev/fuse to the guest; see below
 ```
 
 ### Capabilities
@@ -44,6 +45,14 @@ The task container starts as root with Substrate's default capabilities, `AUDIT_
 `spec.sandboxClass` selects the Substrate sandbox for the task actor. Empty or `gvisor` uses gVisor and the `gvisor-default` SandboxConfig. `microvm` uses a Cloud Hypervisor guest with a real Linux kernel and the cluster-scoped SandboxConfig named `microvm`. Use `microvm` for work that gVisor cannot run, such as Nix builds. A `microvm` task stays pending until a WorkerPool with `sandboxClass: microvm` has a free worker. The Fabriek supervisor profile rejects `microvm`.
 
 A root Nix build inside a `microvm` task also needs capabilities, because Nix changes the owner of `/nix/store` and starts its builds as the `nixbld` users. In a test on 2026-10-26, a build with these capabilities passed: `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `FSETID`, `SETUID`, `SETGID`, `SETPCAP`, `SETFCAP`, `MKNOD`, `SYS_ADMIN`, `SYS_CHROOT` and `SYS_PTRACE`. A smaller set was not tested.
+
+### Guest devices
+
+`spec.guestDevices` adds device nodes to the guest of a `microvm` task. The only value is `fuse`, which adds `/dev/fuse` for FUSE filesystems such as LayerFS. AX refuses the field on other sandbox classes.
+
+For each device, the task's ActorTemplate selects WorkerPools with the label `ate.dev/guest-device-<name>: "true"`. The operator puts that label on a `microvm` WorkerPool that sets the same Substrate `spec.guestDevices`. If no such pool has a free worker, the task stays pending. A FUSE mount also needs `SYS_ADMIN` in `spec.capabilities`. LayerFS also needs `SETUID` and `SETGID`, because it runs its command as a non-root user.
+
+A `microvm` task without `guestDevices` has no WorkerSelector, so it can also run on a FUSE pool.
 
 ### Binding several workspaces
 
