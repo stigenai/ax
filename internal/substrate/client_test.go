@@ -139,7 +139,7 @@ func TestBuildActorTemplateResources(t *testing.T) {
 		resources := &v1alpha1.ResourceReqs{
 			Limits: &v1alpha1.ResourceList{Memory: "4Gi"},
 		}
-		tmpl := BuildActorTemplate("atespace", "name", "image", nil, nil, "", "", "", resources, nil)
+		tmpl := BuildActorTemplate("atespace", "name", "image", nil, nil, "", "", "", nil, resources, nil)
 
 		if tmpl.GetResources() == nil {
 			t.Fatalf("want top-level Resources set, got nil")
@@ -154,7 +154,7 @@ func TestBuildActorTemplateResources(t *testing.T) {
 	})
 
 	t.Run("nil resources gives nil top-level Resources", func(t *testing.T) {
-		tmpl := BuildActorTemplate("atespace", "name", "image", nil, nil, "", "", "", nil, nil)
+		tmpl := BuildActorTemplate("atespace", "name", "image", nil, nil, "", "", "", nil, nil, nil)
 		if tmpl.GetResources() != nil {
 			t.Fatalf("want nil top-level Resources, got %v", tmpl.GetResources())
 		}
@@ -164,7 +164,7 @@ func TestBuildActorTemplateResources(t *testing.T) {
 		resources := &v1alpha1.ResourceReqs{
 			Limits: &v1alpha1.ResourceList{Cpu: "2"},
 		}
-		tmpl := BuildActorTemplate("atespace", "name", "image", nil, nil, "", "", "", resources, nil)
+		tmpl := BuildActorTemplate("atespace", "name", "image", nil, nil, "", "", "", nil, resources, nil)
 
 		got := tmpl.GetResources().GetLimits()
 		if len(got) != 1 || limitQuantity(got, "cpu") != "2" {
@@ -176,7 +176,7 @@ func TestBuildActorTemplateResources(t *testing.T) {
 		resources := &v1alpha1.ResourceReqs{
 			Limits: &v1alpha1.ResourceList{Cpu: "1", Memory: "2Gi"},
 		}
-		tmpl := BuildActorTemplate("atespace", "name", "image", nil, nil, "", v1alpha1.FabriekSupervisorProfile, "", resources, nil)
+		tmpl := BuildActorTemplate("atespace", "name", "image", nil, nil, "", v1alpha1.FabriekSupervisorProfile, "", nil, resources, nil)
 
 		gotTop := tmpl.GetResources().GetLimits()
 		if len(gotTop) != 2 || limitQuantity(gotTop, "cpu") != "1" || limitQuantity(gotTop, "memory") != "2Gi" {
@@ -199,9 +199,20 @@ func TestBuildActorTemplateSandboxClass(t *testing.T) {
 		{v1alpha1.SandboxClassGVisor, ateapipb.SandboxClass_SANDBOX_CLASS_GVISOR, "gvisor-default"},
 		{v1alpha1.SandboxClassMicroVM, ateapipb.SandboxClass_SANDBOX_CLASS_MICROVM, "microvm"},
 	} {
-		got := BuildActorTemplate("atespace", "name", "image", nil, nil, "", "", tc.sandboxClass, nil, nil).GetSandboxConfig()
+		got := BuildActorTemplate("atespace", "name", "image", nil, nil, "", "", tc.sandboxClass, nil, nil, nil).GetSandboxConfig()
 		if got.GetSandboxClass() != tc.wantClass || got.GetConfigName() != tc.wantConfig {
 			t.Errorf("sandboxClass %q: got %v, want %v/%s", tc.sandboxClass, got, tc.wantClass, tc.wantConfig)
 		}
+	}
+}
+
+// A guest device makes the template select the pools that carry its label.
+func TestBuildActorTemplateGuestDevices(t *testing.T) {
+	if got := BuildActorTemplate("atespace", "name", "image", nil, nil, "", "", v1alpha1.SandboxClassMicroVM, nil, nil, nil).GetWorkerSelector(); got != nil {
+		t.Errorf("no guest devices: WorkerSelector = %v, want nil", got)
+	}
+	got := BuildActorTemplate("atespace", "name", "image", nil, nil, "", "", v1alpha1.SandboxClassMicroVM, []string{v1alpha1.GuestDeviceFUSE}, nil, nil).GetWorkerSelector().GetMatchLabels()
+	if len(got) != 1 || got["ate.dev/guest-device-fuse"] != "true" {
+		t.Errorf("fuse: MatchLabels = %v, want only ate.dev/guest-device-fuse=true", got)
 	}
 }

@@ -606,6 +606,29 @@ func TestValidateTaskSandboxClass(t *testing.T) {
 	}
 }
 
+func TestValidateTaskGuestDevices(t *testing.T) {
+	fuse := []string{v1alpha1.GuestDeviceFUSE}
+	for name, tc := range map[string]struct {
+		class   string
+		devices []string
+		wantErr bool
+	}{
+		"none":         {"", nil, false},
+		"fuse microvm": {v1alpha1.SandboxClassMicroVM, fuse, false},
+		"fuse gvisor":  {v1alpha1.SandboxClassGVisor, fuse, true},
+		"fuse default": {"", fuse, true},
+		"unknown":      {v1alpha1.SandboxClassMicroVM, []string{"kvm"}, true},
+	} {
+		err := v1alpha1.ValidateTask(&v1alpha1.Task{Spec: &v1alpha1.TaskSpec{SandboxClass: tc.class, GuestDevices: tc.devices}})
+		if (err != nil) != tc.wantErr {
+			t.Errorf("%s: error = %v, want error %v", name, err, tc.wantErr)
+		}
+	}
+	if (&v1alpha1.TaskSpec{}).ProtoReflect().Descriptor().Fields().ByName("guest_devices").Number() != 14 {
+		t.Fatal("guest_devices protobuf field number changed")
+	}
+}
+
 func TestValidateFabriekSupervisor(t *testing.T) {
 	valid := func() *v1alpha1.Task {
 		return &v1alpha1.Task{Spec: &v1alpha1.TaskSpec{

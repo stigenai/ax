@@ -46,6 +46,10 @@ const (
 	SandboxClassGVisor  = "gvisor"
 	SandboxClassMicroVM = "microvm"
 
+	// GuestDeviceFUSE is the only device a microvm task can name in
+	// spec.guestDevices.
+	GuestDeviceFUSE = "fuse"
+
 	// PhaseTerminating marks a task whose deletion has been requested and whose
 	// actor is being torn down. The record disappears once cleanup completes.
 	PhaseTerminating = "Terminating"
@@ -270,6 +274,14 @@ func ValidateTask(t *Task) error {
 	default:
 		return fmt.Errorf("spec.sandboxClass: %q is not one of %q, %q", spec.GetSandboxClass(), SandboxClassGVisor, SandboxClassMicroVM)
 	}
+	for i, d := range spec.GetGuestDevices() {
+		if d != GuestDeviceFUSE {
+			return fmt.Errorf("spec.guestDevices[%d]: %q is not %q", i, d, GuestDeviceFUSE)
+		}
+	}
+	if len(spec.GetGuestDevices()) > 0 && spec.GetSandboxClass() != SandboxClassMicroVM {
+		return fmt.Errorf("spec.guestDevices requires spec.sandboxClass %q", SandboxClassMicroVM)
+	}
 	refs := spec.WorkspaceRefs()
 	paths := spec.WorkspacePaths()
 	names := make(map[string]bool, len(refs))
@@ -451,4 +463,10 @@ func ValidateSupervisorWorkspaces(task *Task, workspaces []*Workspace) error {
 		}
 	}
 	return nil
+}
+
+// GuestDeviceLabel is the WorkerPool label that a task with the guest device d
+// selects, with the value "true".
+func GuestDeviceLabel(d string) string {
+	return "ate.dev/guest-device-" + d
 }

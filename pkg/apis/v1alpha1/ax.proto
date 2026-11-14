@@ -102,6 +102,12 @@ message TaskSpec {
   // A microvm task needs a WorkerPool with sandboxClass microvm and the
   // cluster-scoped SandboxConfig named "microvm".
   string sandbox_class = 13;
+  // guest_devices adds device nodes to a microvm task's guest. The only value
+  // is "fuse" (/dev/fuse). For each device, the task's ActorTemplate selects
+  // WorkerPools with the label ate.dev/guest-device-<name>: "true". The
+  // operator puts that label on a pool with the same Substrate
+  // spec.guestDevices. A FUSE mount also needs SYS_ADMIN in capabilities.
+  repeated string guest_devices = 14;
 }
 
 message EnvVar {
