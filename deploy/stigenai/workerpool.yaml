@@ -31,8 +31,12 @@ spec:
   # (Nix builds). Two hs-2 workers go: 29 workers hold 58 tasks (24 ran then),
   # and hs-2 gets 4 CPU back for microvm workers (1 CPU, 16Gi each).
   #
+  # On 2026-11-14 hs-2 went offline (with the DGX Sparks). Its 16 workers go:
+  # gtr-150, gtr-151 and gtr-152 hold the other 13, and their memory is about
+  # 90% requested. To bring hs-2 back, set replicas to 29 again.
+  #
   # The comments below still describe the 6-worker sizing.
-  replicas: 29
+  replicas: 13
   workerImage: ghcr.io/stigenai/substrate/ateom-gvisor:v0.3.0-stigenai.2@sha256:9c4721241aaf7da1dd8832467c0e6bf472a1c8a18233ac206d3b7535f44c6dc1
   template:
     nodeSelector:
