@@ -720,7 +720,7 @@ func projectTaskTag(tag *ateapipb.Tag, atespace, name, source string) (*TaskTag,
 		created = timestamp.AsTime()
 	}
 	snapshot := state.GetSnapshot()
-	if snapshot.GetSnapshotUri() != "" && snapshot.GetActorTemplateUid() != state.GetActorTemplateUid() {
+	if snapshot.GetSnapshotUri() != "" && snapshot.GetActorTemplateUid() != "" && snapshot.GetActorTemplateUid() != state.GetActorTemplateUid() {
 		return nil, bad
 	}
 	if tag.GetScope() == ateapipb.TagScope_TAG_SCOPE_PUBLISHED {
