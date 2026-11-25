@@ -45,8 +45,10 @@ const (
 	DefaultWorkspacePath = v1alpha1.DefaultWorkspacePath
 
 	// stopGracePeriod is how long a running task command gets to exit after
-	// SIGTERM before it is killed during shutdown.
-	stopGracePeriod = 10 * time.Second
+	// SIGTERM before it is killed during shutdown. A node drain or a Spot
+	// interruption stops a task this way, and the command can need this time
+	// to save its work. It must stay below the 2-minute Spot notice.
+	stopGracePeriod = 90 * time.Second
 )
 
 // Config controls a single Run.
