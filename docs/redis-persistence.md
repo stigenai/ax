@@ -74,6 +74,7 @@ A plain apply of the new manifest starts Redis with 0 keys. Redis with `--append
    ```bash
    kubectl --context gtr -n ax-system exec deploy/ax-redis -- redis-cli SAVE
    kubectl --context gtr -n ax-system cp "$(kubectl --context gtr -n ax-system get pod -l app.kubernetes.io/name=ax-redis -o name | cut -d/ -f2)":/data/dump.rdb ./ax-redis-before.rdb
+   chmod 600 ax-redis-before.rdb
    ls -l ax-redis-before.rdb
    kubectl --context gtr -n ax-system exec deploy/ax-redis -- redis-cli DBSIZE
    ```
