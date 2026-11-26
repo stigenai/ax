@@ -35,8 +35,14 @@ spec:
   # gtr-150, gtr-151 and gtr-152 hold the other 13, and their memory is about
   # 90% requested. To bring hs-2 back, set replicas to 29 again.
   #
+  # On 2026-11-25 one worker moves to WorkerPool sluis (nix-fleet-hosts
+  # flux/apps/overlays/nixfleet/ax-sluis): the factory filled all 13, and sluis
+  # reviews waited 20 min and failed. The nodes have no memory for a 14th.
+  # Tasks with no spec.workerLabels get workload=ax from ax-server
+  # (AX_DEFAULT_WORKER_LABELS), so they stay here. With hs-2 back: 28 here.
+  #
   # The comments below still describe the 6-worker sizing.
-  replicas: 13
+  replicas: 12
   workerImage: ghcr.io/stigenai/substrate/ateom-gvisor:v0.3.0-stigenai.2@sha256:9c4721241aaf7da1dd8832467c0e6bf472a1c8a18233ac206d3b7535f44c6dc1
   template:
     nodeSelector:
