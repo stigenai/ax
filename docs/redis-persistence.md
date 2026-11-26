@@ -143,9 +143,16 @@ Keep the private work directory and its files. This includes `ax-redis-before.rd
 
 If a check fails or the owner has not accepted the outcome, keep the files. After the migration or rollback checks pass and the owner accepts that outcome, the migration operator must do these steps.
 
-1. Leave the private work directory.
-2. Remove the private work directory and its contents with `rm -r "$WORK"`.
-3. Run `test ! -e "$WORK"`. The command must exit 0.
+1. In the private work directory, remove the dump, each inventory file and each saved task output file by name.
+2. Leave the private work directory.
+3. Remove the empty directory. If `rmdir` fails, check which files remain before you remove them.
+4. Verify that the directory is absent. The `test` command must exit 0.
+
+   ```bash
+   cd "$WORK/.." &&
+     rmdir -- "$WORK" &&
+     test ! -e "$WORK"
+   ```
 
 ## Restart check
 
