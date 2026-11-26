@@ -60,7 +60,7 @@ jobs:
             echo "- Merge base: $(git log -1 --format='%h %cs' "$base")"
             echo
           } >> "$GITHUB_STEP_SUMMARY"
-          if git merge --no-edit --no-ff FETCH_HEAD > /dev/null; then
+          if git merge --no-edit --no-ff FETCH_HEAD; then
             echo "Merge: clean" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
