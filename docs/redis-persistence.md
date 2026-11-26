@@ -88,6 +88,8 @@ A plain apply of the new manifest starts Redis with 0 keys. Redis with `--append
    kubectl --context gtr -n ax-system rollout status deploy/ax-redis
    ```
 
+   The container has a readiness probe (`redis-cli ping`). The rollout finishes only when Redis answers `PONG`, not `LOADING`.
+
    The new pod has an empty `/data`. If the claim stays Pending, stop and go to "Rollback".
 
 4. Seed. Copy the saved file to a temporary directory in the pod. Start a second Redis on port 6380 with it. Make the main Redis a replica of it. Then make the main Redis a master again.

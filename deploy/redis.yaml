@@ -69,6 +69,16 @@ spec:
           ports:
             - containerPort: 6379
               name: redis
+          # PING gives LOADING while Redis reads the AOF. Only PONG is ready.
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - '[ "$(redis-cli ping)" = PONG ]'
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
           volumeMounts:
             - name: data
               mountPath: /data

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Restart test for the ax-redis manifest (ax-vnr).
 #
-# 1. Static: deploy/redis.yaml has a PVC, strategy Recreate, AOF args and a
-#    /data mount from that PVC.
+# 1. Static: deploy/redis.yaml has a PVC, strategy Recreate, AOF args, a
+#    /data mount from that PVC and a readinessProbe (redis-cli ping).
 # 2. Dynamic: start Redis with the args of the manifest, write task keys, a
 #    stream entry, a consumer group and a pending entry. Then do a SIGKILL
 #    (container crash) and a SHUTDOWN NOSAVE (pod restart), each followed by a
@@ -39,6 +39,8 @@ claim=$(q "$dep | .spec.template.spec.volumes[] | select(.name == \"$vol\") | .p
 { [ "$claim" != null ] && [ -n "$claim" ]; } || fail "volume $vol must be a persistentVolumeClaim"
 [ "$(q "select(.kind == \"PersistentVolumeClaim\" and .metadata.name == \"$claim\") | .metadata.name")" = "$claim" ] ||
   fail "claim $claim is not a PersistentVolumeClaim in $manifest"
+probe=$(q "$ctr | .readinessProbe.exec.command // [] | join(\" \")")
+case "$probe" in *"redis-cli ping"*) ;; *) fail "container redis must have a readinessProbe that runs redis-cli ping" ;; esac
 echo "static checks ok"
 
 # --- dynamic checks ---
