@@ -65,6 +65,198 @@ func addTestEvent(t *testing.T, ctx context.Context, client *redisclient.Client,
 	return id
 }
 
+type recoveryCommandHook struct {
+	command string
+	noGroup bool
+}
+
+func (h *recoveryCommandHook) DialHook(next redisclient.DialHook) redisclient.DialHook {
+	return next
+}
+
+func (h *recoveryCommandHook) ProcessPipelineHook(next redisclient.ProcessPipelineHook) redisclient.ProcessPipelineHook {
+	return next
+}
+
+func (h *recoveryCommandHook) ProcessHook(next redisclient.ProcessHook) redisclient.ProcessHook {
+	return func(ctx context.Context, cmd redisclient.Cmder) error {
+		err := next(ctx, cmd)
+		if cmd.Name() == h.command && redisclient.HasErrorPrefix(err, "NOGROUP") {
+			h.noGroup = true
+		}
+		return err
+	}
+}
+
+func TestGroupRecoveryOrder(t *testing.T) {
+	t.Run("first_setup", func(t *testing.T) {
+		s, client := newClaimTestStore(t, "first-setup", Options{ReadBlock: 20 * time.Millisecond})
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		addTestEvent(t, ctx, client, s.opts.StreamName, "before-setup")
+		sub, err := s.Subscribe(ctx, "group", "first")
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := addTestEvent(t, ctx, client, s.opts.StreamName, "after-setup")
+		if ev, err := sub.Next(ctx); err != nil || ev.ID != want {
+			t.Fatalf("Next = %q, %v; want %q", ev.ID, err, want)
+		}
+	})
+
+	for _, loss := range []string{"full_loss", "saved_checkpoint", "missing_checkpoint"} {
+		for _, winner := range []string{"fresh_first", "active_first"} {
+			for _, command := range []string{"xreadgroup", "xautoclaim"} {
+				t.Run(loss+"/"+winner+"/"+command, func(t *testing.T) {
+					testGroupRecoveryOrder(t, loss, winner, command)
+				})
+			}
+		}
+	}
+}
+
+func testGroupRecoveryOrder(t *testing.T, loss, winner, command string) {
+	t.Helper()
+	const group = "group"
+	opts := Options{ReadBatchSize: 1, ReadBlock: 20 * time.Millisecond, ClaimMinIdle: 10 * time.Millisecond, ClaimInterval: time.Millisecond}
+	fresh, freshClient := newClaimTestStore(t, "recovery-order", opts)
+	stream := fresh.opts.StreamName
+	checkpoint := fmt.Sprintf("ax:stream-checkpoint:%d:%s:%s", len(stream), stream, group)
+	client := redisclient.NewClient(&redisclient.Options{Addr: freshClient.Options().Addr})
+	t.Cleanup(func() { client.Close() })
+	activeClient := redisclient.NewClient(&redisclient.Options{Addr: freshClient.Options().Addr})
+	t.Cleanup(func() { activeClient.Close() })
+	hook := &recoveryCommandHook{command: command}
+	activeClient.AddHook(hook)
+	activeOpts := fresh.opts
+	if command == "xreadgroup" {
+		activeOpts.ClaimMinIdle = -1
+	}
+	active := NewStore(activeClient, activeOpts)
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	joined, err := active.Subscribe(ctx, group, t.Name()+"/active")
+	if err != nil {
+		t.Fatal(err)
+	}
+	activeSub := joined.(*subscription)
+	deletedID, err := client.XAdd(ctx, &redisclient.XAddArgs{
+		Stream: stream,
+		ID:     "1-0",
+		Values: map[string]interface{}{"action": "delete", "namespace": "private", "name": "old-task"},
+	}).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ev, err := activeSub.Next(ctx)
+	if err != nil || ev.ID != deletedID {
+		t.Fatalf("legacy delete = %q, %v; want %q", ev.ID, err, deletedID)
+	}
+	if err := activeSub.Ack(ctx, ev); err != nil {
+		t.Fatal(err)
+	}
+	want := make(map[string]bool)
+	if loss == "saved_checkpoint" {
+		id := addTestEvent(t, ctx, client, stream, "pending")
+		if ev, err := activeSub.Next(ctx); err != nil || ev.ID != id {
+			t.Fatalf("pending event = %q, %v; want %q", ev.ID, err, id)
+		}
+		want[id] = true
+	}
+
+	// Neither client starts another operation until XADD returns the marker ID.
+	if n, err := client.XGroupDestroy(ctx, stream, group).Result(); err != nil || n != 1 {
+		t.Fatalf("XGROUP DESTROY = %d, %v; want 1", n, err)
+	}
+	if loss != "saved_checkpoint" {
+		if err := client.Del(ctx, checkpoint).Err(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if loss == "full_loss" {
+		if err := client.Del(ctx, stream).Err(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	marker := addTestEvent(t, ctx, client, stream, "outage")
+	want[marker] = true
+
+	var freshSub *subscription
+	resumeFresh := func() error {
+		sub, err := fresh.Subscribe(ctx, group, t.Name()+"/fresh")
+		if err == nil {
+			freshSub = sub.(*subscription)
+		}
+		return err
+	}
+	resumeActive := func() (err error) {
+		if command == "xautoclaim" {
+			activeSub.lastClaim = time.Time{}
+			activeSub.pending, err = activeSub.claim(ctx)
+		} else {
+			activeSub.pending, err = activeSub.read(ctx)
+		}
+		return err
+	}
+	// Each call returns before the next client can attempt recovery.
+	var freshErr, activeErr error
+	if winner == "fresh_first" {
+		freshErr = resumeFresh()
+		activeErr = resumeActive()
+	} else {
+		activeErr = resumeActive()
+		freshErr = resumeFresh()
+	}
+	if loss == "missing_checkpoint" {
+		if freshErr == nil || activeErr == nil {
+			t.Errorf("ambiguous state must produce two errors; Subscribe = %v, %s = %v", freshErr, command, activeErr)
+		}
+		groups, err := client.XInfoGroups(ctx, stream).Result()
+		if err != nil || len(groups) != 0 {
+			t.Errorf("XINFO GROUPS = %v, %v; want no groups", groups, err)
+		}
+		msgs, err := client.XRange(ctx, stream, "-", "+").Result()
+		if err != nil || len(msgs) != 2 || msgs[0].ID != deletedID || msgs[1].ID != marker {
+			t.Errorf("stream must retain legacy delete %q and marker %q; got %v, %v", deletedID, marker, msgs, err)
+		}
+		if !hook.noGroup {
+			t.Errorf("%s did not encounter NOGROUP", command)
+		}
+		return
+	}
+	if freshErr != nil || activeErr != nil {
+		t.Fatalf("Subscribe = %v, %s = %v", freshErr, command, activeErr)
+	}
+	if hook.noGroup != (winner == "active_first") {
+		t.Fatalf("%s NOGROUP = %t in %s", command, hook.noGroup, winner)
+	}
+	for len(want) > 0 {
+		sub := freshSub
+		if len(activeSub.pending) > 0 {
+			sub = activeSub
+		}
+		readCtx, stop := context.WithTimeout(ctx, time.Second)
+		ev, err := sub.Next(readCtx)
+		stop()
+		if err != nil || !want[ev.ID] {
+			t.Fatalf("Next = %q, %v; want remaining IDs %v; acknowledged delete = %q", ev.ID, err, want, deletedID)
+		}
+		delete(want, ev.ID)
+		if err := sub.Ack(ctx, ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+	readCtx, stop := context.WithTimeout(ctx, 150*time.Millisecond)
+	defer stop()
+	if ev, err := freshSub.Next(readCtx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("extra delivery = %q, %v; want deadline", ev.ID, err)
+	}
+	pending, err := client.XPending(ctx, stream, group).Result()
+	if err != nil || pending.Count != 0 {
+		t.Errorf("XPENDING = %v, %v; want no pending entries", pending, err)
+	}
+}
+
 // AC1: consumer A reads an event and never acks it. Consumer B, in the same
 // group, must get the same event id from Next within 2s once it has gone
 // idle for ClaimMinIdle. After B acks it, XPENDING must show 0 entries.
