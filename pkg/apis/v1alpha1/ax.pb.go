@@ -200,7 +200,11 @@ type TaskSpec struct {
 	// with a real Linux kernel, for work gVisor cannot run, such as Nix builds).
 	// A microvm task needs a WorkerPool with sandboxClass microvm and the
 	// cluster-scoped SandboxConfig named "microvm".
-	SandboxClass  string `protobuf:"bytes,13,opt,name=sandbox_class,json=sandboxClass,proto3" json:"sandbox_class,omitempty"`
+	SandboxClass string `protobuf:"bytes,13,opt,name=sandbox_class,json=sandboxClass,proto3" json:"sandbox_class,omitempty"`
+	// worker_labels pin the task to workers: it runs only on workers whose
+	// WorkerPool labels contain all these pairs. Empty means the server default
+	// (AX_DEFAULT_WORKER_LABELS on ax-controller).
+	WorkerLabels  map[string]string `protobuf:"bytes,14,rep,name=worker_labels,json=workerLabels,proto3" json:"worker_labels,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -303,6 +307,13 @@ func (x *TaskSpec) GetSandboxClass() string {
 		return x.SandboxClass
 	}
 	return ""
+}
+
+func (x *TaskSpec) GetWorkerLabels() map[string]string {
+	if x != nil {
+		return x.WorkerLabels
+	}
+	return nil
 }
 
 type EnvVar struct {
@@ -2572,7 +2583,7 @@ const file_pkg_apis_v1alpha1_ax_proto_rawDesc = "" +
 	"\x04kind\x18\x02 \x01(\tR\x04kind\x123\n" +
 	"\bmetadata\x18\x03 \x01(\v2\x17.ax.v1alpha1.ObjectMetaR\bmetadata\x12)\n" +
 	"\x04spec\x18\x04 \x01(\v2\x15.ax.v1alpha1.TaskSpecR\x04spec\x12/\n" +
-	"\x06status\x18\x05 \x01(\v2\x17.ax.v1alpha1.TaskStatusR\x06status\"\xa8\x03\n" +
+	"\x06status\x18\x05 \x01(\v2\x17.ax.v1alpha1.TaskStatusR\x06status\"\xb7\x04\n" +
 	"\bTaskSpec\x12\x18\n" +
 	"\asuspend\x18\x02 \x01(\bR\asuspend\x12\x14\n" +
 	"\x05image\x18\x03 \x01(\tR\x05image\x12\x18\n" +
@@ -2586,7 +2597,11 @@ const file_pkg_apis_v1alpha1_ax_proto_rawDesc = "" +
 	" \x01(\bR\x05debug\x12\"\n" +
 	"\fcapabilities\x18\v \x03(\tR\fcapabilities\x12-\n" +
 	"\x12supervisor_profile\x18\f \x01(\tR\x11supervisorProfile\x12#\n" +
-	"\rsandbox_class\x18\r \x01(\tR\fsandboxClassJ\x04\b\x01\x10\x02J\x04\b\b\x10\tJ\x04\b\t\x10\n" +
+	"\rsandbox_class\x18\r \x01(\tR\fsandboxClass\x12L\n" +
+	"\rworker_labels\x18\x0e \x03(\v2'.ax.v1alpha1.TaskSpec.WorkerLabelsEntryR\fworkerLabels\x1a?\n" +
+	"\x11WorkerLabelsEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b\x01\x10\x02J\x04\b\b\x10\tJ\x04\b\t\x10\n" +
 	"R\x04goalR\agatewayR\bpolicies\"2\n" +
 	"\x06EnvVar\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x14\n" +
@@ -2774,7 +2789,7 @@ func file_pkg_apis_v1alpha1_ax_proto_rawDescGZIP() []byte {
 	return file_pkg_apis_v1alpha1_ax_proto_rawDescData
 }
 
-var file_pkg_apis_v1alpha1_ax_proto_msgTypes = make([]protoimpl.MessageInfo, 44)
+var file_pkg_apis_v1alpha1_ax_proto_msgTypes = make([]protoimpl.MessageInfo, 45)
 var file_pkg_apis_v1alpha1_ax_proto_goTypes = []any{
 	(*ObjectMeta)(nil),              // 0: ax.v1alpha1.ObjectMeta
 	(*Task)(nil),                    // 1: ax.v1alpha1.Task
@@ -2820,79 +2835,81 @@ var file_pkg_apis_v1alpha1_ax_proto_goTypes = []any{
 	(*UpdateModelRequest)(nil),      // 41: ax.v1alpha1.UpdateModelRequest
 	(*DeleteModelRequest)(nil),      // 42: ax.v1alpha1.DeleteModelRequest
 	(*DeleteModelResponse)(nil),     // 43: ax.v1alpha1.DeleteModelResponse
-	(*timestamppb.Timestamp)(nil),   // 44: google.protobuf.Timestamp
-	(*structpb.Struct)(nil),         // 45: google.protobuf.Struct
+	nil,                             // 44: ax.v1alpha1.TaskSpec.WorkerLabelsEntry
+	(*timestamppb.Timestamp)(nil),   // 45: google.protobuf.Timestamp
+	(*structpb.Struct)(nil),         // 46: google.protobuf.Struct
 }
 var file_pkg_apis_v1alpha1_ax_proto_depIdxs = []int32{
-	44, // 0: ax.v1alpha1.ObjectMeta.creation_timestamp:type_name -> google.protobuf.Timestamp
+	45, // 0: ax.v1alpha1.ObjectMeta.creation_timestamp:type_name -> google.protobuf.Timestamp
 	0,  // 1: ax.v1alpha1.Task.metadata:type_name -> ax.v1alpha1.ObjectMeta
 	2,  // 2: ax.v1alpha1.Task.spec:type_name -> ax.v1alpha1.TaskSpec
 	7,  // 3: ax.v1alpha1.Task.status:type_name -> ax.v1alpha1.TaskStatus
 	3,  // 4: ax.v1alpha1.TaskSpec.env:type_name -> ax.v1alpha1.EnvVar
 	4,  // 5: ax.v1alpha1.TaskSpec.resources:type_name -> ax.v1alpha1.ResourceReqs
 	6,  // 6: ax.v1alpha1.TaskSpec.workspaces:type_name -> ax.v1alpha1.WorkspaceRef
-	5,  // 7: ax.v1alpha1.ResourceReqs.requests:type_name -> ax.v1alpha1.ResourceList
-	5,  // 8: ax.v1alpha1.ResourceReqs.limits:type_name -> ax.v1alpha1.ResourceList
-	8,  // 9: ax.v1alpha1.TaskStatus.pending_approval:type_name -> ax.v1alpha1.PendingApproval
-	9,  // 10: ax.v1alpha1.TaskStatus.usage:type_name -> ax.v1alpha1.UsageStats
-	10, // 11: ax.v1alpha1.TaskStatus.conditions:type_name -> ax.v1alpha1.Condition
-	44, // 12: ax.v1alpha1.PendingApproval.requested_at:type_name -> google.protobuf.Timestamp
-	44, // 13: ax.v1alpha1.Condition.last_transition_time:type_name -> google.protobuf.Timestamp
-	0,  // 14: ax.v1alpha1.Workspace.metadata:type_name -> ax.v1alpha1.ObjectMeta
-	12, // 15: ax.v1alpha1.Workspace.spec:type_name -> ax.v1alpha1.WorkspaceSpec
-	13, // 16: ax.v1alpha1.WorkspaceSpec.git:type_name -> ax.v1alpha1.GitRepo
-	14, // 17: ax.v1alpha1.WorkspaceSpec.mcp:type_name -> ax.v1alpha1.MCPConfig
-	17, // 18: ax.v1alpha1.WorkspaceSpec.skills:type_name -> ax.v1alpha1.SkillsConfig
-	15, // 19: ax.v1alpha1.MCPConfig.registries:type_name -> ax.v1alpha1.MCPRegistry
-	16, // 20: ax.v1alpha1.MCPConfig.servers:type_name -> ax.v1alpha1.MCPServer
-	16, // 21: ax.v1alpha1.MCPRegistry.servers:type_name -> ax.v1alpha1.MCPServer
-	18, // 22: ax.v1alpha1.SkillsConfig.registries:type_name -> ax.v1alpha1.SkillRegistry
-	0,  // 23: ax.v1alpha1.Model.metadata:type_name -> ax.v1alpha1.ObjectMeta
-	20, // 24: ax.v1alpha1.Model.spec:type_name -> ax.v1alpha1.ModelSpec
-	21, // 25: ax.v1alpha1.ModelSpec.secret_key:type_name -> ax.v1alpha1.SecretKeyRef
-	45, // 26: ax.v1alpha1.ModelSpec.parameters:type_name -> google.protobuf.Struct
-	1,  // 27: ax.v1alpha1.ListTasksResponse.tasks:type_name -> ax.v1alpha1.Task
-	1,  // 28: ax.v1alpha1.UpdateTaskRequest.task:type_name -> ax.v1alpha1.Task
-	1,  // 29: ax.v1alpha1.WatchTaskResponse.task:type_name -> ax.v1alpha1.Task
-	11, // 30: ax.v1alpha1.ListWorkspacesResponse.workspaces:type_name -> ax.v1alpha1.Workspace
-	11, // 31: ax.v1alpha1.UpdateWorkspaceRequest.workspace:type_name -> ax.v1alpha1.Workspace
-	19, // 32: ax.v1alpha1.ListModelsResponse.models:type_name -> ax.v1alpha1.Model
-	19, // 33: ax.v1alpha1.UpdateModelRequest.model:type_name -> ax.v1alpha1.Model
-	22, // 34: ax.v1alpha1.AX.GetTask:input_type -> ax.v1alpha1.GetTaskRequest
-	23, // 35: ax.v1alpha1.AX.ListTasks:input_type -> ax.v1alpha1.ListTasksRequest
-	25, // 36: ax.v1alpha1.AX.UpdateTask:input_type -> ax.v1alpha1.UpdateTaskRequest
-	26, // 37: ax.v1alpha1.AX.DeleteTask:input_type -> ax.v1alpha1.DeleteTaskRequest
-	28, // 38: ax.v1alpha1.AX.SuspendTask:input_type -> ax.v1alpha1.SuspendTaskRequest
-	29, // 39: ax.v1alpha1.AX.ResumeTask:input_type -> ax.v1alpha1.ResumeTaskRequest
-	30, // 40: ax.v1alpha1.AX.WatchTask:input_type -> ax.v1alpha1.WatchTaskRequest
-	32, // 41: ax.v1alpha1.AX.GetWorkspace:input_type -> ax.v1alpha1.GetWorkspaceRequest
-	33, // 42: ax.v1alpha1.AX.ListWorkspaces:input_type -> ax.v1alpha1.ListWorkspacesRequest
-	35, // 43: ax.v1alpha1.AX.UpdateWorkspace:input_type -> ax.v1alpha1.UpdateWorkspaceRequest
-	36, // 44: ax.v1alpha1.AX.DeleteWorkspace:input_type -> ax.v1alpha1.DeleteWorkspaceRequest
-	38, // 45: ax.v1alpha1.AX.GetModel:input_type -> ax.v1alpha1.GetModelRequest
-	39, // 46: ax.v1alpha1.AX.ListModels:input_type -> ax.v1alpha1.ListModelsRequest
-	41, // 47: ax.v1alpha1.AX.UpdateModel:input_type -> ax.v1alpha1.UpdateModelRequest
-	42, // 48: ax.v1alpha1.AX.DeleteModel:input_type -> ax.v1alpha1.DeleteModelRequest
-	1,  // 49: ax.v1alpha1.AX.GetTask:output_type -> ax.v1alpha1.Task
-	24, // 50: ax.v1alpha1.AX.ListTasks:output_type -> ax.v1alpha1.ListTasksResponse
-	1,  // 51: ax.v1alpha1.AX.UpdateTask:output_type -> ax.v1alpha1.Task
-	27, // 52: ax.v1alpha1.AX.DeleteTask:output_type -> ax.v1alpha1.DeleteTaskResponse
-	1,  // 53: ax.v1alpha1.AX.SuspendTask:output_type -> ax.v1alpha1.Task
-	1,  // 54: ax.v1alpha1.AX.ResumeTask:output_type -> ax.v1alpha1.Task
-	31, // 55: ax.v1alpha1.AX.WatchTask:output_type -> ax.v1alpha1.WatchTaskResponse
-	11, // 56: ax.v1alpha1.AX.GetWorkspace:output_type -> ax.v1alpha1.Workspace
-	34, // 57: ax.v1alpha1.AX.ListWorkspaces:output_type -> ax.v1alpha1.ListWorkspacesResponse
-	11, // 58: ax.v1alpha1.AX.UpdateWorkspace:output_type -> ax.v1alpha1.Workspace
-	37, // 59: ax.v1alpha1.AX.DeleteWorkspace:output_type -> ax.v1alpha1.DeleteWorkspaceResponse
-	19, // 60: ax.v1alpha1.AX.GetModel:output_type -> ax.v1alpha1.Model
-	40, // 61: ax.v1alpha1.AX.ListModels:output_type -> ax.v1alpha1.ListModelsResponse
-	19, // 62: ax.v1alpha1.AX.UpdateModel:output_type -> ax.v1alpha1.Model
-	43, // 63: ax.v1alpha1.AX.DeleteModel:output_type -> ax.v1alpha1.DeleteModelResponse
-	49, // [49:64] is the sub-list for method output_type
-	34, // [34:49] is the sub-list for method input_type
-	34, // [34:34] is the sub-list for extension type_name
-	34, // [34:34] is the sub-list for extension extendee
-	0,  // [0:34] is the sub-list for field type_name
+	44, // 7: ax.v1alpha1.TaskSpec.worker_labels:type_name -> ax.v1alpha1.TaskSpec.WorkerLabelsEntry
+	5,  // 8: ax.v1alpha1.ResourceReqs.requests:type_name -> ax.v1alpha1.ResourceList
+	5,  // 9: ax.v1alpha1.ResourceReqs.limits:type_name -> ax.v1alpha1.ResourceList
+	8,  // 10: ax.v1alpha1.TaskStatus.pending_approval:type_name -> ax.v1alpha1.PendingApproval
+	9,  // 11: ax.v1alpha1.TaskStatus.usage:type_name -> ax.v1alpha1.UsageStats
+	10, // 12: ax.v1alpha1.TaskStatus.conditions:type_name -> ax.v1alpha1.Condition
+	45, // 13: ax.v1alpha1.PendingApproval.requested_at:type_name -> google.protobuf.Timestamp
+	45, // 14: ax.v1alpha1.Condition.last_transition_time:type_name -> google.protobuf.Timestamp
+	0,  // 15: ax.v1alpha1.Workspace.metadata:type_name -> ax.v1alpha1.ObjectMeta
+	12, // 16: ax.v1alpha1.Workspace.spec:type_name -> ax.v1alpha1.WorkspaceSpec
+	13, // 17: ax.v1alpha1.WorkspaceSpec.git:type_name -> ax.v1alpha1.GitRepo
+	14, // 18: ax.v1alpha1.WorkspaceSpec.mcp:type_name -> ax.v1alpha1.MCPConfig
+	17, // 19: ax.v1alpha1.WorkspaceSpec.skills:type_name -> ax.v1alpha1.SkillsConfig
+	15, // 20: ax.v1alpha1.MCPConfig.registries:type_name -> ax.v1alpha1.MCPRegistry
+	16, // 21: ax.v1alpha1.MCPConfig.servers:type_name -> ax.v1alpha1.MCPServer
+	16, // 22: ax.v1alpha1.MCPRegistry.servers:type_name -> ax.v1alpha1.MCPServer
+	18, // 23: ax.v1alpha1.SkillsConfig.registries:type_name -> ax.v1alpha1.SkillRegistry
+	0,  // 24: ax.v1alpha1.Model.metadata:type_name -> ax.v1alpha1.ObjectMeta
+	20, // 25: ax.v1alpha1.Model.spec:type_name -> ax.v1alpha1.ModelSpec
+	21, // 26: ax.v1alpha1.ModelSpec.secret_key:type_name -> ax.v1alpha1.SecretKeyRef
+	46, // 27: ax.v1alpha1.ModelSpec.parameters:type_name -> google.protobuf.Struct
+	1,  // 28: ax.v1alpha1.ListTasksResponse.tasks:type_name -> ax.v1alpha1.Task
+	1,  // 29: ax.v1alpha1.UpdateTaskRequest.task:type_name -> ax.v1alpha1.Task
+	1,  // 30: ax.v1alpha1.WatchTaskResponse.task:type_name -> ax.v1alpha1.Task
+	11, // 31: ax.v1alpha1.ListWorkspacesResponse.workspaces:type_name -> ax.v1alpha1.Workspace
+	11, // 32: ax.v1alpha1.UpdateWorkspaceRequest.workspace:type_name -> ax.v1alpha1.Workspace
+	19, // 33: ax.v1alpha1.ListModelsResponse.models:type_name -> ax.v1alpha1.Model
+	19, // 34: ax.v1alpha1.UpdateModelRequest.model:type_name -> ax.v1alpha1.Model
+	22, // 35: ax.v1alpha1.AX.GetTask:input_type -> ax.v1alpha1.GetTaskRequest
+	23, // 36: ax.v1alpha1.AX.ListTasks:input_type -> ax.v1alpha1.ListTasksRequest
+	25, // 37: ax.v1alpha1.AX.UpdateTask:input_type -> ax.v1alpha1.UpdateTaskRequest
+	26, // 38: ax.v1alpha1.AX.DeleteTask:input_type -> ax.v1alpha1.DeleteTaskRequest
+	28, // 39: ax.v1alpha1.AX.SuspendTask:input_type -> ax.v1alpha1.SuspendTaskRequest
+	29, // 40: ax.v1alpha1.AX.ResumeTask:input_type -> ax.v1alpha1.ResumeTaskRequest
+	30, // 41: ax.v1alpha1.AX.WatchTask:input_type -> ax.v1alpha1.WatchTaskRequest
+	32, // 42: ax.v1alpha1.AX.GetWorkspace:input_type -> ax.v1alpha1.GetWorkspaceRequest
+	33, // 43: ax.v1alpha1.AX.ListWorkspaces:input_type -> ax.v1alpha1.ListWorkspacesRequest
+	35, // 44: ax.v1alpha1.AX.UpdateWorkspace:input_type -> ax.v1alpha1.UpdateWorkspaceRequest
+	36, // 45: ax.v1alpha1.AX.DeleteWorkspace:input_type -> ax.v1alpha1.DeleteWorkspaceRequest
+	38, // 46: ax.v1alpha1.AX.GetModel:input_type -> ax.v1alpha1.GetModelRequest
+	39, // 47: ax.v1alpha1.AX.ListModels:input_type -> ax.v1alpha1.ListModelsRequest
+	41, // 48: ax.v1alpha1.AX.UpdateModel:input_type -> ax.v1alpha1.UpdateModelRequest
+	42, // 49: ax.v1alpha1.AX.DeleteModel:input_type -> ax.v1alpha1.DeleteModelRequest
+	1,  // 50: ax.v1alpha1.AX.GetTask:output_type -> ax.v1alpha1.Task
+	24, // 51: ax.v1alpha1.AX.ListTasks:output_type -> ax.v1alpha1.ListTasksResponse
+	1,  // 52: ax.v1alpha1.AX.UpdateTask:output_type -> ax.v1alpha1.Task
+	27, // 53: ax.v1alpha1.AX.DeleteTask:output_type -> ax.v1alpha1.DeleteTaskResponse
+	1,  // 54: ax.v1alpha1.AX.SuspendTask:output_type -> ax.v1alpha1.Task
+	1,  // 55: ax.v1alpha1.AX.ResumeTask:output_type -> ax.v1alpha1.Task
+	31, // 56: ax.v1alpha1.AX.WatchTask:output_type -> ax.v1alpha1.WatchTaskResponse
+	11, // 57: ax.v1alpha1.AX.GetWorkspace:output_type -> ax.v1alpha1.Workspace
+	34, // 58: ax.v1alpha1.AX.ListWorkspaces:output_type -> ax.v1alpha1.ListWorkspacesResponse
+	11, // 59: ax.v1alpha1.AX.UpdateWorkspace:output_type -> ax.v1alpha1.Workspace
+	37, // 60: ax.v1alpha1.AX.DeleteWorkspace:output_type -> ax.v1alpha1.DeleteWorkspaceResponse
+	19, // 61: ax.v1alpha1.AX.GetModel:output_type -> ax.v1alpha1.Model
+	40, // 62: ax.v1alpha1.AX.ListModels:output_type -> ax.v1alpha1.ListModelsResponse
+	19, // 63: ax.v1alpha1.AX.UpdateModel:output_type -> ax.v1alpha1.Model
+	43, // 64: ax.v1alpha1.AX.DeleteModel:output_type -> ax.v1alpha1.DeleteModelResponse
+	50, // [50:65] is the sub-list for method output_type
+	35, // [35:50] is the sub-list for method input_type
+	35, // [35:35] is the sub-list for extension type_name
+	35, // [35:35] is the sub-list for extension extendee
+	0,  // [0:35] is the sub-list for field type_name
 }
 
 func init() { file_pkg_apis_v1alpha1_ax_proto_init() }
@@ -2906,7 +2923,7 @@ func file_pkg_apis_v1alpha1_ax_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_pkg_apis_v1alpha1_ax_proto_rawDesc), len(file_pkg_apis_v1alpha1_ax_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   44,
+			NumMessages:   45,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

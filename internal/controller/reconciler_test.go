@@ -1523,3 +1523,54 @@ func TestFabriekSupervisorRejectsRetainedWorkerSelectorChange(t *testing.T) {
 		})
 	}
 }
+
+func TestTaskReconcilerWorkerLabels(t *testing.T) {
+	for name, tc := range map[string]struct {
+		defaults map[string]string
+		task     map[string]string
+		want     map[string]string
+	}{
+		"task labels win":        {map[string]string{"workload": "ax"}, map[string]string{"workload": "sluis"}, map[string]string{"workload": "sluis"}},
+		"default when no labels": {map[string]string{"workload": "ax"}, nil, map[string]string{"workload": "ax"}},
+		"none":                   {nil, nil, nil},
+	} {
+		t.Run(name, func(t *testing.T) {
+			lis, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer lis.Close()
+			mockSrv := &mockControlServer{}
+			grpcServer := grpc.NewServer()
+			ateapipb.RegisterControlServer(grpcServer, mockSrv)
+			go grpcServer.Serve(lis)
+			defer grpcServer.Stop()
+			client, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+
+			r := controller.NewTaskReconciler(client, "test-template", "ax-system")
+			r.SecretResolver = noSecrets
+			r.WorkspaceReadyTimeout = 200 * time.Millisecond
+			r.DefaultWorkerLabels = tc.defaults
+			task := &v1alpha1.Task{
+				ApiVersion: v1alpha1.APIVersion,
+				Kind:       v1alpha1.KindTask,
+				Metadata:   &v1alpha1.ObjectMeta{Name: "label-task", Atespace: "default"},
+				Spec:       &v1alpha1.TaskSpec{Image: "ghrc.io/my-org/my-image", Command: []string{"/bin/task-runner"}, WorkerLabels: tc.task},
+			}
+			if _, err := r.Reconcile(context.Background(), task); err != nil {
+				t.Fatal(err)
+			}
+			var want *ateapipb.Selector
+			if tc.want != nil {
+				want = &ateapipb.Selector{MatchLabels: tc.want}
+			}
+			if got := mockSrv.lastTemplate.GetWorkerSelector(); !proto.Equal(got, want) {
+				t.Fatalf("worker selector = %v, want %v", got, want)
+			}
+		})
+	}
+}

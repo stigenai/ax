@@ -57,6 +57,12 @@ patches:
                   # note there.
                   - name: AX_MAX_TASK_CPU
                     value: "6"
+                  # A task with no spec.workerLabels runs only on WorkerPool
+                  # ax (label workload: ax). WorkerPool sluis (label
+                  # workload: sluis, in nix-fleet-hosts ax-sluis) is then
+                  # free for sluis tasks, which ask for workload=sluis.
+                  - name: AX_DEFAULT_WORKER_LABELS
+                    value: workload=ax
   - patch: |-
       apiVersion: apps/v1
       kind: Deployment
