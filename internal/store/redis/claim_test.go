@@ -15,11 +15,13 @@
 package redis
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"strings"
 	"testing"
@@ -298,20 +300,20 @@ func TestNextKeepsBufferedEventAfterRestoreError(t *testing.T) {
 		t.Fatal(err)
 	}
 	key := s.checkpointKey(group)
-	saved, err := client.Get(ctx, key).Result()
+	saved, err := client.HGet(ctx, key, "cursor").Result()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := client.XGroupDestroy(ctx, stream, group).Err(); err != nil {
 		t.Fatal(err)
 	}
-	if err := client.Set(ctx, key, "", 0).Err(); err != nil {
+	if err := client.HSet(ctx, key, "cursor", "invalid").Err(); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := sub.Next(ctx); err == nil || !strings.Contains(err.Error(), "restoring consumer group") {
 		t.Fatalf("Next error = %v, want group restore error", err)
 	}
-	if err := client.Set(ctx, key, saved, 0).Err(); err != nil {
+	if err := client.HSet(ctx, key, "cursor", saved).Err(); err != nil {
 		t.Fatal(err)
 	}
 	if ev, err := sub.Next(ctx); err != nil || ev.ID != second {
@@ -407,12 +409,103 @@ func TestCheckpointRestoresPendingPages(t *testing.T) {
 	}
 }
 
+func TestCheckpointWorkDoesNotGrowWithPendingBacklog(t *testing.T) {
+	for _, size := range []int{1, 300} {
+		t.Run(fmt.Sprint(size), func(t *testing.T) {
+			s, client := newClaimTestStore(t, "checkpoint-work", Options{ClaimMinIdle: -1})
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			stream := s.opts.StreamName
+			sub, err := s.Subscribe(ctx, "group", "consumer")
+			if err != nil {
+				t.Fatal(err)
+			}
+			for range size {
+				addTestEvent(t, ctx, client, stream, "pending")
+			}
+			for range size {
+				if _, err := sub.Next(ctx); err != nil {
+					t.Fatal(err)
+				}
+			}
+			marker := addTestEvent(t, ctx, client, stream, "marker")
+			var dialer net.Dialer
+			conn, err := dialer.DialContext(ctx, "tcp", client.Options().Addr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := fmt.Fprint(conn, "MONITOR\r\n"); err != nil {
+				t.Fatal(err)
+			}
+			lines := bufio.NewScanner(conn)
+			if !lines.Scan() || lines.Text() != "+OK" {
+				t.Fatalf("MONITOR reply = %q, %v", lines.Text(), lines.Err())
+			}
+			ev, err := sub.Next(ctx)
+			if err != nil || ev.ID != marker {
+				t.Fatalf("delivery = %v, %v, want %s", ev, err, marker)
+			}
+			if err := sub.Ack(ctx, ev); err != nil {
+				t.Fatal(err)
+			}
+			barrier := stream + ":monitor-barrier"
+			if err := client.Echo(ctx, barrier).Err(); err != nil {
+				t.Fatal(err)
+			}
+			var pendingCalls int
+			for lines.Scan() {
+				line := strings.ToLower(lines.Text())
+				if strings.Contains(line, fmt.Sprintf(`"echo" "%s"`, barrier)) {
+					if pendingCalls > 3 {
+						t.Fatalf("delivery and ACK used %d XPENDING calls, want at most 3", pendingCalls)
+					}
+					return
+				}
+				if strings.Contains(line, `"xpending" "`+stream+`"`) {
+					pendingCalls++
+				}
+			}
+			t.Fatalf("missing MONITOR barrier: %v", lines.Err())
+		})
+	}
+}
+
+func TestClaimRemovesTrimmedCheckpointEntry(t *testing.T) {
+	s, client := newClaimTestStore(t, "trimmed-claim", Options{ClaimMinIdle: time.Millisecond})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	stream := s.opts.StreamName
+	sub, err := s.Subscribe(ctx, "group", "consumer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := addTestEvent(t, ctx, client, stream, "pending")
+	if ev, err := sub.Next(ctx); err != nil || ev.ID != id {
+		t.Fatalf("delivery = %v, %v, want %s", ev, err, id)
+	}
+	if err := client.XDel(ctx, stream, id).Err(); err != nil {
+		t.Fatal(err)
+	}
+	active := sub.(*subscription)
+	active.lastClaim = time.Time{}
+	if _, err := active.claim(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.HGet(ctx, s.checkpointKey("group"), id).Err(); err != redisclient.Nil {
+		t.Fatalf("trimmed checkpoint field error = %v, want redis.Nil", err)
+	}
+}
+
 func TestCheckpointRejectsDeniedWrites(t *testing.T) {
 	s, client := newClaimTestStore(t, "acl", Options{ClaimMinIdle: -1, MaxDeliveries: 1})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	username := s.opts.KeyPrefix
-	if err := client.Do(ctx, "ACL", "SETUSER", username, "on", "nopass", "~*", "+@all", "-set").Err(); err != nil {
+	if err := client.Do(ctx, "ACL", "SETUSER", username, "on", "nopass", "~*", "+@all", "-hset").Err(); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
@@ -431,7 +524,7 @@ func TestCheckpointRejectsDeniedWrites(t *testing.T) {
 	stream := s.opts.StreamName
 	const group = "group"
 	if _, err := limited.Subscribe(ctx, group, "limited"); !redisclient.HasErrorPrefix(err, "NOPERM") {
-		t.Fatalf("Subscribe with SET denied: %v", err)
+		t.Fatalf("Subscribe with HSET denied: %v", err)
 	}
 	if err := client.XPending(ctx, stream, group).Err(); !redisclient.HasErrorPrefix(err, "NOGROUP") {
 		t.Fatalf("failed Subscribe created the group: %v", err)
@@ -448,23 +541,23 @@ func TestCheckpointRejectsDeniedWrites(t *testing.T) {
 	replacement := &subscription{store: limited, group: group, consumer: "limited"}
 	marker := addTestEvent(t, ctx, client, stream, "marker")
 	if _, err := replacement.Next(ctx); err == nil || !strings.Contains(err.Error(), "saving pending task event") {
-		t.Fatalf("delivery with SET denied: %v", err)
+		t.Fatalf("delivery with HSET denied: %v", err)
 	}
-	if err := client.Do(ctx, "ACL", "SETUSER", username, "+set", "-xack", "-xclaim").Err(); err != nil {
+	if err := client.Do(ctx, "ACL", "SETUSER", username, "+hset", "-xack", "-xclaim").Err(); err != nil {
 		t.Fatal(err)
 	}
 	if got, err := replacement.Next(ctx); err != nil || got.ID != marker {
 		t.Fatalf("retry delivery = %v, %v, want %s", got, err, marker)
 	}
 	checkpoint := s.checkpointKey(group)
-	before, err := client.Get(ctx, checkpoint).Result()
+	before, err := client.HGet(ctx, checkpoint, id).Result()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := replacement.Ack(ctx, ev); !redisclient.HasErrorPrefix(err, "NOPERM") {
 		t.Fatalf("ACK with XACK denied: %v", err)
 	}
-	if after, err := client.Get(ctx, checkpoint).Result(); err != nil || after != before {
+	if after, err := client.HGet(ctx, checkpoint, id).Result(); err != nil || after != before {
 		t.Fatalf("failed ACK changed the checkpoint: %v", err)
 	}
 	if err := client.Do(ctx, "XCLAIM", stream, group, "limited", 0, ev.ID).Err(); err != nil {

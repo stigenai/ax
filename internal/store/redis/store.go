@@ -824,15 +824,15 @@ func (s *Store) Subscribe(ctx context.Context, group, consumer string) (store.Su
 }
 
 // A group checkpoint retains its cursor and pending entries across group loss.
-// Save the pending entry before dispatch so recovery can restore it for a late ACK.
-// Save the checkpoint and ACK in the same script to exclude acknowledged entries from recovery.
+// Save new pending entries in batches of at most 256 before dispatch.
+// Remove each acknowledged entry from the checkpoint in the same script as the ACK.
 var checkpointGroup = redis.NewScript(`
 local stream, checkpoint = KEYS[1], KEYS[2]
 local group, operation, id = ARGV[1], ARGV[2], ARGV[3]
 local streamType = redis.call('TYPE', stream).ok
 local checkpointType = redis.call('TYPE', checkpoint).ok
 if (streamType ~= 'none' and streamType ~= 'stream') or
-   (checkpointType ~= 'none' and checkpointType ~= 'string') then
+   (checkpointType ~= 'none' and checkpointType ~= 'hash') then
     return redis.error_reply('WRONGTYPE invalid stream or group checkpoint type')
 end
 
@@ -852,35 +852,42 @@ if streamType == 'stream' then
     end
 end
 
-if operation == 'recover' and position then return 0 end
-local deliveries = 0
-if operation == 'deliver' then
-    local match = redis.call('XPENDING', stream, group, id, id, 1)
-    if #match == 0 then return -1 end
-    deliveries = match[1][4]
+local saved = redis.call('HGET', checkpoint, 'cursor')
+if checkpointType == 'hash' and not saved then
+    return redis.error_reply('ERR missing group checkpoint cursor')
 end
 if operation == 'ack' then
-    local match = redis.call('XPENDING', stream, group, id, id, 1)
-    if #match == 0 then return redis.call('XACK', stream, group, id) end
-    id = match[1][1]
+    if not position then return redis.error_reply('NOGROUP consumer group no longer exists') end
+    if not saved then return redis.error_reply('ERR missing group checkpoint') end
     if redis.acl_check_cmd and not redis.acl_check_cmd('XACK', stream, group, id) then
         return redis.error_reply('NOPERM cannot acknowledge stream entries')
     end
+    redis.call('HDEL', checkpoint, id)
+    return redis.call('XACK', stream, group, id)
 end
 
 if not position then
-    local saved = redis.call('GET', checkpoint)
+    if operation == 'deliver' then return redis.error_reply('NOGROUP consumer group no longer exists') end
     if saved then
-        local state = cmsgpack.unpack(saved)
-        local pending = state[2]
-        if #pending > 0 and redis.acl_check_cmd and
-           not redis.acl_check_cmd('XCLAIM', stream, group, pending[1][2], 0, pending[1][1], 'FORCE') then
-            return redis.error_reply('NOPERM cannot restore pending stream entries')
+        local fields = redis.call('HGETALL', checkpoint)
+        local pending = {}
+        for i = 1, #fields, 2 do
+            if fields[i] ~= 'cursor' then
+                local entry = cmsgpack.unpack(fields[i + 1])
+                local pendingID = fields[i]
+                if redis.acl_check_cmd and
+                   (not redis.acl_check_cmd('XCLAIM', stream, group, entry[1], 0, pendingID, 'FORCE') or
+                    not redis.acl_check_cmd('HDEL', checkpoint, pendingID)) then
+                    return redis.error_reply('NOPERM cannot restore pending stream entries')
+                end
+                pending[pendingID] = entry
+            end
         end
-        redis.call('XGROUP', 'CREATE', stream, group, state[1], 'MKSTREAM')
-        for _, entry in ipairs(pending) do
-            redis.call('XCLAIM', stream, group, entry[2], 0, entry[1],
-                'TIME', entry[3], 'RETRYCOUNT', entry[4], 'FORCE', 'JUSTID')
+        redis.call('XGROUP', 'CREATE', stream, group, saved, 'MKSTREAM')
+        for pendingID, entry in pairs(pending) do
+            local claimed = redis.call('XCLAIM', stream, group, entry[1], 0, pendingID,
+                'TIME', entry[2], 'RETRYCOUNT', entry[3], 'FORCE', 'JUSTID')
+            if #claimed == 0 then redis.call('HDEL', checkpoint, pendingID) end
         end
         return 1
     end
@@ -888,33 +895,52 @@ if not position then
     if operation == 'subscribe' and streamType == 'stream' then
         position = field(redis.call('XINFO', 'STREAM', stream), 'last-generated-id')
     end
-    local empty = cmsgpack.pack({position, {}})
-    if redis.acl_check_cmd and not redis.acl_check_cmd('SET', checkpoint, empty) then
+    if redis.acl_check_cmd and not redis.acl_check_cmd('HSET', checkpoint, 'cursor', position) then
         return redis.error_reply('NOPERM cannot save the group checkpoint')
     end
     redis.call('XGROUP', 'CREATE', stream, group, position, 'MKSTREAM')
-    redis.call('SET', checkpoint, empty)
+    redis.call('HSET', checkpoint, 'cursor', position)
     if operation == 'subscribe' then return 0 end
     return 1
 end
+if operation == 'recover' or (operation == 'subscribe' and saved) then return 0 end
 
 local clock = redis.call('TIME')
 local now = clock[1] * 1000 + math.floor(clock[2] / 1000)
-local pending, start, page = {}, '-', {}
-repeat
-    page = redis.call('XPENDING', stream, group, start, '+', 256)
-    for _, entry in ipairs(page) do
-        if operation ~= 'ack' or entry[1] ~= id then
-            entry[3] = math.max(0, now - entry[3])
-            pending[#pending + 1] = entry
-        end
-    end
-    if #page == 256 then start = '(' .. page[#page][1] end
-until #page < 256
 
-redis.call('SET', checkpoint, cmsgpack.pack({position, pending}))
-if operation == 'ack' then return redis.call('XACK', stream, group, id) end
-return deliveries
+local function save(entry)
+    redis.call('HSET', checkpoint, entry[1], cmsgpack.pack({
+        entry[2], math.max(0, now - entry[3]), entry[4]
+    }))
+end
+
+if operation == 'subscribe' then
+    local start, page = '-', {}
+    repeat
+        page = redis.call('XPENDING', stream, group, start, '+', 256)
+        for _, entry in ipairs(page) do save(entry) end
+        if #page == 256 then start = '(' .. page[#page][1] end
+    until #page < 256
+    redis.call('HSET', checkpoint, 'cursor', position)
+    return 0
+end
+
+if not saved then return redis.error_reply('ERR missing group checkpoint') end
+if saved ~= position then
+    local page = redis.call('XPENDING', stream, group, '(' .. saved, position, 256)
+    for _, entry in ipairs(page) do
+        save(entry)
+    end
+    if #page == 256 and page[#page][1] ~= position then
+        redis.call('HSET', checkpoint, 'cursor', page[#page][1])
+        return -2
+    end
+    redis.call('HSET', checkpoint, 'cursor', position)
+end
+local match = redis.call('XPENDING', stream, group, id, id, 1)
+if #match == 0 then return -1 end
+save(match[1])
+return match[1][4]
 `)
 
 func (s *Store) checkpointKey(group string) string {
@@ -985,6 +1011,10 @@ func (sub *subscription) Next(ctx context.Context) (store.TaskEvent, error) {
 		if err != nil {
 			return store.TaskEvent{}, fmt.Errorf("saving pending task event %s: %w", ev.ID, err)
 		}
+		// Redis saved one page. Keep this event until it saves the rest.
+		if deliveries == -2 {
+			continue
+		}
 		sub.pending = sub.pending[1:]
 		if deliveries < 0 {
 			continue
@@ -1053,7 +1083,7 @@ func (sub *subscription) claim(ctx context.Context) ([]store.TaskEvent, error) {
 	if sub.claimCursor == "0-0" && time.Since(sub.lastClaim) < sub.store.opts.ClaimInterval {
 		return nil, nil
 	}
-	msgs, cursor, err := sub.store.client.XAutoClaim(ctx, &redis.XAutoClaimArgs{
+	msgs, cursor, deleted, err := sub.store.client.XAutoClaimWithDeleted(ctx, &redis.XAutoClaimArgs{
 		Stream:   sub.store.opts.StreamName,
 		Group:    sub.group,
 		Consumer: sub.consumer,
@@ -1066,6 +1096,11 @@ func (sub *subscription) claim(ctx context.Context) ([]store.TaskEvent, error) {
 			return nil, sub.restoreConsumerGroup(ctx)
 		}
 		return nil, fmt.Errorf("reclaiming idle task events: %w", err)
+	}
+	if len(deleted) > 0 {
+		if err := sub.store.client.HDel(ctx, sub.store.checkpointKey(sub.group), deleted...).Err(); err != nil {
+			return nil, fmt.Errorf("removing trimmed task events from the checkpoint: %w", err)
+		}
 	}
 	sub.claimCursor = cursor
 	if cursor == "0-0" {
