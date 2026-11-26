@@ -135,7 +135,17 @@ A plain apply of the new manifest starts Redis with 0 keys. Redis with `--append
 
    Wait until Redis answers PING, then record the task inventory again. It must equal the inventory of step 2. Run `ax -a <atespace> get task <name>` for the 3 tasks that you kept before step 1. Each command must succeed.
 
-Keep the private work directory and each local file in it (`ax-redis-before.rdb`, the inventory files and the saved `ax get task` output). Before the writers resume, the copy must stay available for rollback. After the writers resume, fix forward (see "Rollback"). If a check fails or the owner has not accepted the migration, keep the files. When the migration checks pass and the owner accepts the outcome, the operator removes the directory. Leave the directory, then run `rm -r "$WORK"` and `test ! -e "$WORK"`. The `test` must exit 0.
+7. After the migration checks pass, follow [Local backup cleanup](#local-backup-cleanup).
+
+## Local backup cleanup
+
+Keep the private work directory and its files. This includes `ax-redis-before.rdb`, the inventory files and the saved `ax get task` output. Before the writers resume, keep the copy available for rollback. After the writers resume, fix forward (see "Rollback").
+
+If a check fails or the owner has not accepted the outcome, keep the files. After the migration or rollback checks pass and the owner accepts that outcome, the migration operator must do these steps.
+
+1. Leave the private work directory.
+2. Remove the private work directory and its contents with `rm -r "$WORK"`.
+3. Run `test ! -e "$WORK"`. The command must exit 0.
 
 ## Restart check
 
@@ -196,6 +206,7 @@ Use this procedure only before the writers resume.
 4. Wait until Redis answers PING. Check `DBSIZE` and the task inventory against the baseline of Migration step 2. Scale the writers back to 1. Wait for the rollout.
 5. Run `ax -a <atespace> get task <name>` for 3 tasks. Each command must succeed.
 6. Remove `/tmp/seed` from the pod (Migration step 4). Delete the claim only after steps 4 and 5 pass: `kubectl --context gtr -n ax-system delete pvc ax-redis-data`.
+7. After the rollback checks pass, follow [Local backup cleanup](#local-backup-cleanup).
 
 ### Do not apply the old manifest after the writers resume
 
