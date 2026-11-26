@@ -292,15 +292,13 @@ func (d *DeletionSweeper) sweepActors(ctx context.Context, now time.Time, minAge
 
 // isOrphanActor reports whether actor is an AX actor with no task record.
 // It fails closed: every item must hold. (1) taskKeys is not nil, so the
-// task list finished. (2) The actor is not DELETING. (3) Its template is in
+// task list finished. (2) The actor is not DELETING: the caller never asks
+// about a DELETING actor, which stuck_actors counts. (3) Its template is in
 // its own atespace and its name matches taskTemplatePattern. (4) No task of
 // any phase has its atespace/name. (5) Its create_time is valid and at
 // least minAge old.
 func isOrphanActor(actor *ateapipb.Actor, now time.Time, minAge time.Duration, taskKeys map[string]bool) bool {
 	if taskKeys == nil {
-		return false
-	}
-	if actor.GetStatus().GetState() == ateapipb.ActorState_ACTOR_STATE_DELETING {
 		return false
 	}
 	atespace := actor.GetMetadata().GetAtespace()
