@@ -1,0 +1,90 @@
+# This workflow is fork carry. FORK.md on stigenai/deploy lists it.
+#
+# Each week, the job merges google/ax main into each fork branch on the runner.
+# Then it runs the tests on that tree.
+# If the merge or a test fails, the job fails.
+# The job summary shows each conflicted file and the FORK.md entries for it.
+# The job does not push.
+#
+# Keep this file on main. GitHub reads schedule triggers only from the
+# default branch.
+
+name: upstream-sync
+
+on:
+  schedule:
+    - cron: "0 6 * * 1" # Monday 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  trial-merge:
+    strategy:
+      fail-fast: false
+      matrix:
+        branch: [main, stigenai/deploy]
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: ax
+          POSTGRES_PASSWORD: ax
+          POSTGRES_DB: ax
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ax -d ax"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ matrix.branch }}
+          fetch-depth: 0
+
+      - name: Trial merge of google/ax main
+        run: |
+          git config user.name "upstream-sync"
+          git config user.email "upstream-sync@users.noreply.github.com"
+          git fetch --quiet https://github.com/google/ax.git main
+          base=$(git merge-base HEAD FETCH_HEAD)
+          {
+            echo "## ${{ matrix.branch }} + google/ax $(git rev-parse --short FETCH_HEAD)"
+            echo
+            echo "- Upstream commits not merged: $(git rev-list --count HEAD..FETCH_HEAD)"
+            echo "- Fork commits: $(git rev-list --count --no-merges FETCH_HEAD..HEAD)"
+            echo "- Merge base: $(git log -1 --format='%h %cs' "$base")"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+          if git merge --no-edit --no-ff FETCH_HEAD > /dev/null; then
+            echo "Merge: clean" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          {
+            echo "### Merge conflicts"
+            echo
+            echo "| File | FORK.md entries that edit it |"
+            echo "|---|---|"
+            git diff --name-only --diff-filter=U | while read -r f; do
+              entries=""
+              if [ -f FORK.md ]; then
+                entries=$(awk -v f="- \`$f\`" '/^## /{t=substr($0,4)} $0==f{print t}' FORK.md | sort -u | paste -sd ';' -)
+              fi
+              echo "| \`$f\` | ${entries:-none} |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+
+      - name: Set up Go
+        uses: actions/setup-go@f111f3307d8850f501ac008e886eec1fd1932a34 # v5.3.0
+        with:
+          go-version-file: go.mod
+
+      - name: Test the merged tree
+        env:
+          AX_TEST_POSTGRES_URL: postgres://ax:ax@localhost:5432/ax?sslmode=disable
+        run: go test ./...
