@@ -304,14 +304,14 @@ func isOrphanActor(actor *ateapipb.Actor, now time.Time, minAge time.Duration, t
 	atespace := actor.GetMetadata().GetAtespace()
 	name := actor.GetMetadata().GetName()
 	tmpl := actor.GetActorTemplate()
-	if tmpl == nil || tmpl.GetAtespace() != atespace || !taskTemplatePattern(name).MatchString(tmpl.GetName()) {
+	if tmpl.GetAtespace() != atespace || !taskTemplatePattern(name).MatchString(tmpl.GetName()) {
 		return false
 	}
 	if taskKeys[atespace+"/"+name] {
 		return false
 	}
 	created := actor.GetMetadata().GetCreateTime()
-	if created == nil || created.CheckValid() != nil {
+	if created.CheckValid() != nil {
 		return false
 	}
 	return now.Sub(created.AsTime()) >= minAge
