@@ -491,6 +491,39 @@ func TestRestoreConsumerGroup(t *testing.T) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
 	t.Cleanup(func() { slog.SetDefault(previous) })
 
+	for _, subscribeFirst := range []bool{true, false} {
+		group := fmt.Sprintf("subscribe-first-%t", subscribeFirst)
+		active, err := s.Subscribe(ctx, group, "active")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if logs.Len() != 0 {
+			t.Fatalf("fresh Subscribe logged a warning: %q", logs.String())
+		}
+		if err := client.XGroupDestroy(ctx, s.opts.StreamName, group).Err(); err != nil {
+			t.Fatal(err)
+		}
+		restore := func() {
+			t.Helper()
+			if err := active.(*subscription).restoreConsumerGroup(ctx); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if !subscribeFirst {
+			restore()
+		}
+		if _, err := s.Subscribe(ctx, group, "replacement"); err != nil {
+			t.Fatal(err)
+		}
+		if subscribeFirst {
+			restore()
+		}
+		if strings.Count(logs.String(), "level=WARN msg=\"restored Redis consumer group\"") != 1 {
+			t.Fatalf("Subscribe first = %t: expected one recovery warning, got %q", subscribeFirst, logs.String())
+		}
+		logs.Reset()
+	}
+
 	sub := &subscription{store: s, group: "group", consumer: "first", claimCursor: "42-0"}
 	competitor := &subscription{store: s, group: "group", consumer: "second", claimCursor: "42-0"}
 	other, err := s.Subscribe(ctx, "other", "first")

@@ -894,6 +894,7 @@ if not position then
     end
     redis.call('XGROUP', 'CREATE', stream, group, position, 'MKSTREAM')
     redis.call('SET', checkpoint, empty)
+    if operation == 'subscribe' then return 0 end
     return 1
 end
 
@@ -922,7 +923,11 @@ func (s *Store) checkpointKey(group string) string {
 }
 
 func (s *Store) consumerGroupCheckpoint(ctx context.Context, group, operation, id string) (int, error) {
-	return checkpointGroup.Run(ctx, s.client, []string{s.opts.StreamName, s.checkpointKey(group)}, group, operation, id).Int()
+	result, err := checkpointGroup.Run(ctx, s.client, []string{s.opts.StreamName, s.checkpointKey(group)}, group, operation, id).Int()
+	if err == nil && result == 1 && (operation == "subscribe" || operation == "recover") {
+		slog.Warn("restored Redis consumer group", "stream", s.opts.StreamName, "group", group)
+	}
+	return result, err
 }
 
 // subscription reads from a consumer group in batches.
@@ -948,15 +953,12 @@ type subscription struct {
 }
 
 func (sub *subscription) restoreConsumerGroup(ctx context.Context) error {
-	created, err := sub.store.consumerGroupCheckpoint(ctx, sub.group, "recover", "")
+	_, err := sub.store.consumerGroupCheckpoint(ctx, sub.group, "recover", "")
 	if err != nil {
 		return fmt.Errorf("restoring consumer group %q: %w", sub.group, err)
 	}
 	sub.claimCursor = "0-0"
 	sub.lastClaim = time.Now()
-	if created == 1 {
-		slog.Warn("restored Redis consumer group", "stream", sub.store.opts.StreamName, "group", sub.group)
-	}
 	return nil
 }
 
