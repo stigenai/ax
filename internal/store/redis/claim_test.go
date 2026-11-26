@@ -234,6 +234,76 @@ func TestAckAfterGroupLossPreservesPendingGap(t *testing.T) {
 	}
 }
 
+func TestNextRestoresOutstandingBufferedEvent(t *testing.T) {
+	s, client := newClaimTestStore(t, "buffered-recovery", Options{ClaimMinIdle: -1, ReadBatchSize: 2})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	stream := s.opts.StreamName
+	const group = "group"
+	sub, err := s.Subscribe(ctx, group, "consumer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := addTestEvent(t, ctx, client, stream, "first")
+	second := addTestEvent(t, ctx, client, stream, "second")
+	ev, err := sub.Next(ctx)
+	if err != nil || ev.ID != first {
+		t.Fatalf("initial delivery = %v, %v, want %s", ev, err, first)
+	}
+	if err := sub.Ack(ctx, ev); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.XGroupDestroy(ctx, stream, group).Err(); err != nil {
+		t.Fatal(err)
+	}
+	marker := addTestEvent(t, ctx, client, stream, "marker")
+	for _, want := range []string{second, marker} {
+		if ev, err := sub.Next(ctx); err != nil || ev.ID != want {
+			t.Fatalf("next delivery = %v, %v, want %s", ev, err, want)
+		}
+		if err := sub.Ack(ctx, ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestNextKeepsBufferedEventAfterRestoreError(t *testing.T) {
+	s, client := newClaimTestStore(t, "buffered-restore-error", Options{ClaimMinIdle: -1, ReadBatchSize: 2})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	stream := s.opts.StreamName
+	const group = "group"
+	sub, err := s.Subscribe(ctx, group, "consumer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addTestEvent(t, ctx, client, stream, "first")
+	second := addTestEvent(t, ctx, client, stream, "second")
+	if _, err := sub.Next(ctx); err != nil {
+		t.Fatal(err)
+	}
+	key := s.checkpointKey(group)
+	saved, err := client.Get(ctx, key).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.XGroupDestroy(ctx, stream, group).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Set(ctx, key, "", 0).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sub.Next(ctx); err == nil || !strings.Contains(err.Error(), "restoring consumer group") {
+		t.Fatalf("Next error = %v, want group restore error", err)
+	}
+	if err := client.Set(ctx, key, saved, 0).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if ev, err := sub.Next(ctx); err != nil || ev.ID != second {
+		t.Fatalf("next delivery = %v, %v, want %s", ev, err, second)
+	}
+}
+
 func TestNextSkipsAcknowledgedBufferedEvent(t *testing.T) {
 	t.Run("live group", func(t *testing.T) { testNextSkipsAcknowledgedBufferedEvent(t, false) })
 	t.Run("group loss", func(t *testing.T) { testNextSkipsAcknowledgedBufferedEvent(t, true) })

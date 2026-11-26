@@ -855,7 +855,6 @@ end
 if operation == 'recover' and position then return 0 end
 local deliveries = 0
 if operation == 'deliver' then
-    if not position then return -1 end
     local match = redis.call('XPENDING', stream, group, id, id, 1)
     if #match == 0 then return -1 end
     deliveries = match[1][4]
@@ -976,6 +975,11 @@ func (sub *subscription) Next(ctx context.Context) (store.TaskEvent, error) {
 		}
 		ev := sub.pending[0]
 		deliveries, err := sub.store.consumerGroupCheckpoint(ctx, sub.group, "deliver", ev.ID)
+		if redis.HasErrorPrefix(err, "NOGROUP") {
+			if err = sub.restoreConsumerGroup(ctx); err == nil {
+				continue
+			}
+		}
 		if err != nil {
 			return store.TaskEvent{}, fmt.Errorf("saving pending task event %s: %w", ev.ID, err)
 		}
