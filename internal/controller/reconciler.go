@@ -123,6 +123,24 @@ type TaskReconciler struct {
 	// reasonCPUExceedsCapacity. As with MaxTaskMemory, the check applies
 	// before each placement, not to a task already in phase Running.
 	MaxTaskCPU resource.Quantity
+
+	// DefaultWorkerLabels (AX_DEFAULT_WORKER_LABELS) pin a task that sets no
+	// spec.workerLabels to the WorkerPool whose labels contain all of them.
+	// Empty means no default. Fabriek supervisor tasks ignore it, because their
+	// existing templates are immutable.
+	DefaultWorkerLabels map[string]string
+}
+
+// effectiveWorkerLabels returns the labels a task's workers must carry: its
+// own spec.workerLabels, else DefaultWorkerLabels (not for a supervisor task).
+func (r *TaskReconciler) effectiveWorkerLabels(spec *v1alpha1.TaskSpec) map[string]string {
+	if len(spec.GetWorkerLabels()) > 0 {
+		return spec.GetWorkerLabels()
+	}
+	if spec.GetSupervisorProfile() != "" {
+		return nil
+	}
+	return r.DefaultWorkerLabels
 }
 
 // NewTaskReconciler creates a new TaskReconciler.
@@ -292,7 +310,7 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 			}
 		}
 
-		tmpl, err := r.client.EnsureActorTemplateWithImage(ctx, templateAtespace, templateName, atespace, customTemplateName, task.Spec.Image, task.Spec.SupervisorProfile, task.Spec.GetSandboxClass(), effectiveResources, task.Spec.Capabilities, extraEnv)
+		tmpl, err := r.client.EnsureActorTemplateWithImage(ctx, templateAtespace, templateName, atespace, customTemplateName, task.Spec.Image, task.Spec.SupervisorProfile, task.Spec.GetSandboxClass(), effectiveResources, task.Spec.Capabilities, r.effectiveWorkerLabels(task.Spec), extraEnv)
 		if err != nil {
 			// The default template has neither this image nor this env, so an
 			// actor made from it would not be this task: fail with the reason.

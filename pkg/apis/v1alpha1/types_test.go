@@ -693,3 +693,50 @@ func TestTaskCapabilityAndSupervisorWireNumbers(t *testing.T) {
 		t.Fatal("ordinary task capabilities lost in YAML")
 	}
 }
+
+func TestValidateTaskWorkerLabels(t *testing.T) {
+	many := map[string]string{}
+	for i := 0; i < 9; i++ {
+		many[strings.Repeat("k", i+1)] = "v"
+	}
+	for name, tc := range map[string]struct {
+		labels  map[string]string
+		wantErr bool
+	}{
+		"nil":             {nil, false},
+		"simple":          {map[string]string{"workload": "sluis"}, false},
+		"prefixed":        {map[string]string{"example.com/pool": "a-b_c.d"}, false},
+		"empty value":     {map[string]string{"workload": ""}, false},
+		"empty key":       {map[string]string{"": "x"}, true},
+		"key with space":  {map[string]string{"a b": "x"}, true},
+		"bad prefix":      {map[string]string{"Example.com/pool": "x"}, true},
+		"two slashes":     {map[string]string{"a/b/c": "x"}, true},
+		"long key":        {map[string]string{strings.Repeat("a", 64): "x"}, true},
+		"value with star": {map[string]string{"workload": "a*"}, true},
+		"value edge dash": {map[string]string{"workload": "-a"}, true},
+		"long value":      {map[string]string{"workload": strings.Repeat("a", 64)}, true},
+		"nine pairs":      {many, true},
+	} {
+		err := v1alpha1.ValidateTask(&v1alpha1.Task{Spec: &v1alpha1.TaskSpec{WorkerLabels: tc.labels}})
+		if (err != nil) != tc.wantErr {
+			t.Errorf("%s: error = %v, want error %v", name, err, tc.wantErr)
+		}
+	}
+}
+
+func TestParseWorkerLabels(t *testing.T) {
+	got, err := v1alpha1.ParseWorkerLabels("workload=ax,a=b")
+	if err != nil || len(got) != 2 || got["workload"] != "ax" || got["a"] != "b" {
+		t.Fatalf("got %v, %v", got, err)
+	}
+	for _, in := range []string{"", "  "} {
+		if got, err := v1alpha1.ParseWorkerLabels(in); err != nil || got != nil {
+			t.Errorf("%q: got %v, %v; want nil, nil", in, got, err)
+		}
+	}
+	for _, in := range []string{"workload", "=x", "a=b,", "a b=c"} {
+		if _, err := v1alpha1.ParseWorkerLabels(in); err == nil {
+			t.Errorf("%q: want error", in)
+		}
+	}
+}
