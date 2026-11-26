@@ -15,6 +15,7 @@
 package controller
 
 import (
+	"errors"
 	"context"
 	"log/slog"
 	"sync"
@@ -256,7 +257,7 @@ func (d *DeletionSweeper) sweepActors(ctx context.Context, now time.Time, minAge
 	}
 	for _, actor := range actors {
 		if actor.GetStatus().GetState() != ateapipb.ActorState_ACTOR_STATE_DELETING {
-			if isOrphanActor(actor, now, minAge, taskKeys) {
+			if isOrphanActor(actor, now, minAge, taskKeys) && d.taskRecordMissing(ctx, actor) {
 				orphanActors++
 				slog.Warn("delete sweep: orphan actor",
 					"atespace", actor.GetMetadata().GetAtespace(),
@@ -288,6 +289,16 @@ func (d *DeletionSweeper) sweepActors(ctx context.Context, now time.Time, minAge
 		)
 	}
 	return stuckActors, orphanActors, false
+}
+
+// taskRecordMissing confirms an orphan candidate with a direct GetTask. The
+// paged list can miss a task that exists: the Redis ListTasks drops an
+// indexed task it cannot read, and the page then looks like the last one
+// (ax-vnr.12). Only ErrNotFound confirms the orphan. Any other error fails
+// closed.
+func (d *DeletionSweeper) taskRecordMissing(ctx context.Context, actor *ateapipb.Actor) bool {
+	_, err := d.Store.GetTask(ctx, actor.GetMetadata().GetAtespace(), actor.GetMetadata().GetName())
+	return errors.Is(err, store.ErrNotFound)
 }
 
 // isOrphanActor reports whether actor is an AX actor with no task record.

@@ -89,6 +89,25 @@ func (s *writeSpyStore) SaveWorkspace(ctx context.Context, w *v1alpha1.Workspace
 	return s.Store.SaveWorkspace(ctx, w)
 }
 
+// hiddenTaskStore lists no task but still serves GetTask. It stands in for
+// the Redis ListTasks that drops an indexed task whose value it cannot
+// read, so a short page hides a task that exists (ax-vnr.12).
+type hiddenTaskStore struct {
+	store.Store
+	getErr error
+}
+
+func (s *hiddenTaskStore) ListTasks(context.Context, string, int64, int64) ([]*v1alpha1.Task, error) {
+	return nil, nil
+}
+
+func (s *hiddenTaskStore) GetTask(ctx context.Context, a, n string) (*v1alpha1.Task, error) {
+	if s.getErr != nil {
+		return nil, s.getErr
+	}
+	return s.Store.GetTask(ctx, a, n)
+}
+
 // orphanActor returns an AX-shaped actor: running, template name matching
 // taskTemplatePattern, 1 hour old. A test changes the one field it probes.
 func orphanActor(now time.Time, atespace, name string) *ateapipb.Actor {
@@ -111,6 +130,8 @@ func TestDeleteSweepOrphanActors(t *testing.T) {
 		taskSpace string // atespace of that task; "" means factory
 		listErr   bool   // ListTasks fails
 		actorErr  bool   // ListActors fails
+		hidden    bool   // ListTasks hides the task; GetTask finds it
+		getErr    error  // GetTask fails (with hidden, or with no task)
 		want      int
 	}{
 		{name: "running orphan", want: 1},
@@ -129,6 +150,8 @@ func TestDeleteSweepOrphanActors(t *testing.T) {
 		{name: "nil create time", actor: func(a *ateapipb.Actor) { a.Metadata.CreateTime = nil }, want: 0},
 		{name: "invalid create time", actor: func(a *ateapipb.Actor) { a.Metadata.CreateTime = &timestamppb.Timestamp{Seconds: -1 << 60} }, want: 0},
 		{name: "ListTasks error", listErr: true, want: 0},
+		{name: "task hidden from a short page", task: "Running", hidden: true, want: 0},
+		{name: "GetTask error", getErr: errors.New("redis down"), want: 0},
 		{name: "ListActors error", actorErr: true, want: 0},
 	}
 	for _, tc := range tests {
@@ -150,6 +173,9 @@ func TestDeleteSweepOrphanActors(t *testing.T) {
 			var st store.Store = base
 			if tc.listErr {
 				st = &failOnCallListTasksStore{Store: base, failOnCall: 1}
+			}
+			if tc.hidden || tc.getErr != nil {
+				st = &hiddenTaskStore{Store: st, getErr: tc.getErr}
 			}
 			spy := &writeSpyStore{Store: st}
 			actor := orphanActor(now, "factory", "orphan")
