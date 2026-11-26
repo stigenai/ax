@@ -137,6 +137,19 @@ The sweep skips the report when it cannot list the tasks.
 
 To recover an orphan, apply the workspace manifest and then the task manifest again. Keep the original `creationTimestamp` of the task. The template name and the actor then stay the same. If the task is gone for good, a person deletes the actor (see `docs/stuck-deletions.md`).
 
+## Owner steps
+
+Only the owner runs these steps. They need the live cluster. CI and the offline checks cannot prove them. Run them after the pull request is merged.
+
+| AC | Offline proof (done) | Owner step (post-merge) |
+| --- | --- | --- |
+| AC1 manifest | Static check in `deploy/stigenai/redis-persistence-test.sh` | Pre-check: `kubectl --context gtr get storageclass` |
+| AC2 restart keeps data | `bash deploy/stigenai/redis-persistence-test.sh` against a local Redis with a data directory | "Migration", then "Restart check" |
+| AC4, AC5 orphan report | `go test ./internal/controller -run TestDeleteSweepOrphanActors` | Apply ax-controller with `ko`, then read the `delete sweep: orphan actor` log lines |
+| AC7 live migration | None | "Migration" steps 1 to 6 |
+| AC8 soak | None | "Restart check" on the live pod, then watch the controller logs |
+| ax-89l k0s-agents | None (same `deploy/redis.yaml`) | Run "Pre-check", "Migration" and "Restart check" with the k0s-agents context and namespace |
+
 ## Rollback
 
 Choose the case.
