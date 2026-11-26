@@ -26,6 +26,19 @@ kubectl --context gtr get storageclass
 
 One class must show `(default)`.
 
+## Private work directory
+
+Make one private directory outside the checkout. Run all local steps in it. Run `umask 077` in each new shell.
+
+```bash
+umask 077
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/ax-redis-migration.XXXXXX")
+cd "$WORK"
+stat -c %a "$WORK"
+```
+
+`mktemp -d` makes the directory with mode 700. The `stat` command must print `700`. The `kubectl exec` command does not use the local umask. Set the mode of each directory in the pod yourself.
+
 ## Task inventory
 
 The CLI task list is not an inventory. The CLI sends no limit, and the server returns at most 50 tasks. Its AGE column also changes. Read the full task index of Redis instead. It holds one `<atespace>:<name>` member for each task.
@@ -40,7 +53,7 @@ test -s tasks-before.txt && wc -l tasks-before.txt
 
 `PING` must print `PONG`. If a command fails, stop. Do not go on with an old or empty file.
 
-The task inventory and the `ax get task` output name tasks and can show task specs. Keep them in a private directory (`umask 077`). Use a new file name for each record. To compare, run `diff tasks-before.txt tasks-after.txt`. The diff must be empty. `ax -a <atespace> get task <name>` needs the ax-server RPC. Run it for 3 tasks only while ax-server runs. Keep the output. After the step, when ax-server runs again, each of these commands must succeed with the same spec.
+The task inventory and the `ax get task` output name tasks and can show task specs. Keep them in the private work directory. Use a new file name for each record. To compare, run `diff tasks-before.txt tasks-after.txt`. The diff must be empty. `ax -a <atespace> get task <name>` needs the ax-server RPC. Run it for 3 tasks only while ax-server runs. Keep the output. After the step, when ax-server runs again, each of these commands must succeed with the same spec.
 
 ## Migration
 
@@ -56,10 +69,9 @@ A plain apply of the new manifest starts Redis with 0 keys. Redis with `--append
 
 2. Record the baseline after the writers are gone: the task inventory (see "Task inventory") and `DBSIZE`. Then save the data and keep the file. It is the rollback copy.
 
-   The file holds the full database. It can contain tokens. Set private access before the copy: use `umask 077`, and a private directory.
+   The file holds the full database. It can contain tokens. Run this step in the private work directory. Its `ls -l` must show mode `-rw-------`.
 
    ```bash
-   umask 077
    kubectl --context gtr -n ax-system exec deploy/ax-redis -- redis-cli SAVE
    kubectl --context gtr -n ax-system cp "$(kubectl --context gtr -n ax-system get pod -l app.kubernetes.io/name=ax-redis -o name | cut -d/ -f2)":/data/dump.rdb ./ax-redis-before.rdb
    ls -l ax-redis-before.rdb
@@ -81,14 +93,14 @@ A plain apply of the new manifest starts Redis with 0 keys. Redis with `--append
 
    ```bash
    POD=$(kubectl --context gtr -n ax-system get pod -l app.kubernetes.io/name=ax-redis -o name | cut -d/ -f2)
-   kubectl --context gtr -n ax-system exec "$POD" -- mkdir -p /tmp/seed
+   kubectl --context gtr -n ax-system exec "$POD" -- sh -c 'umask 077 && mkdir -p /tmp/seed && stat -c %a /tmp/seed'
    kubectl --context gtr -n ax-system cp ./ax-redis-before.rdb "$POD":/tmp/seed/dump.rdb
    kubectl --context gtr -n ax-system exec "$POD" -- sh -c 'redis-server --port 6380 --dir /tmp/seed --appendonly no --daemonize yes'
    kubectl --context gtr -n ax-system exec "$POD" -- redis-cli REPLICAOF 127.0.0.1 6380
    kubectl --context gtr -n ax-system exec "$POD" -- redis-cli INFO replication
    ```
 
-   Repeat the last command until it shows `master_link_status:up`. Then run:
+   The `stat` in the pod must print `700`. Repeat the last command until it shows `master_link_status:up`. Then run:
 
    ```bash
    kubectl --context gtr -n ax-system exec "$POD" -- redis-cli REPLICAOF NO ONE
@@ -116,7 +128,7 @@ A plain apply of the new manifest starts Redis with 0 keys. Redis with `--append
 
    Wait until Redis answers PING, then record the task inventory again. It must equal the inventory of step 2. Run `ax -a <atespace> get task <name>` for the 3 tasks that you kept before step 1. Each command must succeed.
 
-Remove each local file (`ax-redis-before.rdb`, the inventory files and the saved `ax get task` output) when the owner accepts the migration. Use `shred -u <file>` or `rm`. Then run `ls -l` in the directory. The files must not be there.
+Remove the private work directory with each local file in it (`ax-redis-before.rdb`, the inventory files and the saved `ax get task` output) when the owner accepts the migration. Leave the directory, then run `rm -r "$WORK"` and `ls -d "$WORK"`. The `ls` must fail with "No such file".
 
 ## Restart check
 
