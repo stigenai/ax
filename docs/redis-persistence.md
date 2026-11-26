@@ -30,24 +30,23 @@ One class must show `(default)`.
 
 A plain apply of the new manifest starts Redis with 0 keys. Redis with `--appendonly yes` ignores `dump.rdb` when it has no AOF file. Seed the new Redis from the old data.
 
-1. Save the current data and keep the file. It is the rollback copy.
+1. Stop the writers. If a writer runs during the save, the saved file lacks its last writes.
+
+   ```bash
+   kubectl --context gtr -n ax-system scale deploy/ax-server deploy/ax-controller --replicas=0
+   kubectl --context gtr -n ax-system wait --for=delete pod -l app.kubernetes.io/name=ax-server --timeout=120s
+   kubectl --context gtr -n ax-system wait --for=delete pod -l app.kubernetes.io/name=ax-controller --timeout=120s
+   ```
+
+2. Save the data and keep the file. It is the rollback copy. Record the baseline: `DBSIZE` and the task list of each atespace.
 
    ```bash
    kubectl --context gtr -n ax-system exec deploy/ax-redis -- redis-cli SAVE
    kubectl --context gtr -n ax-system cp "$(kubectl --context gtr -n ax-system get pod -l app.kubernetes.io/name=ax-redis -o name | cut -d/ -f2)":/data/dump.rdb ./ax-redis-before.rdb
-   ```
-
-   Record the baseline: `DBSIZE` and `ax -a <atespace> get tasks` for each atespace.
-
-   ```bash
    kubectl --context gtr -n ax-system exec deploy/ax-redis -- redis-cli DBSIZE
    ```
 
-2. Stop the writers.
-
-   ```bash
-   kubectl --context gtr -n ax-system scale deploy/ax-server deploy/ax-controller --replicas=0
-   ```
+   `ax get tasks` needs ax-server. Before step 1, run `ax -a <atespace> get tasks` for each atespace and keep the output. Compare it in step 6.
 
 3. Apply the manifest. The Recreate strategy stops the old pod first.
 
@@ -88,17 +87,29 @@ A plain apply of the new manifest starts Redis with 0 keys. Redis with `--append
 
    ```bash
    kubectl --context gtr -n ax-system scale deploy/ax-server deploy/ax-controller --replicas=1
+   kubectl --context gtr -n ax-system rollout status deploy/ax-server deploy/ax-controller
    ```
+
+   Run `ax -a <atespace> get tasks` for each atespace. The lists must equal the lists from before step 1.
 
 ## Restart check
 
-CI runs `bash deploy/stigenai/redis-persistence-test.sh` on each pull request. It starts Redis with the args of `deploy/redis.yaml`. It writes 3 task keys, one stream entry, a consumer group and one pending entry. It then does a SIGKILL and a restart, and a `SHUTDOWN NOSAVE` and a new start on the same directory. After each step the data must be the same.
+CI runs `bash deploy/stigenai/redis-persistence-test.sh` on each pull request. It starts Redis with the args of `deploy/redis.yaml`. It writes 3 task records with their indexes, 3 stream entries, a consumer group and one pending entry. It then does a SIGKILL and a restart, and a `SHUTDOWN NOSAVE` and a new start on the same directory. After each step the data must be the same.
 
-To check the live cluster, record `ax -a <atespace> get tasks` for each atespace. Then restart the container and the pod, and compare the lists after each.
+To check the live cluster, record `ax -a <atespace> get tasks` for each atespace. Restart the container. Wait until Redis is ready. Compare the lists.
 
 ```bash
 kubectl --context gtr -n ax-system exec deploy/ax-redis -- redis-cli SHUTDOWN NOSAVE
+kubectl --context gtr -n ax-system rollout status deploy/ax-redis
+kubectl --context gtr -n ax-system exec deploy/ax-redis -- redis-cli PING
+```
+
+Then restart the pod. Wait until Redis is ready. Compare the lists again.
+
+```bash
 kubectl --context gtr -n ax-system delete pod -l app.kubernetes.io/name=ax-redis
+kubectl --context gtr -n ax-system rollout status deploy/ax-redis
+kubectl --context gtr -n ax-system exec deploy/ax-redis -- redis-cli PING
 ```
 
 `ax ssh` to a Running task must connect after both.

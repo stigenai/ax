@@ -96,6 +96,9 @@ snapshot() {
   rc GET ax:task:t:a
   rc GET ax:task:t:b
   rc GET ax:task:u:c
+  rc ZRANGE ax:tasks:index 0 -1 WITHSCORES
+  rc ZRANGE ax:tasks:atespace:t 0 -1 WITHSCORES
+  rc ZRANGE ax:tasks:atespace:u 0 -1 WITHSCORES
   rc XLEN ax:stream:tasks
   rc XINFO GROUPS ax:stream:tasks
   rc XPENDING ax:stream:tasks ax-controllers | head -n1
@@ -103,10 +106,18 @@ snapshot() {
 
 start
 wait_ready
-rc SET ax:task:t:a '{"name":"a"}' >/dev/null
-rc SET ax:task:t:b '{"name":"b"}' >/dev/null
-rc SET ax:task:u:c '{"name":"c"}' >/dev/null
-rc XADD ax:stream:tasks '*' action reconcile >/dev/null
+# The fixture has the shape of SaveTask (internal/store/redis/store.go): a
+# task record with metadata, a score in the global and atespace indexes, and
+# a stream entry with action, atespace and name.
+save_task() { # atespace name score
+  rc SET "ax:task:$1:$2" "{\"apiVersion\":\"ax.io/v1alpha1\",\"kind\":\"Task\",\"metadata\":{\"name\":\"$2\",\"atespace\":\"$1\"},\"status\":{\"phase\":\"Running\"}}" >/dev/null
+  rc ZADD ax:tasks:index "$3" "$1:$2" >/dev/null
+  rc ZADD "ax:tasks:atespace:$1" "$3" "$2" >/dev/null
+  rc XADD ax:stream:tasks '*' action reconcile atespace "$1" name "$2" >/dev/null
+}
+save_task t a 1001
+save_task t b 1002
+save_task u c 1003
 rc XGROUP CREATE ax:stream:tasks ax-controllers 0 >/dev/null
 rc XREADGROUP GROUP ax-controllers c1 COUNT 1 STREAMS ax:stream:tasks '>' >/dev/null
 before=$(snapshot)

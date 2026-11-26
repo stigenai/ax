@@ -125,6 +125,7 @@ func TestDeleteSweepOrphanActors(t *testing.T) {
 		{name: "template in another atespace", actor: func(a *ateapipb.Actor) { a.ActorTemplate.Atespace = "other" }, want: 0},
 		{name: "nil template", actor: func(a *ateapipb.Actor) { a.ActorTemplate = nil }, want: 0},
 		{name: "younger than MinAge", actor: func(a *ateapipb.Actor) { a.Metadata.CreateTime = timestamppb.New(now.Add(-5 * time.Minute)) }, want: 0},
+		{name: "exactly MinAge", actor: func(a *ateapipb.Actor) { a.Metadata.CreateTime = timestamppb.New(now.Add(-15 * time.Minute)) }, want: 1},
 		{name: "nil create time", actor: func(a *ateapipb.Actor) { a.Metadata.CreateTime = nil }, want: 0},
 		{name: "invalid create time", actor: func(a *ateapipb.Actor) { a.Metadata.CreateTime = &timestamppb.Timestamp{Seconds: -1 << 60} }, want: 0},
 		{name: "ListTasks error", listErr: true, want: 0},
@@ -169,7 +170,7 @@ func TestDeleteSweepOrphanActors(t *testing.T) {
 				t.Fatalf("want %d orphan lines, got %d: %s", tc.want, got, output)
 			}
 			if tc.want == 1 {
-				for _, s := range []string{"atespace=factory", "name=orphan", "uid=uid-orphan", "state=ACTOR_STATE_", "template=orphan-tmpl-0123abcd", "worker_pod=worker-1", "age=1h0m0s"} {
+				for _, s := range []string{"atespace=factory", "name=orphan", "uid=uid-orphan", "state=ACTOR_STATE_", "template=orphan-tmpl-0123abcd", "worker_pod=worker-1", "age="} {
 					if !strings.Contains(output, s) {
 						t.Fatalf("orphan line lacks %s: %s", s, output)
 					}
