@@ -106,6 +106,7 @@ func TestSubscriptionRestoresConsumerGroup(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			sub.(*subscription).lastClaim = time.Time{}
 			ev, err = sub.Next(ctx)
 			if err != nil {
 				t.Fatal(err)
