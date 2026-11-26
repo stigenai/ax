@@ -3,7 +3,9 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -11,8 +13,10 @@ import (
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"github.com/google/ax/internal/store"
 	"github.com/google/ax/internal/store/memory"
+	redisstore "github.com/google/ax/internal/store/redis"
 	"github.com/google/ax/internal/substrate"
 	"github.com/google/ax/pkg/apis/v1alpha1"
+	redisclient "github.com/redis/go-redis/v9"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -80,6 +84,160 @@ func (s *deletionControlServer) Attempts() int {
 func (s *deletionControlServer) ListActorTemplates(_ context.Context, request *ateapipb.ListActorTemplatesRequest) (*ateapipb.ListActorTemplatesResponse, error) {
 	s.templates <- request
 	return &ateapipb.ListActorTemplatesResponse{}, nil
+}
+
+type recoveryDeleteServer struct {
+	deletionControlServer
+	templateDeletes chan string
+}
+
+func (s *recoveryDeleteServer) ListActorTemplates(context.Context, *ateapipb.ListActorTemplatesRequest) (*ateapipb.ListActorTemplatesResponse, error) {
+	return &ateapipb.ListActorTemplatesResponse{ActorTemplates: []*ateapipb.ActorTemplate{
+		{Metadata: &ateapipb.ResourceMetadata{Name: "old-tmpl-01234567", Uid: "old"}},
+		{Metadata: &ateapipb.ResourceMetadata{Name: "new-tmpl-01234567", Uid: "new"}},
+	}}, nil
+}
+
+func (s *recoveryDeleteServer) ListTags(context.Context, *ateapipb.ListTagsRequest) (*ateapipb.ListTagsResponse, error) {
+	return &ateapipb.ListTagsResponse{}, nil
+}
+
+func (s *recoveryDeleteServer) DeleteActorTemplate(_ context.Context, req *ateapipb.DeleteActorTemplateRequest) (*ateapipb.ActorTemplate, error) {
+	s.templateDeletes <- req.GetActorTemplate().GetName()
+	return &ateapipb.ActorTemplate{}, nil
+}
+
+func TestRecoveryDispatchesOnlyOutstandingWork(t *testing.T) {
+	address := os.Getenv("AX_DELETE_TEST_REDIS_ADDRESS")
+	if address == "" {
+		t.Skip("requires explicit disposable AX_DELETE_TEST_REDIS_ADDRESS")
+	}
+	for _, tc := range []struct {
+		name        string
+		claimIdle   time.Duration
+		terminating bool
+		pending     bool
+	}{
+		{name: "read/absent", claimIdle: -1},
+		{name: "read/terminating", claimIdle: -1, terminating: true},
+		{name: "claim/absent", claimIdle: time.Second},
+		{name: "claim/terminating", claimIdle: time.Second, terminating: true},
+		{name: "claim/pending-expired", claimIdle: time.Second, pending: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			redis := redisclient.NewClient(&redisclient.Options{Addr: address})
+			t.Cleanup(func() { _ = redis.Close() })
+			prefix := fmt.Sprintf("ax-worker-recovery-%d", time.Now().UnixNano())
+			stream := prefix + ":events"
+			s := redisstore.NewStore(redis, redisstore.Options{
+				KeyPrefix: prefix, StreamName: stream, ClaimMinIdle: tc.claimIdle,
+				ClaimInterval: time.Millisecond, ReadBlock: time.Millisecond,
+			})
+			control := &recoveryDeleteServer{
+				deletionControlServer: deletionControlServer{deletions: make(chan *ateapipb.DeleteActorRequest, 4)},
+				templateDeletes:       make(chan string, 4),
+			}
+			listener, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			server := grpc.NewServer()
+			ateapipb.RegisterControlServer(server, control)
+			go server.Serve(listener)
+			t.Cleanup(server.Stop)
+			client, err := substrate.NewClient(listener.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = client.Close() })
+			worker := &Worker{store: s, reconciler: NewTaskReconciler(client, "default-template", "ax-system")}
+			if tc.terminating {
+				if err := s.SaveTask(ctx, &v1alpha1.Task{
+					Metadata: &v1alpha1.ObjectMeta{Atespace: "private", Name: "old"},
+					Status:   &v1alpha1.TaskStatus{Phase: v1alpha1.PhaseTerminating},
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			const group = "group"
+			publish := func(action, name string) string {
+				t.Helper()
+				id, err := redis.XAdd(ctx, &redisclient.XAddArgs{Stream: stream,
+					Values: map[string]any{"atespace": "private", "action": action, "name": name},
+				}).Result()
+				if err != nil {
+					t.Fatal(err)
+				}
+				return id
+			}
+			original, err := s.Subscribe(ctx, group, "original")
+			if err != nil {
+				t.Fatal(err)
+			}
+			replacement, err := s.Subscribe(ctx, group, "replacement")
+			if err != nil {
+				t.Fatal(err)
+			}
+			old := publish("delete", "old")
+			ev, err := original.Next(ctx)
+			if err != nil || ev.ID != old {
+				t.Fatalf("initial delivery = %v, %v, want %s", ev, err, old)
+			}
+			if tc.pending {
+				checkpoint := publish("reconcile", "checkpoint")
+				ev, err = original.Next(ctx)
+				if err != nil || ev.ID != checkpoint {
+					t.Fatalf("second delivery = %v, %v, want %s", ev, err, checkpoint)
+				}
+			}
+			if err := original.Ack(ctx, ev); err != nil {
+				t.Fatal(err)
+			}
+			if err := redis.XGroupDestroy(ctx, stream, group).Err(); err != nil {
+				t.Fatal(err)
+			}
+			publish("delete", "new")
+			end := publish("reconcile", "end")
+			for {
+				ev, err := replacement.Next(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if ev.ID == end {
+					break
+				}
+				if err := worker.processEvent(ctx, ev); err != nil {
+					t.Fatal(err)
+				}
+				if err := replacement.Ack(ctx, ev); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if len(control.deletions) != 1 || len(control.templateDeletes) != 1 {
+				t.Fatalf("want only new cleanup, got %d actor and %d template deletes", len(control.deletions), len(control.templateDeletes))
+			}
+			if actor, template := (<-control.deletions).GetActor().GetName(), <-control.templateDeletes; actor != "new" || template != "new-tmpl-01234567" {
+				t.Fatalf("unexpected cleanup of actor %q and template %q", actor, template)
+			}
+			if tc.pending {
+				ev, err := replacement.Next(ctx)
+				if err != nil || ev.ID != old {
+					t.Fatalf("reclaimed delivery = %v, %v, want %s", ev, err, old)
+				}
+				if err := worker.processEvent(ctx, ev); err != nil {
+					t.Fatal(err)
+				}
+				if len(control.deletions) != 1 || len(control.templateDeletes) != 1 {
+					t.Fatal("pending delete did not clean up its actor and template")
+				}
+				if actor, template := (<-control.deletions).GetActor().GetName(), <-control.templateDeletes; actor != "old" || template != "old-tmpl-01234567" {
+					t.Fatalf("unexpected cleanup of actor %q and template %q", actor, template)
+				}
+			}
+		})
+	}
 }
 
 func TestMissingTaskDeletionPreservesOnlyLegacyCleanup(t *testing.T) {

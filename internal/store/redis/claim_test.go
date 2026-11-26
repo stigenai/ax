@@ -84,11 +84,16 @@ func TestSubscriptionRestoresConsumerGroup(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 
+			addTestEvent(t, ctx, client, s.opts.StreamName, "history")
 			sub, err := s.Subscribe(ctx, "group", "consumer")
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := client.XGroupDestroy(ctx, s.opts.StreamName, "group").Err(); err != nil {
+			initial := addTestEvent(t, ctx, client, s.opts.StreamName, "initial")
+			if ev, err := sub.Next(ctx); err != nil || ev.ID != initial {
+				t.Fatalf("fresh subscription got %v, %v, want %s", ev, err, initial)
+			}
+			if err := client.Del(ctx, s.opts.StreamName).Err(); err != nil {
 				t.Fatal(err)
 			}
 			id := addTestEvent(t, ctx, client, s.opts.StreamName, "job")
@@ -100,6 +105,63 @@ func TestSubscriptionRestoresConsumerGroup(t *testing.T) {
 				t.Fatalf("got event ID %q, want %q", ev.ID, id)
 			}
 		})
+	}
+}
+
+func TestRecoveryPreservesPendingGaps(t *testing.T) {
+	s, client := newClaimTestStore(t, "pending-gaps", Options{
+		ClaimMinIdle: time.Second, ClaimInterval: time.Millisecond, ReadBlock: time.Millisecond,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	stream := s.opts.StreamName
+	const group = "group"
+	if err := client.XGroupCreateMkStream(ctx, stream, group, "$").Err(); err != nil {
+		t.Fatal(err)
+	}
+	low := addTestEvent(t, ctx, client, stream, "low")
+	high := addTestEvent(t, ctx, client, stream, "high")
+	if _, err := client.XReadGroup(ctx, &redisclient.XReadGroupArgs{
+		Group: group, Consumer: "original", Streams: []string{stream, ">"}, Count: 2,
+	}).Result(); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.XAck(ctx, stream, group, high).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Do(ctx, "XCLAIM", stream, group, "original", 0, low, "IDLE", 200, "RETRYCOUNT", 2).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Subscribe(ctx, group, "original"); err != nil {
+		t.Fatal(err)
+	}
+	subscriber, err := s.Subscribe(ctx, group, "replacement")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sub := subscriber.(*subscription)
+	for _, name := range []string{"first", "second"} {
+		if err := client.XGroupDestroy(ctx, stream, group).Err(); err != nil {
+			t.Fatal(err)
+		}
+		marker := addTestEvent(t, ctx, client, stream, name)
+		ev, err := sub.Next(ctx)
+		if err != nil || ev.ID != marker {
+			t.Fatalf("after %s recovery got %v, %v, want marker %s", name, ev, err, marker)
+		}
+		pending, err := client.XPendingExt(ctx, &redisclient.XPendingExtArgs{
+			Stream: stream, Group: group, Start: low, End: low, Count: 1,
+		}).Result()
+		if err != nil || len(pending) != 1 || pending[0].Consumer != "original" || pending[0].RetryCount != 2 || pending[0].Idle < 200*time.Millisecond {
+			t.Fatalf("after %s recovery got pending %v, %v", name, pending, err)
+		}
+		if err := sub.Ack(ctx, ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ev, err := sub.Next(ctx)
+	if err != nil || ev.ID != low {
+		t.Fatalf("got reclaimed event %v, %v, want %s", ev, err, low)
 	}
 }
 
@@ -197,6 +259,13 @@ func TestClaimReassignsEventFromDeadConsumerAfterIdleThreshold(t *testing.T) {
 	}
 	if pending.Count != 0 {
 		t.Fatalf("XPENDING count = %d, want 0", pending.Count)
+	}
+	if err := client.XGroupDestroy(ctx, s.opts.StreamName, "group").Err(); err != nil {
+		t.Fatal(err)
+	}
+	marker := addTestEvent(t, ctx, client, s.opts.StreamName, "after normal ack")
+	if ev, err := subB.Next(ctx); err != nil || ev.ID != marker {
+		t.Fatalf("after recovery got %v, %v, want marker %s", ev, err, marker)
 	}
 }
 
@@ -422,5 +491,12 @@ func TestClaimDropsPoisonEventAfterMaxDeliveries(t *testing.T) {
 	}
 	if pending.Count != 0 {
 		t.Fatalf("XPENDING count = %d, want 0", pending.Count)
+	}
+	if err := client.XGroupDestroy(ctx, s.opts.StreamName, "group").Err(); err != nil {
+		t.Fatal(err)
+	}
+	marker := addTestEvent(t, ctx, client, s.opts.StreamName, "after poison drop")
+	if ev, err := sub.Next(ctx); err != nil || ev.ID != marker {
+		t.Fatalf("after recovery got %v, %v, want marker %s", ev, err, marker)
 	}
 }
