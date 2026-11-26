@@ -28,7 +28,9 @@ One class must show `(default)`.
 
 ## Private work directory
 
-The migration operator keeps the rollback copy. The operator is the person who runs the migration. Keep it on persistent local storage outside the checkout. Do not use shared temporary storage (`/tmp`) or a path with automatic cleanup. Make one new private directory under your home. Run all local steps in it. Run `umask 077` in each new shell, before the first capture.
+The migration operator keeps the rollback copy. The operator is the person who runs the migration. Keep the copy on persistent local storage outside the checkout. Do not use shared temporary storage (`/tmp`) or a path with automatic cleanup.
+
+Make one new private directory under your home. Run all local steps in it. Run `umask 077` in each new shell before the first capture.
 
 ```bash
 umask 077
@@ -70,7 +72,7 @@ A plain apply of the new manifest starts Redis with 0 keys. Redis with `--append
 
 2. Record the baseline after the writers are gone: the task inventory (see "Task inventory") and `DBSIZE`. Then save the data and keep the file. It is the rollback copy.
 
-   The file holds the full database. It can contain tokens. Run this step in the private work directory. Its `ls -l` must show mode `-rw-------`.
+   The file holds the full database. It can contain tokens. Run this step in the private work directory. For the RDB file, `ls -l` must show `-rw-------`.
 
    ```bash
    kubectl --context gtr -n ax-system exec deploy/ax-redis -- redis-cli SAVE
