@@ -33,7 +33,12 @@ spec:
   debug: true   # serve guest services inside the sandbox so `ax ssh` works; off by default
   capabilities: ["SETUID", "SETGID"]   # added to the container's default set; see below
   sandboxClass: gvisor   # gvisor (default) or microvm; see below
+  workerLabels: {workload: sluis}   # run only on workers whose WorkerPool labels contain all of these; see below
 ```
+
+### Worker labels
+
+`spec.workerLabels` (protojson name `workerLabels`) pins a task to the workers whose WorkerPool labels contain all the given pairs. It becomes the `workerSelector.matchLabels` of the task's ActorTemplate. Keys must be Kubernetes label names, values must be label values, and a task may set at most 8 pairs. A task that sets none runs on the workers that match `AX_DEFAULT_WORKER_LABELS`, a comma-separated `key=value` list (for example `workload=ax`) that ax-controller reads. If the variable is empty or unset, such a task can use any worker. A malformed value stops ax-controller at start. The labels apply when the task's ActorTemplate is created; an existing template is not changed.
 
 ### Capabilities
 

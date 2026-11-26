@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"regexp"
 	"slices"
 	"strconv"
@@ -265,6 +266,9 @@ func ValidateTask(t *Task) error {
 	if err := validateSupervisorTask(spec); err != nil {
 		return err
 	}
+	if err := ValidateWorkerLabels("spec.workerLabels", spec.GetWorkerLabels()); err != nil {
+		return err
+	}
 	switch spec.GetSandboxClass() {
 	case "", SandboxClassGVisor, SandboxClassMicroVM:
 	default:
@@ -316,6 +320,72 @@ func validateResourceReqs(spec *TaskSpec) error {
 		return err
 	}
 	return nil
+}
+
+var (
+	labelNameRE   = regexp.MustCompile(`^[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$`)
+	labelPrefixRE = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`)
+)
+
+// validLabelKey reports whether k is a Kubernetes qualified label name:
+// an optional DNS subdomain prefix and "/", then a name of up to 63 characters.
+func validLabelKey(k string) bool {
+	prefix, name, hasPrefix := strings.Cut(k, "/")
+	if !hasPrefix {
+		prefix, name = "", k
+	}
+	if hasPrefix && (len(prefix) > 253 || !labelPrefixRE.MatchString(prefix)) {
+		return false
+	}
+	return len(name) <= 63 && labelNameRE.MatchString(name)
+}
+
+// validLabelValue reports whether v is a Kubernetes label value.
+func validLabelValue(v string) bool {
+	return v == "" || (len(v) <= 63 && labelNameRE.MatchString(v))
+}
+
+// MaxWorkerLabels is the most worker label pairs a task may set.
+const MaxWorkerLabels = 8
+
+// ValidateWorkerLabels checks that each key is a Kubernetes qualified name,
+// each value is a valid label value, and there are at most MaxWorkerLabels
+// pairs. field names the setting in the error text.
+func ValidateWorkerLabels(field string, labels map[string]string) error {
+	if len(labels) > MaxWorkerLabels {
+		return fmt.Errorf("%s: %d labels is more than the limit of %d", field, len(labels), MaxWorkerLabels)
+	}
+	for _, k := range slices.Sorted(maps.Keys(labels)) {
+		if !validLabelKey(k) {
+			return fmt.Errorf("%s: key %q is not a valid Kubernetes label name", field, k)
+		}
+		if !validLabelValue(labels[k]) {
+			return fmt.Errorf("%s[%q]: value %q is not a valid Kubernetes label value", field, k, labels[k])
+		}
+	}
+	return nil
+}
+
+// ParseWorkerLabels parses a comma-separated k=v list, for example
+// "workload=ax,a=b". An empty string gives nil. A malformed pair or an invalid
+// label is an error.
+func ParseWorkerLabels(s string) (map[string]string, error) {
+	if strings.TrimSpace(s) == "" {
+		return nil, nil
+	}
+	labels := map[string]string{}
+	for _, pair := range strings.Split(s, ",") {
+		k, v, ok := strings.Cut(strings.TrimSpace(pair), "=")
+		k, v = strings.TrimSpace(k), strings.TrimSpace(v)
+		if !ok || k == "" {
+			return nil, fmt.Errorf("worker labels: %q is not of the form key=value", pair)
+		}
+		labels[k] = v
+	}
+	if err := ValidateWorkerLabels("worker labels", labels); err != nil {
+		return nil, err
+	}
+	return labels, nil
 }
 
 // ValidateTaskMemoryCap rejects a task whose effective memory limit exceeds
