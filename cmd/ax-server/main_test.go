@@ -23,10 +23,11 @@ import (
 func TestResolveAuthToken(t *testing.T) {
 	tok := "0123456789abcdef0123456789abcdef"
 	cases := []struct {
-		name    string
-		value   string
-		want    string
-		wantErr bool
+		name     string
+		value    string
+		required bool
+		want     string
+		wantErr  bool
 	}{
 		{name: "unset is off", value: ""},
 		{name: "32 bytes is on", value: tok, want: tok},
@@ -34,15 +35,20 @@ func TestResolveAuthToken(t *testing.T) {
 		{name: "31 bytes is an error", value: tok[:31], wantErr: true},
 		{name: "whitespace only is an error", value: "   \n", wantErr: true},
 		{name: "short after trim is an error", value: " " + tok[:31] + " ", wantErr: true},
+		{name: "required token is empty", required: true, wantErr: true},
+		{name: "required token is whitespace only", value: "   \n", required: true, wantErr: true},
+		{name: "required token is 31 bytes", value: tok[:31], required: true, wantErr: true},
+		{name: "required token is 32 bytes", value: tok, required: true, want: tok},
+		{name: "required token has whitespace", value: " " + tok + "\n", required: true, want: tok},
 	}
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := resolveAuthToken(tt.value)
+			got, err := resolveAuthToken(tt.value, tt.required)
 			if (err != nil) != tt.wantErr {
-				t.Fatalf("resolveAuthToken(%q) error = %v, wantErr %v", tt.value, err, tt.wantErr)
+				t.Fatalf("resolveAuthToken(%q, %t) error = %v, wantErr %v", tt.value, tt.required, err, tt.wantErr)
 			}
 			if got != tt.want {
-				t.Fatalf("resolveAuthToken(%q) = %q, want %q", tt.value, got, tt.want)
+				t.Fatalf("resolveAuthToken(%q, %t) = %q, want %q", tt.value, tt.required, got, tt.want)
 			}
 		})
 	}
