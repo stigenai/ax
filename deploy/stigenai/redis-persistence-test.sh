@@ -40,7 +40,7 @@ claim=$(q "$dep | .spec.template.spec.volumes[] | select(.name == \"$vol\") | .p
 [ "$(q "select(.kind == \"PersistentVolumeClaim\" and .metadata.name == \"$claim\") | .metadata.name")" = "$claim" ] ||
   fail "claim $claim is not a PersistentVolumeClaim in $manifest"
 probe=$(q "$ctr | .readinessProbe.exec.command // [] | join(\" \")")
-case "$probe" in *"redis-cli ping"*) ;; *) fail "container redis must have a readinessProbe that runs redis-cli ping" ;; esac
+case "$probe" in *'"$(redis-cli ping)" = PONG'*) ;; *) fail "container redis must have a readinessProbe that compares redis-cli ping with PONG" ;; esac
 echo "static checks ok"
 
 # --- dynamic checks ---
