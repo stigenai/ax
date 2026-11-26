@@ -1333,3 +1333,30 @@ func TestTaskReconcilerWorkerLabels(t *testing.T) {
 		})
 	}
 }
+
+// spec.workerLabels choose the worker, but stay out of AX_TASK_YAML, which a
+// runner built before the field would refuse ("unknown field workerLabels").
+func TestTaskReconciler_WorkerLabelsNotInTaskYAML(t *testing.T) {
+	mockSrv := &mockControlServer{}
+	task := envTask("x")
+	task.Spec.WorkerLabels = map[string]string{"workload": "sluis"}
+	if _, err := newTestReconciler(t, mockSrv).Reconcile(context.Background(), task); err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	var found bool
+	for _, e := range mockSrv.lastTemplate.GetContainers()[0].GetEnv() {
+		if e.GetName() != "AX_TASK_YAML" {
+			continue
+		}
+		found = true
+		if strings.Contains(e.GetValue(), "sluis") || strings.Contains(e.GetValue(), "orkerLabels") {
+			t.Errorf("AX_TASK_YAML carries the worker labels: %q", e.GetValue())
+		}
+	}
+	if !found {
+		t.Fatal("template has no AX_TASK_YAML")
+	}
+	if task.Spec.WorkerLabels["workload"] != "sluis" {
+		t.Errorf("Reconcile changed the task's own worker labels: %v", task.Spec.WorkerLabels)
+	}
+}
