@@ -73,7 +73,11 @@ if command -v docker >/dev/null; then
   crash() { docker kill "$cid" >/dev/null; docker rm "$cid" >/dev/null; cid=""; rm -f "$cidfile"; }
   stop() {
     rc SHUTDOWN NOSAVE >/dev/null 2>&1 || true
-    timeout 30 docker wait "$cid" >/dev/null || fail "container did not stop after SHUTDOWN NOSAVE"
+    for _ in $(seq 1 60); do
+      [ "$(docker inspect -f '{{.State.Running}}' "$cid")" = true ] || break
+      sleep 0.5
+    done
+    [ "$(docker inspect -f '{{.State.Running}}' "$cid")" != true ] || fail "container did not stop after SHUTDOWN NOSAVE"
     docker rm "$cid" >/dev/null; cid=""; rm -f "$cidfile"
   }
 else
