@@ -26,6 +26,17 @@ kubectl --context gtr get storageclass
 
 One class must show `(default)`.
 
+## Task inventory
+
+`ax get tasks` is not an inventory. The CLI sends no limit, and the server returns at most 50 tasks. Its AGE column also changes. Read the full task index of Redis instead. It holds one `<atespace>:<name>` member for each task.
+
+```bash
+kubectl --context gtr -n ax-system exec deploy/ax-redis -- redis-cli ZRANGE ax:tasks:index 0 -1 | sort > tasks-before.txt
+wc -l tasks-before.txt
+```
+
+Use a new file name for each record. To compare, run `diff tasks-before.txt tasks-after.txt`. The diff must be empty. Also keep the output of `ax -a <atespace> get task <name>` for 3 tasks. After the step, each of these commands must succeed with the same spec.
+
 ## Migration
 
 A plain apply of the new manifest starts Redis with 0 keys. Redis with `--appendonly yes` ignores `dump.rdb` when it has no AOF file. Seed the new Redis from the old data.
@@ -46,7 +57,7 @@ A plain apply of the new manifest starts Redis with 0 keys. Redis with `--append
    kubectl --context gtr -n ax-system exec deploy/ax-redis -- redis-cli DBSIZE
    ```
 
-   `ax get tasks` needs ax-server. Before step 1, run `ax -a <atespace> get tasks` for each atespace and keep the output. Compare it in step 6.
+   Record the task inventory before step 1 (see "Task inventory"). Compare it in step 6.
 
 3. Apply the manifest. The Recreate strategy stops the old pod first.
 
@@ -90,13 +101,13 @@ A plain apply of the new manifest starts Redis with 0 keys. Redis with `--append
    kubectl --context gtr -n ax-system rollout status deploy/ax-server deploy/ax-controller
    ```
 
-   Run `ax -a <atespace> get tasks` for each atespace. The lists must equal the lists from before step 1.
+   Record the task inventory again. It must equal the inventory from before step 1. Run `ax -a <atespace> get task <name>` for 3 tasks that you captured before step 1. Each command must succeed.
 
 ## Restart check
 
 CI runs `bash deploy/stigenai/redis-persistence-test.sh` on each pull request. It starts Redis with the args of `deploy/redis.yaml`. It writes 3 task records with their indexes, 3 stream entries, a consumer group and one pending entry. It then does a SIGKILL and a restart, and a `SHUTDOWN NOSAVE` and a new start on the same directory. After each step the data must be the same.
 
-To check the live cluster, record `ax -a <atespace> get tasks` for each atespace. Restart the container. Wait until Redis is ready. Compare the lists.
+To check the live cluster, record the task inventory. Restart the container. Wait until Redis is ready. Record the inventory again and compare.
 
 ```bash
 kubectl --context gtr -n ax-system exec deploy/ax-redis -- redis-cli SHUTDOWN NOSAVE
@@ -104,7 +115,7 @@ kubectl --context gtr -n ax-system rollout status deploy/ax-redis
 kubectl --context gtr -n ax-system exec deploy/ax-redis -- redis-cli PING
 ```
 
-Then restart the pod. Wait until Redis is ready. Compare the lists again.
+Then restart the pod. Wait until Redis is ready. Compare the inventory again.
 
 ```bash
 kubectl --context gtr -n ax-system delete pod -l app.kubernetes.io/name=ax-redis
@@ -128,14 +139,26 @@ To recover an orphan, apply the workspace manifest and then the task manifest ag
 
 ## Rollback
 
-1. Revert the pull request, and scale the writers to 0.
-2. Apply the old `deploy/redis.yaml`. Redis starts with no data.
-3. Seed it from `ax-redis-before.rdb` with the same steps as in "Migration" step 4.
-4. Scale the writers back to 1.
-5. Delete the claim only after the data is back.
+Choose the case.
 
-   ```bash
-   kubectl --context gtr -n ax-system delete pvc ax-redis-data
-   ```
+### Case A: abort before the writers resume (before Migration step 6)
+
+1. Scale the writers to 0 (they are 0 already).
+2. Apply the old `deploy/redis.yaml`. Redis starts with no data.
+3. Seed it from `ax-redis-before.rdb` with the same steps as in "Migration" step 4. No write happened after that file, so no data is lost.
+4. Scale the writers back to 1.
+5. Delete the claim only after the data is back: `kubectl --context gtr -n ax-system delete pvc ax-redis-data`.
+
+### Case B: roll back after the writers resumed
+
+`ax-redis-before.rdb` does not hold the writes that Redis accepted after step 6. Do not use it. Do not delete the claim first.
+
+1. Scale the writers to 0 and wait until the pods are gone, as in "Migration" step 1.
+2. Take a fresh snapshot: `redis-cli SAVE`. Copy `/data/dump.rdb` to `ax-redis-after.rdb`. Record the task inventory and `DBSIZE`.
+3. Revert the pull request and apply the old `deploy/redis.yaml`. Redis starts with no data. The claim stays, because `kubectl apply` does not delete it.
+4. Seed it from `ax-redis-after.rdb` with the same steps as in "Migration" step 4.
+5. Check that `DBSIZE` and the task inventory equal the values of step 2. Run `ax -a <atespace> get task <name>` for 3 tasks.
+6. Scale the writers back to 1.
+7. Delete the claim only after step 5 passes and the person agrees: `kubectl --context gtr -n ax-system delete pvc ax-redis-data`.
 
 A rollback of ax-controller removes only the `orphan_actors` field.
