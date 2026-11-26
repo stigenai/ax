@@ -16,6 +16,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sync"
 	"time"
@@ -104,8 +105,8 @@ func (d *DeletionSweeper) SweepOnce(ctx context.Context) {
 	now := d.now()
 	minAge := d.minAge()
 
-	stuckTasks, protected, requeued, requeueFailed, taskListError := d.sweepTasks(ctx, now, minAge)
-	stuckActors, actorListError := d.sweepActors(ctx, now, minAge)
+	stuckTasks, protected, requeued, requeueFailed, taskKeys, taskListError := d.sweepTasks(ctx, now, minAge)
+	stuckActors, orphanActors, actorListError := d.sweepActors(ctx, now, minAge, taskKeys)
 
 	stuck := stuckTasks + stuckActors
 	args := []any{
@@ -117,6 +118,7 @@ func (d *DeletionSweeper) SweepOnce(ctx context.Context) {
 		"requeue_failed", requeueFailed,
 		"task_list_error", taskListError,
 		"actor_list_error", actorListError,
+		"orphan_actors", orphanActors,
 		"min_age", minAge,
 	}
 	if stuck > 0 {
@@ -135,13 +137,18 @@ func (d *DeletionSweeper) SweepOnce(ctx context.Context) {
 // `ax delete` with its identity to clean it up, the same limit
 // requeueStrandedDeletions already documents.
 //
+// It also returns the atespace/name key of every task in any phase. The
+// map is nil when ListTasks failed, so a partial list never feeds the
+// orphan report (ax-vnr.3).
+//
 // A ListTasks error stops paging early and sets listError (ax-706.7). This
 // tick then skips pruneSeen, so the ages this process already tracked stay
 // in place instead of resetting to 0: a partial page must not make the
 // next tick look falsely young, and must not make this tick's own summary
 // line look falsely like an all-clear.
-func (d *DeletionSweeper) sweepTasks(ctx context.Context, now time.Time, minAge time.Duration) (stuckTasks, protected, requeued, requeueFailed int, listError bool) {
+func (d *DeletionSweeper) sweepTasks(ctx context.Context, now time.Time, minAge time.Duration) (stuckTasks, protected, requeued, requeueFailed int, taskKeys map[string]bool, listError bool) {
 	seenKeys := make(map[string]bool)
+	allKeys := make(map[string]bool)
 	var offset int64
 	for {
 		tasks, err := d.Store.ListTasks(ctx, "*", strandedTasksPageSize, offset)
@@ -151,6 +158,7 @@ func (d *DeletionSweeper) sweepTasks(ctx context.Context, now time.Time, minAge 
 			break
 		}
 		for _, task := range tasks {
+			allKeys[task.GetMetadata().GetAtespace()+"/"+task.GetMetadata().GetName()] = true
 			if task.GetStatus().GetPhase() != v1alpha1.PhaseTerminating {
 				continue
 			}
@@ -190,8 +198,9 @@ func (d *DeletionSweeper) sweepTasks(ctx context.Context, now time.Time, minAge 
 	}
 	if !listError {
 		d.pruneSeen(seenKeys)
+		taskKeys = allKeys
 	}
-	return stuckTasks, protected, requeued, requeueFailed, listError
+	return stuckTasks, protected, requeued, requeueFailed, taskKeys, listError
 }
 
 // touch records that this sweep saw key with creation timestamp created,
@@ -232,17 +241,34 @@ func (d *DeletionSweeper) pruneSeen(seenKeys map[string]bool) {
 // old. It never calls DeleteActor (ActorLister exposes no such method):
 // ax-706 DESIGN item 3 leaves that step to a person, given in
 // docs/stuck-deletions.md.
-func (d *DeletionSweeper) sweepActors(ctx context.Context, now time.Time, minAge time.Duration) (stuckActors int, listError bool) {
+//
+// It also counts and logs each orphan actor (ax-vnr.3): an AX actor that
+// has no task record. It only reports, and writes nothing. taskKeys is the
+// key set from sweepTasks. A nil taskKeys (ListTasks failed) turns the
+// orphan report off for this tick.
+func (d *DeletionSweeper) sweepActors(ctx context.Context, now time.Time, minAge time.Duration, taskKeys map[string]bool) (stuckActors, orphanActors int, listError bool) {
 	if d.Actors == nil {
-		return 0, false
+		return 0, 0, false
 	}
 	actors, err := d.Actors.ListActors(ctx, "")
 	if err != nil {
 		slog.Warn("delete sweep: failed to list actors", "error", err)
-		return 0, true
+		return 0, 0, true
 	}
 	for _, actor := range actors {
 		if actor.GetStatus().GetState() != ateapipb.ActorState_ACTOR_STATE_DELETING {
+			if isOrphanActor(actor, now, minAge, taskKeys) && d.taskRecordMissing(ctx, actor) {
+				orphanActors++
+				slog.Warn("delete sweep: orphan actor",
+					"atespace", actor.GetMetadata().GetAtespace(),
+					"name", actor.GetMetadata().GetName(),
+					"uid", actor.GetMetadata().GetUid(),
+					"state", actor.GetStatus().GetState().String(),
+					"template", actor.GetActorTemplate().GetName(),
+					"worker_pod", actor.GetStatus().GetWorkerAssignment().GetWorkerPod(),
+					"age", now.Sub(actor.GetMetadata().GetCreateTime().AsTime()),
+				)
+			}
 			continue
 		}
 		updateTime := actor.GetMetadata().GetUpdateTime()
@@ -262,5 +288,42 @@ func (d *DeletionSweeper) sweepActors(ctx context.Context, now time.Time, minAge
 			"worker_pod", actor.GetStatus().GetWorkerAssignment().GetWorkerPod(),
 		)
 	}
-	return stuckActors, false
+	return stuckActors, orphanActors, false
+}
+
+// taskRecordMissing confirms an orphan candidate with a direct GetTask. The
+// paged list can miss a task that exists: the Redis ListTasks drops an
+// indexed task it cannot read, and the page then looks like the last one
+// (ax-vnr.12). Only ErrNotFound confirms the orphan. Any other error fails
+// closed.
+func (d *DeletionSweeper) taskRecordMissing(ctx context.Context, actor *ateapipb.Actor) bool {
+	_, err := d.Store.GetTask(ctx, actor.GetMetadata().GetAtespace(), actor.GetMetadata().GetName())
+	return errors.Is(err, store.ErrNotFound)
+}
+
+// isOrphanActor reports whether actor is an AX actor with no task record.
+// It fails closed: every item must hold. (1) taskKeys is not nil, so the
+// task list finished. (2) The actor is not DELETING: the caller never asks
+// about a DELETING actor, which stuck_actors counts. (3) Its template is in
+// its own atespace and its name matches taskTemplatePattern. (4) No task of
+// any phase has its atespace/name. (5) Its create_time is valid and at
+// least minAge old.
+func isOrphanActor(actor *ateapipb.Actor, now time.Time, minAge time.Duration, taskKeys map[string]bool) bool {
+	if taskKeys == nil {
+		return false
+	}
+	atespace := actor.GetMetadata().GetAtespace()
+	name := actor.GetMetadata().GetName()
+	tmpl := actor.GetActorTemplate()
+	if tmpl.GetAtespace() != atespace || !taskTemplatePattern(name).MatchString(tmpl.GetName()) {
+		return false
+	}
+	if taskKeys[atespace+"/"+name] {
+		return false
+	}
+	created := actor.GetMetadata().GetCreateTime()
+	if created.CheckValid() != nil {
+		return false
+	}
+	return now.Sub(created.AsTime()) >= minAge
 }

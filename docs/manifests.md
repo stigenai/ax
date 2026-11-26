@@ -138,3 +138,7 @@ spec:
   parameters:
     maxTokens: 16000
 ```
+
+## Redis persistence
+
+See [`redis-persistence.md`](redis-persistence.md) for how ax-redis keeps its data, how to migrate a running cluster, and how to find actors that have no task record.

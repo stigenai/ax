@@ -30,6 +30,7 @@ go_library(
 go_test(
     name = "controller_test",
     srcs = [
+        "delete_sweep_orphan_test.go",
         "delete_sweep_test.go",
         "liveness_test.go",
         "native_egress_test.go",
