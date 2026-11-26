@@ -28,7 +28,7 @@ One class must show `(default)`.
 
 ## Task inventory
 
-`ax get tasks` is not an inventory. The CLI sends no limit, and the server returns at most 50 tasks. Its AGE column also changes. Read the full task index of Redis instead. It holds one `<atespace>:<name>` member for each task.
+The CLI task list is not an inventory. The CLI sends no limit, and the server returns at most 50 tasks. Its AGE column also changes. Read the full task index of Redis instead. It holds one `<atespace>:<name>` member for each task.
 
 Capture it only after Redis answers PING. Use `pipefail`, so a failed `kubectl` fails the capture. A capture must not be empty.
 
