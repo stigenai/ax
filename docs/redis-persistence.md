@@ -28,16 +28,17 @@ One class must show `(default)`.
 
 ## Private work directory
 
-Make one private directory outside the checkout. Run all local steps in it. Run `umask 077` in each new shell.
+The migration operator keeps the rollback copy. The operator is the person who runs the migration. Keep it on persistent local storage outside the checkout. Do not use shared temporary storage (`/tmp`) or a path with automatic cleanup. Make one new private directory under your home. Run all local steps in it. Run `umask 077` in each new shell, before the first capture.
 
 ```bash
 umask 077
-WORK=$(mktemp -d "${TMPDIR:-/tmp}/ax-redis-migration.XXXXXX")
-cd "$WORK"
-stat -c %a "$WORK"
+WORK="$HOME/ax-redis-migration.$(date +%Y%m%d%H%M%S).$$"
+mkdir -m 700 "$WORK" || exit 1
+test "$(stat -c '%u %a' "$WORK")" = "$(id -u) 700" || exit 1
+cd "$WORK" || exit 1
 ```
 
-`mktemp -d` makes the directory with mode 700. The `stat` command must print `700`. The `kubectl exec` command does not use the local umask. Set the mode of each directory in the pod yourself.
+If a command fails, stop. Do not start a capture. The `stat` check makes sure that you own the directory and that its mode is 700. The `kubectl exec` command does not use the local umask. Set the mode of each directory in the pod yourself.
 
 ## Task inventory
 
@@ -132,7 +133,7 @@ A plain apply of the new manifest starts Redis with 0 keys. Redis with `--append
 
    Wait until Redis answers PING, then record the task inventory again. It must equal the inventory of step 2. Run `ax -a <atespace> get task <name>` for the 3 tasks that you kept before step 1. Each command must succeed.
 
-Remove the private work directory with each local file in it (`ax-redis-before.rdb`, the inventory files and the saved `ax get task` output) when the owner accepts the migration. Leave the directory, then run `rm -r "$WORK"` and `ls -d "$WORK"`. The `ls` must fail with "No such file".
+Keep the private work directory and each local file in it (`ax-redis-before.rdb`, the inventory files and the saved `ax get task` output). Before the writers resume, the copy must stay available for rollback. After the writers resume, fix forward (see "Rollback"). If a check fails or the owner has not accepted the migration, keep the files. When the migration checks pass and the owner accepts the outcome, the operator removes the directory. Leave the directory, then run `rm -r "$WORK"` and `test ! -e "$WORK"`. The `test` must exit 0.
 
 ## Restart check
 
