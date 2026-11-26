@@ -65,6 +65,45 @@ func addTestEvent(t *testing.T, ctx context.Context, client *redisclient.Client,
 	return id
 }
 
+func TestSubscriptionRestoresConsumerGroup(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		minIdle time.Duration
+	}{
+		{name: "read", minIdle: -1},
+		{name: "claim", minIdle: time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, client := newClaimTestStore(t, tc.name, Options{
+				ReadBlock:    50 * time.Millisecond,
+				ClaimMinIdle: tc.minIdle,
+			})
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			sub, err := s.Subscribe(ctx, "group", "consumer")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := client.XGroupDestroy(ctx, s.opts.StreamName, "group").Err(); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := sub.(*subscription).read(ctx); err != nil {
+				t.Fatal(err)
+			}
+
+			id := addTestEvent(t, ctx, client, s.opts.StreamName, "job")
+			ev, err := sub.Next(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if ev.ID != id {
+				t.Fatalf("got event ID %q, want %q", ev.ID, id)
+			}
+		})
+	}
+}
+
 // AC1: consumer A reads an event and never acks it. Consumer B, in the same
 // group, must get the same event id from Next within 2s once it has gone
 // idle for ClaimMinIdle. After B acks it, XPENDING must show 0 entries.

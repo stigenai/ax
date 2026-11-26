@@ -818,11 +818,21 @@ func (s *Store) GetWorkspace(ctx context.Context, atespace, name string) (*v1alp
 // sees events published after it was created; an existing group keeps its
 // position and any pending entries.
 func (s *Store) Subscribe(ctx context.Context, group, consumer string) (store.Subscription, error) {
-	err := s.client.XGroupCreateMkStream(ctx, s.opts.StreamName, group, "$").Err()
-	if err != nil && !strings.Contains(err.Error(), "BUSYGROUP") {
-		return nil, fmt.Errorf("creating consumer group %q: %w", group, err)
+	if _, err := s.createConsumerGroup(ctx, group); err != nil {
+		return nil, err
 	}
 	return &subscription{store: s, group: group, consumer: consumer, claimCursor: "0-0"}, nil
+}
+
+func (s *Store) createConsumerGroup(ctx context.Context, group string) (bool, error) {
+	err := s.client.XGroupCreateMkStream(ctx, s.opts.StreamName, group, "$").Err()
+	if redis.HasErrorPrefix(err, "BUSYGROUP") {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("creating consumer group %q: %w", group, err)
+	}
+	return true, nil
 }
 
 // subscription reads from a consumer group in batches.
@@ -845,6 +855,19 @@ type subscription struct {
 	// lastClaim is the time claimCursor last returned to "0-0". It throttles
 	// how often an empty scan repeats.
 	lastClaim time.Time
+}
+
+func (sub *subscription) restoreConsumerGroup(ctx context.Context) error {
+	created, err := sub.store.createConsumerGroup(ctx, sub.group)
+	if err != nil {
+		return err
+	}
+	sub.claimCursor = "0-0"
+	sub.lastClaim = time.Now()
+	if created {
+		slog.Warn("restored Redis consumer group", "stream", sub.store.opts.StreamName, "group", sub.group)
+	}
+	return nil
 }
 
 func (sub *subscription) Next(ctx context.Context) (store.TaskEvent, error) {
@@ -890,6 +913,9 @@ func (sub *subscription) read(ctx context.Context) ([]store.TaskEvent, error) {
 		if errors.Is(err, redis.Nil) {
 			return nil, nil
 		}
+		if redis.HasErrorPrefix(err, "NOGROUP") {
+			return nil, sub.restoreConsumerGroup(ctx)
+		}
 		return nil, fmt.Errorf("reading task events: %w", err)
 	}
 
@@ -922,6 +948,9 @@ func (sub *subscription) claim(ctx context.Context) ([]store.TaskEvent, error) {
 		Count:    sub.store.opts.ReadBatchSize,
 	}).Result()
 	if err != nil {
+		if redis.HasErrorPrefix(err, "NOGROUP") {
+			return nil, sub.restoreConsumerGroup(ctx)
+		}
 		return nil, fmt.Errorf("reclaiming idle task events: %w", err)
 	}
 	sub.claimCursor = cursor
