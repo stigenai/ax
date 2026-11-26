@@ -117,12 +117,15 @@ func TestRecoveryDispatchesOnlyOutstandingWork(t *testing.T) {
 		claimIdle   time.Duration
 		terminating bool
 		pending     bool
+		lateAck     bool
 	}{
 		{name: "read/absent", claimIdle: -1},
 		{name: "read/terminating", claimIdle: -1, terminating: true},
 		{name: "claim/absent", claimIdle: time.Second},
 		{name: "claim/terminating", claimIdle: time.Second, terminating: true},
 		{name: "claim/pending-expired", claimIdle: time.Second, pending: true},
+		{name: "late-ack/absent", claimIdle: -1, lateAck: true},
+		{name: "late-ack/terminating", claimIdle: time.Second, terminating: true, lateAck: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -192,11 +195,22 @@ func TestRecoveryDispatchesOnlyOutstandingWork(t *testing.T) {
 					t.Fatalf("second delivery = %v, %v, want %s", ev, err, checkpoint)
 				}
 			}
-			if err := original.Ack(ctx, ev); err != nil {
-				t.Fatal(err)
+			if !tc.lateAck {
+				if err := original.Ack(ctx, ev); err != nil {
+					t.Fatal(err)
+				}
 			}
 			if err := redis.XGroupDestroy(ctx, stream, group).Err(); err != nil {
 				t.Fatal(err)
+			}
+			if tc.lateAck {
+				replacement, err = s.Subscribe(ctx, group, "replacement")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := original.Ack(ctx, ev); err != nil {
+					t.Fatal(err)
+				}
 			}
 			publish("delete", "new")
 			end := publish("reconcile", "end")

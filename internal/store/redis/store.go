@@ -73,7 +73,7 @@ type Options struct {
 	// This field has no effect when reclaim is off.
 	ClaimInterval time.Duration
 	// MaxDeliveries caps how many times a subscription may deliver the same
-	// event. A subscription acks and drops a claimed event past this count,
+	// event. A subscription acks and drops an event past this count,
 	// so a poison event cannot crash-loop the process that reads it forever.
 	// Zero uses the default: 5.
 	MaxDeliveries int64
@@ -824,7 +824,8 @@ func (s *Store) Subscribe(ctx context.Context, group, consumer string) (store.Su
 }
 
 // A group checkpoint retains its cursor and pending entries across group loss.
-// Redis serializes the checkpoint and ACK so recovery cannot replay an acknowledged entry.
+// Save the pending entry before dispatch so recovery can restore it for a late ACK.
+// Save the checkpoint and ACK in the same script to exclude acknowledged entries from recovery.
 var checkpointGroup = redis.NewScript(`
 local stream, checkpoint = KEYS[1], KEYS[2]
 local group, operation, id = ARGV[1], ARGV[2], ARGV[3]
@@ -852,6 +853,13 @@ if streamType == 'stream' then
 end
 
 if operation == 'recover' and position then return 0 end
+local deliveries = 0
+if operation == 'deliver' then
+    if not position then return -1 end
+    local match = redis.call('XPENDING', stream, group, id, id, 1)
+    if #match == 0 then return -1 end
+    deliveries = match[1][4]
+end
 if operation == 'ack' then
     local match = redis.call('XPENDING', stream, group, id, id, 1)
     if #match == 0 then return redis.call('XACK', stream, group, id) end
@@ -906,7 +914,7 @@ until #page < 256
 
 redis.call('SET', checkpoint, cmsgpack.pack({position, pending}))
 if operation == 'ack' then return redis.call('XACK', stream, group, id) end
-return 0
+return deliveries
 `)
 
 func (s *Store) checkpointKey(group string) string {
@@ -954,19 +962,36 @@ func (sub *subscription) restoreConsumerGroup(ctx context.Context) error {
 }
 
 func (sub *subscription) Next(ctx context.Context) (store.TaskEvent, error) {
-	for len(sub.pending) == 0 {
+	for {
 		if err := ctx.Err(); err != nil {
 			return store.TaskEvent{}, err
 		}
-		events, err := sub.read(ctx)
-		if err != nil {
-			return store.TaskEvent{}, err
+		if len(sub.pending) == 0 {
+			events, err := sub.read(ctx)
+			if err != nil {
+				return store.TaskEvent{}, err
+			}
+			sub.pending = events
+			continue
 		}
-		sub.pending = events
+		ev := sub.pending[0]
+		deliveries, err := sub.store.consumerGroupCheckpoint(ctx, sub.group, "deliver", ev.ID)
+		if err != nil {
+			return store.TaskEvent{}, fmt.Errorf("saving pending task event %s: %w", ev.ID, err)
+		}
+		sub.pending = sub.pending[1:]
+		if deliveries < 0 {
+			continue
+		}
+		if int64(deliveries) <= sub.store.opts.MaxDeliveries {
+			return ev, nil
+		}
+		if err := sub.Ack(ctx, ev); err != nil {
+			return store.TaskEvent{}, fmt.Errorf("acking poison task event %s: %w", ev.ID, err)
+		}
+		slog.Error("dropping task event after too many deliveries",
+			"id", ev.ID, "atespace", ev.Atespace, "name", ev.Name, "action", ev.Action, "deliveries", deliveries)
 	}
-	ev := sub.pending[0]
-	sub.pending = sub.pending[1:]
-	return ev, nil
 }
 
 // read returns the next batch of events. When reclaim is on (ClaimMinIdle >
@@ -1048,51 +1073,21 @@ func (sub *subscription) claim(ctx context.Context) ([]store.TaskEvent, error) {
 	ids := make([]string, 0, len(msgs))
 	for _, msg := range msgs {
 		ev := eventFromMessage(msg)
-		dropped, err := sub.dropIfPoison(ctx, ev)
-		if err != nil {
-			return nil, err
-		}
-		if dropped {
-			continue
-		}
 		events = append(events, ev)
 		ids = append(ids, ev.ID)
 	}
-	if len(events) > 0 {
-		slog.Info("reclaimed idle task events", "consumer", sub.consumer, "count", len(events), "ids", ids)
-	}
+	slog.Info("reclaimed idle task events", "consumer", sub.consumer, "count", len(events), "ids", ids)
 	return events, nil
-}
-
-// dropIfPoison checks ev's delivery count and, when it is past
-// Options.MaxDeliveries, acks and drops ev instead of returning it. This
-// stops an event that always crashes its processor from cycling between
-// consumers forever: it caps a poison event's cost at MaxDeliveries tries.
-func (sub *subscription) dropIfPoison(ctx context.Context, ev store.TaskEvent) (bool, error) {
-	pending, err := sub.store.client.XPendingExt(ctx, &redis.XPendingExtArgs{
-		Stream: sub.store.opts.StreamName,
-		Group:  sub.group,
-		Start:  ev.ID,
-		End:    ev.ID,
-		Count:  1,
-	}).Result()
-	if err != nil {
-		return false, fmt.Errorf("checking delivery count for task event %s: %w", ev.ID, err)
-	}
-	if len(pending) == 0 || pending[0].RetryCount <= sub.store.opts.MaxDeliveries {
-		return false, nil
-	}
-	deliveries := pending[0].RetryCount
-	if err := sub.Ack(ctx, ev); err != nil {
-		return false, fmt.Errorf("acking poison task event %s: %w", ev.ID, err)
-	}
-	slog.Error("dropping task event after too many deliveries",
-		"id", ev.ID, "atespace", ev.Atespace, "name", ev.Name, "action", ev.Action, "deliveries", deliveries)
-	return true, nil
 }
 
 func (sub *subscription) Ack(ctx context.Context, ev store.TaskEvent) error {
 	_, err := sub.store.consumerGroupCheckpoint(ctx, sub.group, "ack", ev.ID)
+	if redis.HasErrorPrefix(err, "NOGROUP") {
+		if err := sub.restoreConsumerGroup(ctx); err != nil {
+			return err
+		}
+		_, err = sub.store.consumerGroupCheckpoint(ctx, sub.group, "ack", ev.ID)
+	}
 	return err
 }
 
