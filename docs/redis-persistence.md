@@ -28,16 +28,18 @@ One class must show `(default)`.
 
 ## Private work directory
 
-Make one private directory outside the checkout. Run all local steps in it. Run `umask 077` in each new shell.
+Start at the root of the checkout. Make one private directory outside the checkout. Run all subsequent local steps in it. Run `umask 077` in each new shell.
 
 ```bash
 umask 077
-WORK=$(mktemp -d "${TMPDIR:-/tmp}/ax-redis-migration.XXXXXX")
-cd "$WORK"
-stat -c %a "$WORK"
+REDIS_MANIFEST="$(pwd -P)/deploy/redis.yaml"
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/ax-redis-migration.XXXXXX") &&
+  cd "$WORK" &&
+  ls -ld "$WORK" &&
+  test -r "$REDIS_MANIFEST"
 ```
 
-`mktemp -d` makes the directory with mode 700. The `stat` command must print `700`. The `kubectl exec` command does not use the local umask. Set the mode of each directory in the pod yourself.
+`mktemp -d` makes the directory with mode 700. The permissions from `ls -ld` must start with `drwx------`. If the block fails or the permissions differ, stop before you stop the writers. Keep the same shell for the migration. The `kubectl exec` command does not use the local umask. Set the mode of each directory in the pod yourself.
 
 ## Task inventory
 
@@ -84,7 +86,7 @@ A plain apply of the new manifest starts Redis with 0 keys. Redis with `--append
 3. Apply the manifest. The Recreate strategy stops the old pod first.
 
    ```bash
-   kubectl --context gtr apply -f deploy/redis.yaml
+   kubectl --context gtr apply -f "$REDIS_MANIFEST"
    kubectl --context gtr -n ax-system rollout status deploy/ax-redis
    ```
 
@@ -188,7 +190,7 @@ Use this procedure only before the writers resume.
 ### Rollback before the writers resume (before Migration step 6)
 
 1. Scale the writers to 0 (they are 0 already).
-2. Apply the old `deploy/redis.yaml`. Redis starts with no data.
+2. Apply the old `deploy/redis.yaml` with its absolute path. Redis starts with no data.
 3. Seed it from `ax-redis-before.rdb` with the same steps as in "Migration" step 4. No write happened after that file, so no data is lost.
 4. Wait until Redis answers PING. Check `DBSIZE` and the task inventory against the baseline of Migration step 2. Scale the writers back to 1. Wait for the rollout.
 5. Run `ax -a <atespace> get task <name>` for 3 tasks. Each command must succeed.
