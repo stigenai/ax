@@ -89,6 +89,21 @@ func (s *writeSpyStore) SaveWorkspace(ctx context.Context, w *v1alpha1.Workspace
 	return s.Store.SaveWorkspace(ctx, w)
 }
 
+func (s *writeSpyStore) DeleteWorkspace(ctx context.Context, a, n string) error {
+	s.hit()
+	return s.Store.DeleteWorkspace(ctx, a, n)
+}
+
+func (s *writeSpyStore) SaveModel(ctx context.Context, m *v1alpha1.Model) error {
+	s.hit()
+	return s.Store.SaveModel(ctx, m)
+}
+
+func (s *writeSpyStore) DeleteModel(ctx context.Context, a, n string) error {
+	s.hit()
+	return s.Store.DeleteModel(ctx, a, n)
+}
+
 // hiddenTaskStore lists no task but still serves GetTask. It stands in for
 // the Redis ListTasks that drops an indexed task whose value it cannot
 // read, so a short page hides a task that exists (ax-vnr.12).
@@ -99,6 +114,14 @@ type hiddenTaskStore struct {
 
 func (s *hiddenTaskStore) ListTasks(context.Context, string, int64, int64) ([]*v1alpha1.Task, error) {
 	return nil, nil
+}
+
+// listedNotGettableStore lists tasks but GetTask says ErrNotFound. Only the
+// task-key lookup in isOrphanActor then stops the orphan report.
+type listedNotGettableStore struct{ store.Store }
+
+func (s *listedNotGettableStore) GetTask(context.Context, string, string) (*v1alpha1.Task, error) {
+	return nil, store.ErrNotFound
 }
 
 func (s *hiddenTaskStore) GetTask(ctx context.Context, a, n string) (*v1alpha1.Task, error) {
@@ -131,6 +154,7 @@ func TestDeleteSweepOrphanActors(t *testing.T) {
 		listErr   bool   // ListTasks fails
 		actorErr  bool   // ListActors fails
 		hidden    bool   // ListTasks hides the task; GetTask finds it
+		unGet     bool   // ListTasks lists the task; GetTask says ErrNotFound
 		getErr    error  // GetTask fails (with hidden, or with no task)
 		want      int
 	}{
@@ -151,6 +175,7 @@ func TestDeleteSweepOrphanActors(t *testing.T) {
 		{name: "invalid create time", actor: func(a *ateapipb.Actor) { a.Metadata.CreateTime = &timestamppb.Timestamp{Seconds: -1 << 60} }, want: 0},
 		{name: "ListTasks error", listErr: true, want: 0},
 		{name: "task hidden from a short page", task: "Running", hidden: true, want: 0},
+		{name: "listed task, GetTask not found", task: "Running", unGet: true, want: 0},
 		{name: "GetTask error", getErr: errors.New("redis down"), want: 0},
 		{name: "ListActors error", actorErr: true, want: 0},
 	}
@@ -176,6 +201,9 @@ func TestDeleteSweepOrphanActors(t *testing.T) {
 			}
 			if tc.hidden || tc.getErr != nil {
 				st = &hiddenTaskStore{Store: st, getErr: tc.getErr}
+			}
+			if tc.unGet {
+				st = &listedNotGettableStore{Store: st}
 			}
 			spy := &writeSpyStore{Store: st}
 			actor := orphanActor(now, "factory", "orphan")

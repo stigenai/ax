@@ -67,6 +67,9 @@ push: push-task-runner
 # Deploy all AX components to Kubernetes (Redis, ax-controller, ax-server)
 deploy: deploy-redis deploy-controller deploy-server
 
+# Do not run this on a cluster that holds task data without the runbook.
+# The first apply of deploy/redis.yaml (PVC plus AOF) starts Redis with 0
+# keys and loses all task records. Read docs/redis-persistence.md first.
 deploy-redis:
 	@echo "==> Deploying Redis to ax-system namespace..."
 	kubectl apply -f deploy/redis.yaml
