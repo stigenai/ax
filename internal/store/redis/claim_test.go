@@ -258,12 +258,17 @@ func TestNextRestoresOutstandingBufferedEvent(t *testing.T) {
 	}
 	marker := addTestEvent(t, ctx, client, stream, "marker")
 	for _, want := range []string{second, marker} {
-		if ev, err := sub.Next(ctx); err != nil || ev.ID != want {
+		ev, err := sub.Next(ctx)
+		if err != nil || ev.ID != want {
 			t.Fatalf("next delivery = %v, %v, want %s", ev, err, want)
 		}
 		if err := sub.Ack(ctx, ev); err != nil {
 			t.Fatal(err)
 		}
+	}
+	pending, err := client.XPending(ctx, stream, group).Result()
+	if err != nil || pending.Count != 0 {
+		t.Fatalf("pending after ACKs = %v, %v, want zero", pending, err)
 	}
 }
 
