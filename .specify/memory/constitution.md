@@ -107,13 +107,20 @@ CLA. An agent error there is public and permanent.
 
 - Find carry that upstream now makes unnecessary, and drop it.
 
+- `FORK.md` at the repository root MUST have one entry for each `carry` bead.
+- Each entry MUST give the bead, the upstream files that the carry edits, the new files, the tests, the reason, the status and the removal condition.
+- A PR that adds, changes or drops carry MUST update `FORK.md` and the bead in the same PR.
+- A carry that edits upstream code MUST name at least one test in its entry. These tests MUST pass after each sync.
+
 **Rationale:** Without a ledger, carry stays in the fork after nobody needs it.
 
 ## Upstream Sync
 
 **Sync steps:**
 
-- Fetch `google/ax` `main` every two weeks, or more often.
+- The `upstream-sync` workflow on `main` merges `google/ax` `main` into `main` and `stigenai/deploy` each week, on the runner only. Then it runs the tests.
+- If the workflow fails, a human makes a sync bead from the job summary.
+- Do a real sync every two weeks, or more often.
 
 - Merge it into `main`, then into `stigenai/deploy`.
 
@@ -124,6 +131,8 @@ CLA. An agent error there is public and permanent.
 - The person who does the sync resolves the conflicts.
 
 - If a conflict is in fork carry, prefer the upstream code and reapply the carry on top of it.
+
+- If a carry conflicts on two syncs in sequence, examine it again. Then donate it, move it to new files, or drop it.
 
 - After a sync, `make build` and `make test` MUST pass on both branches before a deploy.
 
@@ -171,4 +180,4 @@ Versions use semantic versioning. Use the version parts in this table:
 
 - Reviews of upstream branches MUST also check Principles III and IV.
 
-**Version**: 1.0.0 | **Ratified**: 2026-11-07 | **Last Amended**: 2026-11-07
+**Version**: 1.1.0 | **Ratified**: 2026-11-07 | **Last Amended**: 2026-11-26
