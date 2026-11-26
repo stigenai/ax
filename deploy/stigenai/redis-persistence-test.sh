@@ -43,32 +43,35 @@ echo "static checks ok"
 
 # --- dynamic checks ---
 work=$(mktemp -d)
-name=ax-redis-persist-$$
-port=$((20000 + $$ % 20000))
+chmod 700 "$work"
 pid=""
+cid=""
+dvol=""
 read -ra rargs <<<"$args"
 
+# The test removes only what it created. Docker assigns the container id and
+# the volume name. Local Redis listens on a private Unix socket in $work, with
+# no TCP port, so it cannot reach a Redis that already runs on the host.
 cleanup() {
   [ -z "$pid" ] || kill -9 "$pid" 2>/dev/null || true
-  if command -v docker >/dev/null; then
-    docker rm -f "$name" >/dev/null 2>&1 || true
-    docker volume rm "$name-data" >/dev/null 2>&1 || true
-  fi
+  [ -z "$cid" ] || docker rm -f "$cid" >/dev/null 2>&1 || true
+  [ -z "$dvol" ] || docker volume rm "$dvol" >/dev/null 2>&1 || true
   rm -rf "$work"
 }
 trap cleanup EXIT
 
 if command -v docker >/dev/null; then
   image=$(q "$ctr | .image")
-  rc() { docker exec "$name" redis-cli "$@"; }
+  dvol=$(docker volume create)
+  rc() { docker exec "$cid" redis-cli "$@"; }
   start() {
-    docker run -d --name "$name" -v "$name-data:/data" "$image" "${rargs[@]}" >/dev/null
+    cid=$(docker run -d -v "$dvol:/data" "$image" "${rargs[@]}")
   }
-  crash() { docker kill "$name" >/dev/null; docker rm "$name" >/dev/null; }
-  stop() { rc SHUTDOWN NOSAVE >/dev/null 2>&1 || true; docker wait "$name" >/dev/null; docker rm "$name" >/dev/null; }
+  crash() { docker kill "$cid" >/dev/null; docker rm "$cid" >/dev/null; cid=""; }
+  stop() { rc SHUTDOWN NOSAVE >/dev/null 2>&1 || true; docker wait "$cid" >/dev/null; docker rm "$cid" >/dev/null; cid=""; }
 else
   command -v redis-server >/dev/null || fail "need docker or redis-server on PATH"
-  rc() { redis-cli -p "$port" "$@"; }
+  rc() { redis-cli -s "$work/redis.sock" "$@"; }
   start() {
     local a=() skip=0 x
     for x in "${rargs[@]}"; do
@@ -76,10 +79,10 @@ else
       if [ "$x" = --dir ]; then skip=1; continue; fi
       a+=("$x")
     done
-    redis-server "${a[@]}" --dir "$work" --port "$port" --bind 127.0.0.1 >"$work/server.log" 2>&1 &
+    redis-server "${a[@]}" --dir "$work" --port 0 --unixsocket "$work/redis.sock" --unixsocketperm 700 >"$work/server.log" 2>&1 &
     pid=$!
   }
-  crash() { kill -9 "$pid"; wait "$pid" 2>/dev/null || true; pid=""; }
+  crash() { kill -9 "$pid"; wait "$pid" 2>/dev/null || true; pid=""; rm -f "$work/redis.sock"; }
   stop() { rc SHUTDOWN NOSAVE >/dev/null 2>&1 || true; wait "$pid" 2>/dev/null || true; pid=""; }
 fi
 

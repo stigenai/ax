@@ -40,7 +40,7 @@ test -s tasks-before.txt && wc -l tasks-before.txt
 
 `PING` must print `PONG`. If a command fails, stop. Do not go on with an old or empty file.
 
-Use a new file name for each record. To compare, run `diff tasks-before.txt tasks-after.txt`. The diff must be empty. `ax -a <atespace> get task <name>` needs the ax-server RPC. Run it for 3 tasks only while ax-server runs. Keep the output. After the step, when ax-server runs again, each of these commands must succeed with the same spec.
+The task inventory and the `ax get task` output name tasks and can show task specs. Keep them in a private directory (`umask 077`). Use a new file name for each record. To compare, run `diff tasks-before.txt tasks-after.txt`. The diff must be empty. `ax -a <atespace> get task <name>` needs the ax-server RPC. Run it for 3 tasks only while ax-server runs. Keep the output. After the step, when ax-server runs again, each of these commands must succeed with the same spec.
 
 ## Migration
 
@@ -56,9 +56,13 @@ A plain apply of the new manifest starts Redis with 0 keys. Redis with `--append
 
 2. Record the baseline after the writers are gone: the task inventory (see "Task inventory") and `DBSIZE`. Then save the data and keep the file. It is the rollback copy.
 
+   The file holds the full database. It can contain tokens. Set private access before the copy: use `umask 077`, and a private directory.
+
    ```bash
+   umask 077
    kubectl --context gtr -n ax-system exec deploy/ax-redis -- redis-cli SAVE
    kubectl --context gtr -n ax-system cp "$(kubectl --context gtr -n ax-system get pod -l app.kubernetes.io/name=ax-redis -o name | cut -d/ -f2)":/data/dump.rdb ./ax-redis-before.rdb
+   ls -l ax-redis-before.rdb
    kubectl --context gtr -n ax-system exec deploy/ax-redis -- redis-cli DBSIZE
    ```
 
@@ -89,7 +93,11 @@ A plain apply of the new manifest starts Redis with 0 keys. Redis with `--append
    ```bash
    kubectl --context gtr -n ax-system exec "$POD" -- redis-cli REPLICAOF NO ONE
    kubectl --context gtr -n ax-system exec "$POD" -- redis-cli -p 6380 SHUTDOWN NOSAVE
+   kubectl --context gtr -n ax-system exec "$POD" -- rm -rf /tmp/seed
+   kubectl --context gtr -n ax-system exec "$POD" -- ls /tmp/seed
    ```
+
+   The `rm` removes the second copy of the data from the pod. The `ls` must fail with "No such file".
 
 5. Check. `DBSIZE` must equal the baseline. `INFO persistence` must show `aof_enabled:1` and `aof_last_write_status:ok`.
 
@@ -107,6 +115,8 @@ A plain apply of the new manifest starts Redis with 0 keys. Redis with `--append
    ```
 
    Wait until Redis answers PING, then record the task inventory again. It must equal the inventory of step 2. Run `ax -a <atespace> get task <name>` for the 3 tasks that you kept before step 1. Each command must succeed.
+
+Remove each local file (`ax-redis-before.rdb`, the inventory files and the saved `ax get task` output) when the owner accepts the migration. Use `shred -u <file>` or `rm`. Then run `ls -l` in the directory. The files must not be there.
 
 ## Restart check
 
@@ -166,7 +176,7 @@ Use this procedure only before the writers resume.
 3. Seed it from `ax-redis-before.rdb` with the same steps as in "Migration" step 4. No write happened after that file, so no data is lost.
 4. Wait until Redis answers PING. Check `DBSIZE` and the task inventory against the baseline of Migration step 2. Scale the writers back to 1. Wait for the rollout.
 5. Run `ax -a <atespace> get task <name>` for 3 tasks. Each command must succeed.
-6. Delete the claim only after steps 4 and 5 pass: `kubectl --context gtr -n ax-system delete pvc ax-redis-data`.
+6. Remove `/tmp/seed` from the pod (Migration step 4). Delete the claim only after steps 4 and 5 pass: `kubectl --context gtr -n ax-system delete pvc ax-redis-data`.
 
 ### Do not apply the old manifest after the writers resume
 
