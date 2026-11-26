@@ -2,6 +2,8 @@
 # profile). redis.yaml goes on as-is (it repeats the ax-system Namespace, so
 # it cannot share a kustomization with the others):
 #   kubectl apply -f deploy/redis.yaml
+# redis.yaml has a PVC and AOF now. On a cluster that holds data, read
+# docs/redis-persistence.md before the first apply (a plain apply loses it).
 #   kubectl kustomize --load-restrictor LoadRestrictionsNone deploy/stigenai | KO_DOCKER_REPO=ghcr.io/stigenai/ax \
 #     ko resolve --bare=false -f - | kubectl apply -f -
 apiVersion: kustomize.config.k8s.io/v1beta1

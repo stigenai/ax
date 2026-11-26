@@ -31,7 +31,7 @@ this query to read the raw lines:
 
 Every line has the same fields: `stuck`, `stuck_tasks`, `stuck_actors`,
 `protected`, `requeued`, `requeue_failed`, `task_list_error`,
-`actor_list_error`, and `min_age`. `task_list_error` and `actor_list_error`
+`actor_list_error`, `orphan_actors`, and `min_age`. `task_list_error` and `actor_list_error`
 are on every line, not only on a line where `stuck` is greater than 0.
 
 Read the fields in this order:
