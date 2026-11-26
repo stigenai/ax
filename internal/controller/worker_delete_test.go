@@ -206,6 +206,9 @@ func TestRecoveryDispatchesOnlyOutstandingWork(t *testing.T) {
 					t.Fatal(err)
 				}
 				if ev.ID == end {
+					if err := replacement.Ack(ctx, ev); err != nil {
+						t.Fatal(err)
+					}
 					break
 				}
 				if err := worker.processEvent(ctx, ev); err != nil {

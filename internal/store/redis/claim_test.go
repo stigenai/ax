@@ -90,14 +90,23 @@ func TestSubscriptionRestoresConsumerGroup(t *testing.T) {
 				t.Fatal(err)
 			}
 			initial := addTestEvent(t, ctx, client, s.opts.StreamName, "initial")
-			if ev, err := sub.Next(ctx); err != nil || ev.ID != initial {
+			ev, err := sub.Next(ctx)
+			if err != nil || ev.ID != initial {
 				t.Fatalf("fresh subscription got %v, %v, want %s", ev, err, initial)
 			}
-			if err := client.Del(ctx, s.opts.StreamName).Err(); err != nil {
+			if err := sub.Ack(ctx, ev); err != nil {
 				t.Fatal(err)
 			}
-			id := addTestEvent(t, ctx, client, s.opts.StreamName, "job")
-			ev, err := sub.Next(ctx)
+			if err := client.Del(ctx, s.opts.StreamName, s.checkpointKey("group")).Err(); err != nil {
+				t.Fatal(err)
+			}
+			id, err := client.XAdd(ctx, &redisclient.XAddArgs{
+				Stream: s.opts.StreamName, ID: "1-0", Values: map[string]any{"name": "job"},
+			}).Result()
+			if err != nil {
+				t.Fatal(err)
+			}
+			ev, err = sub.Next(ctx)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -163,10 +172,134 @@ func TestRecoveryPreservesPendingGaps(t *testing.T) {
 	if err != nil || ev.ID != low {
 		t.Fatalf("got reclaimed event %v, %v, want %s", ev, err, low)
 	}
+	if err := sub.Ack(ctx, ev); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.XGroupDestroy(ctx, stream, group).Err(); err != nil {
+		t.Fatal(err)
+	}
+	marker := addTestEvent(t, ctx, client, stream, "before resubscribe")
+	subscriber, err = s.Subscribe(ctx, group, "replacement")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ev, err := subscriber.Next(ctx); err != nil || ev.ID != marker {
+		t.Fatalf("resubscribe got %v, %v, want %s", ev, err, marker)
+	}
+}
+
+func TestCheckpointRestoresPendingPages(t *testing.T) {
+	s, client := newClaimTestStore(t, "pages", Options{ClaimMinIdle: -1, ReadBatchSize: 300})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	sub, err := s.Subscribe(ctx, "group", "consumer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream := s.opts.StreamName
+	first := addTestEvent(t, ctx, client, stream, "trimmed")
+	for range 256 {
+		addTestEvent(t, ctx, client, stream, "pending")
+	}
+	last := addTestEvent(t, ctx, client, stream, "acknowledged")
+	for range 258 {
+		ev, err := sub.Next(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ev.ID == last {
+			if err := sub.Ack(ctx, ev); err != nil {
+				t.Fatal(err)
+			}
+			if err := sub.Ack(ctx, ev); err != nil {
+				t.Fatalf("duplicate ACK: %v", err)
+			}
+		}
+	}
+	if err := client.XDel(ctx, stream, first).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.XGroupDestroy(ctx, stream, "group").Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := sub.(*subscription).restoreConsumerGroup(ctx); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := client.XPending(ctx, stream, "group").Result()
+	if err != nil || pending.Count != 256 {
+		t.Fatalf("got pending %v, %v, want 256 surviving IDs", pending, err)
+	}
+}
+
+func TestCheckpointRejectsDeniedWrites(t *testing.T) {
+	s, client := newClaimTestStore(t, "acl", Options{ClaimMinIdle: -1})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	username := s.opts.KeyPrefix
+	if err := client.Do(ctx, "ACL", "SETUSER", username, "on", "nopass", "~*", "+@all", "-set").Err(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := client.Do(context.Background(), "ACL", "DELUSER", username).Err(); err != nil {
+			t.Error(err)
+		}
+	})
+	limitedClient := redisclient.NewClient(&redisclient.Options{
+		Addr: client.Options().Addr,
+		OnConnect: func(ctx context.Context, conn *redisclient.Conn) error {
+			return conn.Do(ctx, "AUTH", username, "").Err()
+		},
+	})
+	t.Cleanup(func() { _ = limitedClient.Close() })
+	limited := NewStore(limitedClient, s.opts)
+	stream := s.opts.StreamName
+	const group = "group"
+	if _, err := limited.Subscribe(ctx, group, "limited"); !redisclient.HasErrorPrefix(err, "NOPERM") {
+		t.Fatalf("Subscribe with SET denied: %v", err)
+	}
+	if err := client.XPending(ctx, stream, group).Err(); !redisclient.HasErrorPrefix(err, "NOGROUP") {
+		t.Fatalf("failed Subscribe created the group: %v", err)
+	}
+	sub, err := s.Subscribe(ctx, group, "allowed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := addTestEvent(t, ctx, client, stream, "pending")
+	ev, err := sub.Next(ctx)
+	if err != nil || ev.ID != id {
+		t.Fatalf("initial delivery = %v, %v, want %s", ev, err, id)
+	}
+	if err := client.Do(ctx, "ACL", "SETUSER", username, "+set", "-xack", "-xclaim").Err(); err != nil {
+		t.Fatal(err)
+	}
+	checkpoint := s.checkpointKey(group)
+	before, err := client.Get(ctx, checkpoint).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement := &subscription{store: limited, group: group, consumer: "limited"}
+	if err := replacement.Ack(ctx, ev); !redisclient.HasErrorPrefix(err, "NOPERM") {
+		t.Fatalf("ACK with XACK denied: %v", err)
+	}
+	if after, err := client.Get(ctx, checkpoint).Result(); err != nil || after != before {
+		t.Fatalf("failed ACK changed the checkpoint: %v", err)
+	}
+	if _, err := s.Subscribe(ctx, group, "allowed"); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.XGroupDestroy(ctx, stream, group).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := replacement.restoreConsumerGroup(ctx); !redisclient.HasErrorPrefix(err, "NOPERM") {
+		t.Fatalf("recovery with XCLAIM denied: %v", err)
+	}
+	if err := client.XPending(ctx, stream, group).Err(); !redisclient.HasErrorPrefix(err, "NOGROUP") {
+		t.Fatalf("failed recovery created the group: %v", err)
+	}
 }
 
 func TestRestoreConsumerGroup(t *testing.T) {
-	s, client := newClaimTestStore(t, "restore", Options{})
+	s, client := newClaimTestStore(t, "restore", Options{ClaimMinIdle: -1, ReadBatchSize: 1})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -175,24 +308,88 @@ func TestRestoreConsumerGroup(t *testing.T) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
 	t.Cleanup(func() { slog.SetDefault(previous) })
 
-	sub := &subscription{store: s, group: "group", claimCursor: "42-0"}
-	before := time.Now()
-	if err := sub.restoreConsumerGroup(ctx); err != nil {
+	sub := &subscription{store: s, group: "group", consumer: "first", claimCursor: "42-0"}
+	competitor := &subscription{store: s, group: "group", consumer: "second", claimCursor: "42-0"}
+	other, err := s.Subscribe(ctx, "other", "first")
+	if err != nil {
 		t.Fatal(err)
+	}
+	old := addTestEvent(t, ctx, client, s.opts.StreamName, "other pending")
+	ev, err := other.Next(ctx)
+	if err != nil || ev.ID != old {
+		t.Fatalf("other group got %v, %v, want %s", ev, err, old)
+	}
+	if err := other.Ack(ctx, ev); err != nil {
+		t.Fatal(err)
+	}
+	otherPending := addTestEvent(t, ctx, client, s.opts.StreamName, "another pending")
+	if ev, err := other.Next(ctx); err != nil || ev.ID != otherPending {
+		t.Fatalf("other group got %v, %v, want %s", ev, err, otherPending)
+	}
+
+	before := time.Now()
+	results := make(chan error, 2)
+	go func() { results <- sub.restoreConsumerGroup(ctx) }()
+	go func() { results <- competitor.restoreConsumerGroup(ctx) }()
+	for range 2 {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
 	}
 	if sub.claimCursor != "0-0" || sub.lastClaim.Before(before) {
 		t.Fatalf("recovery left claim cursor %q and last claim %v", sub.claimCursor, sub.lastClaim)
 	}
-	if !strings.Contains(logs.String(), "level=WARN msg=\"restored Redis consumer group\"") {
-		t.Fatalf("expected a recovery warning, got %q", logs.String())
+	if strings.Count(logs.String(), "level=WARN msg=\"restored Redis consumer group\"") != 1 {
+		t.Fatalf("expected one recovery warning, got %q", logs.String())
 	}
 
 	logs.Reset()
-	if err := sub.restoreConsumerGroup(ctx); err != nil {
+	if ev, err := sub.Next(ctx); err != nil || ev.ID != old {
+		t.Fatalf("recovered group got %v, %v, want %s", ev, err, old)
+	}
+	if err := competitor.restoreConsumerGroup(ctx); err != nil {
 		t.Fatalf("recovery must accept BUSYGROUP: %v", err)
+	}
+	if ev, err := competitor.Next(ctx); err != nil || ev.ID != otherPending {
+		t.Fatalf("second recovery changed the group cursor: got %v, %v, want %s", ev, err, otherPending)
 	}
 	if logs.Len() != 0 {
 		t.Fatalf("recovery logged an existing group: %q", logs.String())
+	}
+	pending, err := client.XPendingExt(ctx, &redisclient.XPendingExtArgs{
+		Stream: s.opts.StreamName, Group: "other", Start: "-", End: "+", Count: 10,
+	}).Result()
+	if err != nil || len(pending) != 1 || pending[0].ID != otherPending || pending[0].Consumer != "first" {
+		t.Fatalf("recovery changed another group's pending entries: %v, %v", pending, err)
+	}
+	next := addTestEvent(t, ctx, client, s.opts.StreamName, "other next")
+	ev, err = other.Next(ctx)
+	if err != nil || ev.ID != next {
+		t.Fatalf("recovery changed another group's cursor: got %v, %v, want %s", ev, err, next)
+	}
+
+	if err := client.LPush(ctx, s.checkpointKey("broken"), "wrong type").Err(); err != nil {
+		t.Fatal(err)
+	}
+	broken := &subscription{store: s, group: "broken"}
+	if err := broken.restoreConsumerGroup(ctx); !redisclient.HasErrorPrefix(err, "WRONGTYPE") {
+		t.Fatalf("recovery must reject a checkpoint with the wrong type: %v", err)
+	}
+	if err := client.XPending(ctx, s.opts.StreamName, "broken").Err(); !redisclient.HasErrorPrefix(err, "NOGROUP") {
+		t.Fatalf("recovery created a group with an invalid checkpoint: %v", err)
+	}
+	if err := client.Del(ctx, s.checkpointKey("other")).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.LPush(ctx, s.checkpointKey("other"), "wrong type").Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := other.Ack(ctx, ev); !redisclient.HasErrorPrefix(err, "WRONGTYPE") {
+		t.Fatalf("ACK must reject a checkpoint with the wrong type: %v", err)
+	}
+	remaining, err := client.XPending(ctx, s.opts.StreamName, "other").Result()
+	if err != nil || remaining.Count != 2 {
+		t.Fatalf("failed ACK changed pending entries: %v, %v", remaining, err)
 	}
 
 	if err := client.Set(ctx, s.opts.StreamName, "wrong type", 0).Err(); err != nil {

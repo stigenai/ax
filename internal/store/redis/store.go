@@ -813,26 +813,109 @@ func (s *Store) GetWorkspace(ctx context.Context, atespace, name string) (*v1alp
 	return &w, nil
 }
 
-// Subscribe joins a Redis Streams consumer group, creating the group (and the
-// stream) if needed. A new group starts at the tail of the stream, so it only
-// sees events published after it was created; an existing group keeps its
-// position and any pending entries.
+// Subscribe joins a Redis Streams consumer group and saves its state.
+// A group with no prior state starts at the tail of the stream.
+// A group from a saved checkpoint keeps its position and pending entries.
 func (s *Store) Subscribe(ctx context.Context, group, consumer string) (store.Subscription, error) {
-	if _, err := s.createConsumerGroup(ctx, group, "$"); err != nil {
-		return nil, err
+	if _, err := s.consumerGroupCheckpoint(ctx, group, "subscribe", ""); err != nil {
+		return nil, fmt.Errorf("subscribing to consumer group %q: %w", group, err)
 	}
 	return &subscription{store: s, group: group, consumer: consumer, claimCursor: "0-0"}, nil
 }
 
-func (s *Store) createConsumerGroup(ctx context.Context, group, start string) (bool, error) {
-	err := s.client.XGroupCreateMkStream(ctx, s.opts.StreamName, group, start).Err()
-	if redis.HasErrorPrefix(err, "BUSYGROUP") {
-		return false, nil
-	}
-	if err != nil {
-		return false, fmt.Errorf("creating consumer group %q: %w", group, err)
-	}
-	return true, nil
+// A group checkpoint retains its cursor and pending entries across group loss.
+// Redis serializes the checkpoint and ACK so recovery cannot replay an acknowledged entry.
+var checkpointGroup = redis.NewScript(`
+local stream, checkpoint = KEYS[1], KEYS[2]
+local group, operation, id = ARGV[1], ARGV[2], ARGV[3]
+local streamType = redis.call('TYPE', stream).ok
+local checkpointType = redis.call('TYPE', checkpoint).ok
+if (streamType ~= 'none' and streamType ~= 'stream') or
+   (checkpointType ~= 'none' and checkpointType ~= 'string') then
+    return redis.error_reply('WRONGTYPE invalid stream or group checkpoint type')
+end
+
+local function field(info, name)
+    for i = 1, #info, 2 do
+        if info[i] == name then return info[i + 1] end
+    end
+end
+
+local position
+if streamType == 'stream' then
+    for _, info in ipairs(redis.call('XINFO', 'GROUPS', stream)) do
+        if field(info, 'name') == group then
+            position = field(info, 'last-delivered-id')
+            break
+        end
+    end
+end
+
+if operation == 'recover' and position then return 0 end
+if operation == 'ack' then
+    local match = redis.call('XPENDING', stream, group, id, id, 1)
+    if #match == 0 then return redis.call('XACK', stream, group, id) end
+    id = match[1][1]
+    if redis.acl_check_cmd and not redis.acl_check_cmd('XACK', stream, group, id) then
+        return redis.error_reply('NOPERM cannot acknowledge stream entries')
+    end
+end
+
+if not position then
+    local saved = redis.call('GET', checkpoint)
+    if saved then
+        local state = cmsgpack.unpack(saved)
+        local pending = state[2]
+        if #pending > 0 and redis.acl_check_cmd and
+           not redis.acl_check_cmd('XCLAIM', stream, group, pending[1][2], 0, pending[1][1], 'FORCE') then
+            return redis.error_reply('NOPERM cannot restore pending stream entries')
+        end
+        redis.call('XGROUP', 'CREATE', stream, group, state[1], 'MKSTREAM')
+        for _, entry in ipairs(pending) do
+            redis.call('XCLAIM', stream, group, entry[2], 0, entry[1],
+                'TIME', entry[3], 'RETRYCOUNT', entry[4], 'FORCE', 'JUSTID')
+        end
+        return 1
+    end
+    position = '0-0'
+    if operation == 'subscribe' and streamType == 'stream' then
+        position = field(redis.call('XINFO', 'STREAM', stream), 'last-generated-id')
+    end
+    local empty = cmsgpack.pack({position, {}})
+    if redis.acl_check_cmd and not redis.acl_check_cmd('SET', checkpoint, empty) then
+        return redis.error_reply('NOPERM cannot save the group checkpoint')
+    end
+    redis.call('XGROUP', 'CREATE', stream, group, position, 'MKSTREAM')
+    redis.call('SET', checkpoint, empty)
+    return 1
+end
+
+local clock = redis.call('TIME')
+local now = clock[1] * 1000 + math.floor(clock[2] / 1000)
+local pending, start, page = {}, '-', {}
+repeat
+    page = redis.call('XPENDING', stream, group, start, '+', 256)
+    for _, entry in ipairs(page) do
+        if operation ~= 'ack' or entry[1] ~= id then
+            entry[3] = math.max(0, now - entry[3])
+            pending[#pending + 1] = entry
+        end
+    end
+    if #page == 256 then start = '(' .. page[#page][1] end
+until #page < 256
+
+redis.call('SET', checkpoint, cmsgpack.pack({position, pending}))
+if operation == 'ack' then return redis.call('XACK', stream, group, id) end
+return 0
+`)
+
+func (s *Store) checkpointKey(group string) string {
+	stream := s.opts.StreamName
+	return fmt.Sprintf("ax:stream-checkpoint:%d:%s:%s", len(stream), stream, group)
+}
+
+func (s *Store) consumerGroupCheckpoint(ctx context.Context, group, operation, id string) (int, error) {
+	return checkpointGroup.Run(ctx, s.client, []string{s.opts.StreamName, s.checkpointKey(group)}, group, operation, id).Int()
 }
 
 // subscription reads from a consumer group in batches.
@@ -858,13 +941,13 @@ type subscription struct {
 }
 
 func (sub *subscription) restoreConsumerGroup(ctx context.Context) error {
-	created, err := sub.store.createConsumerGroup(ctx, sub.group, "0-0")
+	created, err := sub.store.consumerGroupCheckpoint(ctx, sub.group, "recover", "")
 	if err != nil {
-		return err
+		return fmt.Errorf("restoring consumer group %q: %w", sub.group, err)
 	}
 	sub.claimCursor = "0-0"
 	sub.lastClaim = time.Now()
-	if created {
+	if created == 1 {
 		slog.Warn("restored Redis consumer group", "stream", sub.store.opts.StreamName, "group", sub.group)
 	}
 	return nil
@@ -1000,7 +1083,7 @@ func (sub *subscription) dropIfPoison(ctx context.Context, ev store.TaskEvent) (
 		return false, nil
 	}
 	deliveries := pending[0].RetryCount
-	if err := sub.store.client.XAck(ctx, sub.store.opts.StreamName, sub.group, ev.ID).Err(); err != nil {
+	if err := sub.Ack(ctx, ev); err != nil {
 		return false, fmt.Errorf("acking poison task event %s: %w", ev.ID, err)
 	}
 	slog.Error("dropping task event after too many deliveries",
@@ -1009,7 +1092,8 @@ func (sub *subscription) dropIfPoison(ctx context.Context, ev store.TaskEvent) (
 }
 
 func (sub *subscription) Ack(ctx context.Context, ev store.TaskEvent) error {
-	return sub.store.client.XAck(ctx, sub.store.opts.StreamName, sub.group, ev.ID).Err()
+	_, err := sub.store.consumerGroupCheckpoint(ctx, sub.group, "ack", ev.ID)
+	return err
 }
 
 // Close releases the subscription. It deliberately leaves the consumer
