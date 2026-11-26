@@ -818,14 +818,14 @@ func (s *Store) GetWorkspace(ctx context.Context, atespace, name string) (*v1alp
 // sees events published after it was created; an existing group keeps its
 // position and any pending entries.
 func (s *Store) Subscribe(ctx context.Context, group, consumer string) (store.Subscription, error) {
-	if _, err := s.createConsumerGroup(ctx, group); err != nil {
+	if _, err := s.createConsumerGroup(ctx, group, "$"); err != nil {
 		return nil, err
 	}
 	return &subscription{store: s, group: group, consumer: consumer, claimCursor: "0-0"}, nil
 }
 
-func (s *Store) createConsumerGroup(ctx context.Context, group string) (bool, error) {
-	err := s.client.XGroupCreateMkStream(ctx, s.opts.StreamName, group, "$").Err()
+func (s *Store) createConsumerGroup(ctx context.Context, group, start string) (bool, error) {
+	err := s.client.XGroupCreateMkStream(ctx, s.opts.StreamName, group, start).Err()
 	if redis.HasErrorPrefix(err, "BUSYGROUP") {
 		return false, nil
 	}
@@ -858,7 +858,7 @@ type subscription struct {
 }
 
 func (sub *subscription) restoreConsumerGroup(ctx context.Context) error {
-	created, err := sub.store.createConsumerGroup(ctx, sub.group)
+	created, err := sub.store.createConsumerGroup(ctx, sub.group, "0-0")
 	if err != nil {
 		return err
 	}

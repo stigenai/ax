@@ -15,10 +15,13 @@
 package redis
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -88,10 +91,6 @@ func TestSubscriptionRestoresConsumerGroup(t *testing.T) {
 			if err := client.XGroupDestroy(ctx, s.opts.StreamName, "group").Err(); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := sub.(*subscription).read(ctx); err != nil {
-				t.Fatal(err)
-			}
-
 			id := addTestEvent(t, ctx, client, s.opts.StreamName, "job")
 			ev, err := sub.Next(ctx)
 			if err != nil {
@@ -101,6 +100,47 @@ func TestSubscriptionRestoresConsumerGroup(t *testing.T) {
 				t.Fatalf("got event ID %q, want %q", ev.ID, id)
 			}
 		})
+	}
+}
+
+func TestRestoreConsumerGroup(t *testing.T) {
+	s, client := newClaimTestStore(t, "restore", Options{})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	sub := &subscription{store: s, group: "group", claimCursor: "42-0"}
+	before := time.Now()
+	if err := sub.restoreConsumerGroup(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if sub.claimCursor != "0-0" || sub.lastClaim.Before(before) {
+		t.Fatalf("recovery left claim cursor %q and last claim %v", sub.claimCursor, sub.lastClaim)
+	}
+	if !strings.Contains(logs.String(), "level=WARN msg=\"restored Redis consumer group\"") {
+		t.Fatalf("expected a recovery warning, got %q", logs.String())
+	}
+
+	logs.Reset()
+	if err := sub.restoreConsumerGroup(ctx); err != nil {
+		t.Fatalf("recovery must accept BUSYGROUP: %v", err)
+	}
+	if logs.Len() != 0 {
+		t.Fatalf("recovery logged an existing group: %q", logs.String())
+	}
+
+	if err := client.Set(ctx, s.opts.StreamName, "wrong type", 0).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := sub.restoreConsumerGroup(ctx); !redisclient.HasErrorPrefix(err, "WRONGTYPE") {
+		t.Fatalf("recovery must return WRONGTYPE: %v", err)
+	}
+	if logs.Len() != 0 {
+		t.Fatalf("recovery logged a failed group creation: %q", logs.String())
 	}
 }
 
