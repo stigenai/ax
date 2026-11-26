@@ -131,13 +131,19 @@ func TestRecoveryPreservesPendingGaps(t *testing.T) {
 	}
 	low := addTestEvent(t, ctx, client, stream, "low")
 	high := addTestEvent(t, ctx, client, stream, "high")
+	poison := addTestEvent(t, ctx, client, stream, "legacy poison")
 	if _, err := client.XReadGroup(ctx, &redisclient.XReadGroupArgs{
-		Group: group, Consumer: "original", Streams: []string{stream, ">"}, Count: 2,
+		Group: group, Consumer: "original", Streams: []string{stream, ">"}, Count: 3,
 	}).Result(); err != nil {
 		t.Fatal(err)
 	}
-	if err := client.XAck(ctx, stream, group, high).Err(); err != nil {
+	if err := client.Do(ctx, "XCLAIM", stream, group, "original", 0, poison, "RETRYCOUNT", 100).Err(); err != nil {
 		t.Fatal(err)
+	}
+	for _, id := range []string{high, poison} {
+		if count, err := client.XAck(ctx, stream, group, id).Result(); err != nil || count != 1 {
+			t.Fatalf("legacy XACK %s = %d, %v, want 1", id, count, err)
+		}
 	}
 	if err := client.Do(ctx, "XCLAIM", stream, group, "original", 0, low, "IDLE", 200, "RETRYCOUNT", 2).Err(); err != nil {
 		t.Fatal(err)
@@ -164,6 +170,10 @@ func TestRecoveryPreservesPendingGaps(t *testing.T) {
 		}).Result()
 		if err != nil || len(pending) != 1 || pending[0].Consumer != "original" || pending[0].RetryCount != 2 || pending[0].Idle < 200*time.Millisecond {
 			t.Fatalf("after %s recovery got pending %v, %v", name, pending, err)
+		}
+		summary, err := client.XPending(ctx, stream, group).Result()
+		if err != nil || summary.Count != 2 {
+			t.Fatalf("after %s recovery got pending summary %v, %v, want low and marker", name, summary, err)
 		}
 		if err := sub.Ack(ctx, ev); err != nil {
 			t.Fatal(err)
