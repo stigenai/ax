@@ -282,6 +282,8 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 	launchTask.Spec.Capabilities = nil
 	// The sandbox class belongs to the template too, for the same reason.
 	launchTask.Spec.SandboxClass = ""
+	// Worker labels only choose the worker; older runners reject this field.
+	launchTask.Spec.WorkerLabels = nil
 	if taskYAML, err := yaml.Marshal(launchTask); err == nil {
 		extraEnv["AX_TASK_YAML"] = string(taskYAML)
 	}
