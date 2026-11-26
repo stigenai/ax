@@ -93,14 +93,14 @@ A plain apply of the new manifest starts Redis with 0 keys. Redis with `--append
 
    ```bash
    POD=$(kubectl --context gtr -n ax-system get pod -l app.kubernetes.io/name=ax-redis -o name | cut -d/ -f2)
-   kubectl --context gtr -n ax-system exec "$POD" -- sh -c 'umask 077 && mkdir -p /tmp/seed && stat -c %a /tmp/seed'
+   kubectl --context gtr -n ax-system exec "$POD" -- sh -c 'umask 077 && mkdir -p /tmp/seed && chmod 700 /tmp/seed && test "$(stat -c %a /tmp/seed)" = 700' || { echo "seed dir is not mode 700: stop"; false; }
    kubectl --context gtr -n ax-system cp ./ax-redis-before.rdb "$POD":/tmp/seed/dump.rdb
    kubectl --context gtr -n ax-system exec "$POD" -- sh -c 'redis-server --port 6380 --dir /tmp/seed --appendonly no --daemonize yes'
    kubectl --context gtr -n ax-system exec "$POD" -- redis-cli REPLICAOF 127.0.0.1 6380
    kubectl --context gtr -n ax-system exec "$POD" -- redis-cli INFO replication
    ```
 
-   The `stat` in the pod must print `700`. Repeat the last command until it shows `master_link_status:up`. Then run:
+   The `sh` command fails if `/tmp/seed` does not have mode `700`. If it fails, do not run the next command. Repeat `INFO replication` until it shows `master_link_status:up`. Then run:
 
    ```bash
    kubectl --context gtr -n ax-system exec "$POD" -- redis-cli REPLICAOF NO ONE
