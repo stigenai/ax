@@ -58,6 +58,7 @@ spec:
   # Stop the old controller before the new controller saves a Redis checkpoint.
   strategy:
     type: Recreate
+    rollingUpdate: null
   selector:
     matchLabels:
       app.kubernetes.io/name: ax-controller
