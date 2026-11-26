@@ -59,6 +59,8 @@ The task inventory and the `ax get task` output name tasks and can show task spe
 
 A plain apply of the new manifest starts Redis with 0 keys. Redis with `--appendonly yes` ignores `dump.rdb` when it has no AOF file. Seed the new Redis from the old data.
 
+Before step 1, while ax-server still runs, keep the output of `ax -a <atespace> get task <name>` for 3 tasks. Compare the inventory in step 6.
+
 1. Stop the writers. If a writer runs during the save, the saved file lacks its last writes.
 
    ```bash
@@ -78,8 +80,6 @@ A plain apply of the new manifest starts Redis with 0 keys. Redis with `--append
    ls -l ax-redis-before.rdb
    kubectl --context gtr -n ax-system exec deploy/ax-redis -- redis-cli DBSIZE
    ```
-
-   Before step 1, while ax-server still runs, keep the output of `ax -a <atespace> get task <name>` for 3 tasks. Compare the inventory in step 6.
 
 3. Apply the manifest. The Recreate strategy stops the old pod first.
 
@@ -116,6 +116,8 @@ A plain apply of the new manifest starts Redis with 0 keys. Redis with `--append
    The `rm` removes the second copy of the data from the pod. The `ls` must fail with "No such file".
 
 5. Check. `DBSIZE` must equal the baseline. `INFO persistence` must show `aof_enabled:1` and `aof_last_write_status:ok`.
+
+   The replica sync of step 4 starts an AOF rewrite. Until the rewrite ends, the AOF on the volume does not hold the seeded data. Repeat `INFO persistence` until it shows `aof_rewrite_in_progress:0` and `aof_last_bgrewrite_status:ok`. Do this before step 6 scales the writers back.
 
    ```bash
    kubectl --context gtr -n ax-system exec "$POD" -- redis-cli DBSIZE
@@ -177,9 +179,9 @@ Only the owner runs these steps. They need the live cluster. CI and the offline 
 | AC1 manifest | Static check in `deploy/stigenai/redis-persistence-test.sh` | Pre-check: `kubectl --context gtr get storageclass` |
 | AC2 restart keeps data | `bash deploy/stigenai/redis-persistence-test.sh` against a local Redis with a data directory | "Migration", then "Restart check" |
 | AC4, AC5 orphan report | `go test ./internal/controller -run TestDeleteSweepOrphanActors` | Apply ax-controller with `ko`, then read the `delete sweep: orphan actor` log lines |
-| AC7 live migration | None | "Migration" steps 1 to 6 |
-| AC8 soak | None | "Restart check" on the live pod, then watch the controller logs |
-| ax-89l k0s-agents | None (same `deploy/redis.yaml`) | Run "Pre-check", "Migration" and "Restart check" with the k0s-agents context and namespace |
+| AC7 live migration and restart check | None | "Migration" steps 1 to 6, then "Restart check" on the live pod |
+| AC8 soak | None | After the `ko` apply of ax-controller, watch the controller logs for the `orphan_actors` field of `delete sweep: stuck deletions` |
+| ax-89l k0s-agents | None (same `deploy/redis.yaml`) | Run "Pre-check", "Migration" and "Restart check" with the k0s-agents context. The namespace stays `ax-system` |
 
 ## Rollback
 
