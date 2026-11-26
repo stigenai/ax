@@ -157,9 +157,9 @@ Only the owner runs these steps. They need the live cluster. CI and the offline 
 
 ## Rollback
 
-Choose the case.
+Use this procedure only before the writers resume.
 
-### Case A: abort before the writers resume (before Migration step 6)
+### Rollback before the writers resume (before Migration step 6)
 
 1. Scale the writers to 0 (they are 0 already).
 2. Apply the old `deploy/redis.yaml`. Redis starts with no data.
@@ -168,17 +168,8 @@ Choose the case.
 5. Run `ax -a <atespace> get task <name>` for 3 tasks. Each command must succeed.
 6. Delete the claim only after steps 4 and 5 pass: `kubectl --context gtr -n ax-system delete pvc ax-redis-data`.
 
-### Case B: roll back after the writers resumed
+### Do not apply the old manifest after the writers resume
 
-`ax-redis-before.rdb` does not hold the writes that Redis accepted after step 6. Do not use it. Do not delete the claim first.
-
-1. Scale the writers to 0 and wait until the pods are gone, as in "Migration" step 1.
-2. Before step 1, keep the output of `ax -a <atespace> get task <name>` for 3 tasks. After step 1, wait until Redis answers PING. Record the task inventory and `DBSIZE`. Take a fresh snapshot: `redis-cli SAVE`. Copy `/data/dump.rdb` to `ax-redis-after.rdb`.
-3. Revert the pull request and apply the old `deploy/redis.yaml`. Redis starts with no data. The claim stays, because `kubectl apply` does not delete it.
-4. Seed it from `ax-redis-after.rdb` with the same steps as in "Migration" step 4.
-5. Wait until Redis answers PING. Check that `DBSIZE` and the task inventory equal the values of step 2.
-6. Scale the writers back to 1. Wait for the rollout.
-7. ax-server runs again. Run `ax -a <atespace> get task <name>` for the 3 tasks. Each command must succeed with the same spec.
-8. Delete the claim only after steps 5 and 7 both pass and the person agrees: `kubectl --context gtr -n ax-system delete pvc ax-redis-data`.
+After the writers resume, the old `deploy/redis.yaml` has no persistence. The next restart loses the data again. Do not apply it. Fix forward on the claim `ax-redis-data`. Do not delete the claim. A `git revert` of the pull request changes no live object.
 
 A rollback of ax-controller removes only the `orphan_actors` field.
