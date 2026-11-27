@@ -58,11 +58,14 @@ func resolveMaxQuantity(value string) (resource.Quantity, error) {
 // minAuthTokenLen is the shortest AX_AUTH_TOKEN the server accepts.
 const minAuthTokenLen = 32
 
-// resolveAuthToken reads the AX_AUTH_TOKEN value. An empty value turns caller
-// authentication off. Any other value is trimmed and must then hold at least
-// minAuthTokenLen bytes. If it does not, the server must not start.
-func resolveAuthToken(value string) (string, error) {
+// resolveAuthToken checks the AX_AUTH_TOKEN value. If the token is optional,
+// an empty value turns caller authentication off. The function removes
+// whitespace from the ends of other values and checks the minimum byte count.
+func resolveAuthToken(value string, required bool) (string, error) {
 	if value == "" {
+		if required {
+			return "", fmt.Errorf("is empty, and --require-auth is set")
+		}
 		return "", nil
 	}
 	token := strings.TrimSpace(value)
@@ -82,6 +85,7 @@ func main() {
 		tlsCertFile   string
 		tlsKeyFile    string
 		plainAddr     string
+		requireAuth   bool
 	)
 
 	flag.StringVar(&listenAddr, "addr", ":8080", "HTTP listen address")
@@ -92,6 +96,7 @@ func main() {
 	flag.StringVar(&tlsCertFile, "tls-cert-file", "", "PEM certificate file; with --tls-key-file turns TLS on. Both files reload on change. Plaintext when unset")
 	flag.StringVar(&plainAddr, "plain-addr", "", "Extra plaintext listen address, for probes and the ax tunnel; only with TLS on. Off when unset")
 	flag.StringVar(&tlsKeyFile, "tls-key-file", "", "PEM private key file for --tls-cert-file")
+	flag.BoolVar(&requireAuth, "require-auth", false, "Refuse to start when AX_AUTH_TOKEN is empty")
 	flag.Parse()
 
 	if envAddr := os.Getenv("ADDR"); envAddr != "" {
@@ -120,7 +125,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	authToken, err := resolveAuthToken(os.Getenv("AX_AUTH_TOKEN"))
+	authToken, err := resolveAuthToken(os.Getenv("AX_AUTH_TOKEN"), requireAuth)
 	if err != nil {
 		slog.Error("invalid AX_AUTH_TOKEN", "error", err)
 		os.Exit(1)
