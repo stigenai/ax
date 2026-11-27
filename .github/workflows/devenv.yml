@@ -1,0 +1,51 @@
+# Devenv check for the stigenai/deploy branch (ax-yj5).
+# Factory workers load devenv.nix with devenv print-dev-env.
+# This job proves that a clean checkout gives the CI tool versions.
+name: Devenv
+
+on:
+  pull_request:
+    branches: [ "stigenai/deploy" ]
+    paths: &paths
+      - devenv.nix
+      - devenv.yaml
+      - devenv.lock
+      - go.mod
+      - .bazelversion
+      - .gitignore
+      - .github/scripts/devenv-check.sh
+      - .github/workflows/devenv.yml
+  push:
+    branches: [ "stigenai/deploy" ]
+    paths: *paths
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: devenv-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  devenv:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31.11.3
+      - name: devenv print-dev-env
+        run: nix shell github:NixOS/nixpkgs/9f9221fa46ec667cff2f666fb42498cb96c804e3#devenv -c devenv print-dev-env > "$RUNNER_TEMP/devenv.sh"
+      - name: CI tools at CI versions
+        run: |
+          set -o pipefail
+          pat='^[[:blank:]]*eval "?\$\{shellHook:-\}"?[[:blank:]]*$'
+          test "$(grep -cE "$pat" "$RUNNER_TEMP/devenv.sh")" = 1 || { echo "::error::print-dev-env output has no single eval shellHook line"; exit 1; }
+          grep -vE "$pat" "$RUNNER_TEMP/devenv.sh" > "$RUNNER_TEMP/devenv-env.sh"
+          base_path=$PATH keep_home=$HOME keep_tmp=${TMPDIR:-/tmp}
+          . "$RUNNER_TEMP/devenv-env.sh" > /dev/null 2>&1
+          export HOME="$keep_home" TMPDIR="$keep_tmp" PATH="$PATH:$base_path"
+          test -n "${DEVENV_ROOT:-}" || { echo "::error::DEVENV_ROOT is not set after sourcing"; exit 1; }
+          bash .github/scripts/devenv-check.sh
+      - name: Checkout stays clean
+        run: test -z "$(git status --porcelain)" || { git status --porcelain; echo "::error::devenv changed the checkout"; exit 1; }

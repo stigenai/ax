@@ -1,0 +1,5 @@
+inputs:
+  nixpkgs:
+    url: git+https://github.com/NixOS/nixpkgs?rev=9f9221fa46ec667cff2f666fb42498cb96c804e3&shallow=1
+  devenv:
+    url: git+https://github.com/cachix/devenv?dir=src/modules&ref=refs/tags/v2.4.0&shallow=1

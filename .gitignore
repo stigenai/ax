@@ -17,3 +17,7 @@ bin/
 .beads/proxieddb/
 *.gate.lock*
 /bazel-*
+
+# devenv
+.devenv*
+devenv.local.nix

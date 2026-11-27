@@ -197,3 +197,27 @@ Entries are in stack order, the same order as the commits.
 **Reason:** Upstream builds with go and make, not Bazel.
 
 **Removal condition:** Remove the carry when stigenai stops using it, or when upstream adds the same behavior.
+
+## devenv with the CI toolbelt
+
+**Bead:** `ax-lcb` · **Branch:** `stigenai/deploy` · **Upstream status:** `fork-only`
+
+**Upstream files edited:**
+
+- `.gitignore`
+
+**New files:**
+
+- `devenv.lock`
+- `devenv.nix`
+- `devenv.yaml`
+- `.github/scripts/devenv-check.sh`
+- `.github/workflows/devenv.yml`
+
+**Tests:**
+
+- none
+
+**Reason:** The devenv serves the fork's CI and workers only.
+
+**Removal condition:** Remove the carry when stigenai stops using it, or when upstream adds the same behavior.
