@@ -73,6 +73,11 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      - name: Redis persistence restart test
+        run: |
+          yq --version
+          bash deploy/stigenai/redis-persistence-test.sh
+
       - name: Test
         run: |
           set -o pipefail

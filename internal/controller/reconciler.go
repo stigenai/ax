@@ -123,6 +123,25 @@ type TaskReconciler struct {
 	// reasonCPUExceedsCapacity. As with MaxTaskMemory, the check applies
 	// before each placement, not to a task already in phase Running.
 	MaxTaskCPU resource.Quantity
+
+	// DefaultWorkerLabels (AX_DEFAULT_WORKER_LABELS) select workers for tasks
+	// without explicit worker labels, guest devices or a supervisor profile.
+	DefaultWorkerLabels map[string]string
+}
+
+// effectiveWorkerLabels returns explicit worker labels if the task sets them.
+// Device and supervisor selectors replace the default worker labels.
+func (r *TaskReconciler) effectiveWorkerLabels(spec *v1alpha1.TaskSpec) map[string]string {
+	if len(spec.GetWorkerLabels()) > 0 {
+		return spec.GetWorkerLabels()
+	}
+	if spec.GetSupervisorProfile() != "" {
+		return nil
+	}
+	if len(spec.GetGuestDevices()) > 0 {
+		return nil
+	}
+	return r.DefaultWorkerLabels
 }
 
 // NewTaskReconciler creates a new TaskReconciler.
@@ -265,6 +284,8 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 	// The sandbox class belongs to the template too, for the same reason.
 	launchTask.Spec.SandboxClass = ""
 	launchTask.Spec.GuestDevices = nil
+	// Worker labels only choose the worker; older runners reject this field.
+	launchTask.Spec.WorkerLabels = nil
 	if taskYAML, err := yaml.Marshal(launchTask); err == nil {
 		extraEnv["AX_TASK_YAML"] = string(taskYAML)
 	}
@@ -293,7 +314,7 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 			}
 		}
 
-		tmpl, err := r.client.EnsureActorTemplateWithImage(ctx, templateAtespace, templateName, atespace, customTemplateName, task.Spec.Image, task.Spec.SupervisorProfile, task.Spec.GetSandboxClass(), task.Spec.GetGuestDevices(), effectiveResources, task.Spec.Capabilities, extraEnv)
+		tmpl, err := r.client.EnsureActorTemplateWithImage(ctx, templateAtespace, templateName, atespace, customTemplateName, task.Spec.Image, task.Spec.SupervisorProfile, task.Spec.GetSandboxClass(), task.Spec.GetGuestDevices(), effectiveResources, task.Spec.Capabilities, r.effectiveWorkerLabels(task.Spec), extraEnv)
 		if err != nil {
 			// The default template has neither this image nor this env, so an
 			// actor made from it would not be this task: fail with the reason.
@@ -308,7 +329,9 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 		}
 	}
 
-	actor, err := r.client.EnsureActor(ctx, atespace, actorName, templateAtespace, templateName, task.Spec.SupervisorProfile != "")
+	// alreadySuspended is true only for an existing SUSPENDED actor.
+	// A new actor still needs SuspendActor.
+	actor, alreadySuspended, err := r.client.EnsureActor(ctx, atespace, actorName, templateAtespace, templateName, task.Spec.SupervisorProfile != "", task.Spec.GetSuspend())
 	if err != nil {
 		r.setNotReady(task, "ActorCreationFailed", err.Error(), now)
 		task.Status.Phase = "Failed"
@@ -317,11 +340,13 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 
 	// 4. Suspend or Resume the Actor
 	if task.Spec != nil && task.Spec.Suspend {
-		slog.Info("suspending actor on Substrate", "actor", actorName)
-		if err := r.client.SuspendActor(ctx, atespace, actorName); err != nil {
-			r.setNotReady(task, "ActorSuspendFailed", err.Error(), now)
-			task.Status.Phase = "Failed"
-			return task, fmt.Errorf("suspending actor: %w", err)
+		if !alreadySuspended {
+			slog.Info("suspending actor on Substrate", "actor", actorName)
+			if err := r.client.SuspendActor(ctx, atespace, actorName); err != nil {
+				r.setNotReady(task, "ActorSuspendFailed", err.Error(), now)
+				task.Status.Phase = "Failed"
+				return task, fmt.Errorf("suspending actor: %w", err)
+			}
 		}
 		task.Status.WorkerIp = ""
 		task.Status.Phase = "Suspended"
@@ -510,8 +535,7 @@ func taskTemplatePattern(taskName string) *regexp.Regexp {
 	return regexp.MustCompile(fmt.Sprintf("^%s-tmpl-[0-9a-f]{%d}$", regexp.QuoteMeta(taskName), 2*templateDigestBytes))
 }
 
-// ReconcileDelete cleans up Substrate resources when a Task is deleted: the actor,
-// which shares the task's name, then every ActorTemplate provisioned for the task.
+// ReconcileDelete deletes the task actor, then its templates without tag references.
 func (r *TaskReconciler) ReconcileDelete(ctx context.Context, atespace, taskName string, actorUID ...string) error {
 	if atespace == "" {
 		atespace = "default"
@@ -531,20 +555,46 @@ func (r *TaskReconciler) ReconcileDelete(ctx context.Context, atespace, taskName
 	return nil
 }
 
-// deleteTaskTemplates removes all ActorTemplates belonging to the task. Templates
-// accumulate across spec revisions, so this matches by name pattern rather than
-// recomputing a single digest. If an actor deletion is still finishing in Substrate,
-// template deletion may briefly return Aborted, so we retry with backoff.
+// deleteTaskTemplates retains templates that tags reference, except their own golden tags.
+// It validates the complete inventory and all candidates before the first delete.
+// Template delete retries allow Substrate to finish the actor delete.
 func (r *TaskReconciler) deleteTaskTemplates(ctx context.Context, atespace, taskName string) error {
 	templates, err := r.client.ListActorTemplates(ctx, atespace)
 	if err != nil {
 		return err
 	}
 	pattern := taskTemplatePattern(taskName)
-	var errs []error
+	var candidates []*ateapipb.ActorTemplate
 	for _, tmpl := range templates {
+		if pattern.MatchString(tmpl.GetMetadata().GetName()) {
+			if tmpl.GetMetadata().GetUid() == "" {
+				return fmt.Errorf("template cleanup requires a candidate UID")
+			}
+			candidates = append(candidates, tmpl)
+		}
+	}
+	tags, err := r.client.ListTags(ctx, "")
+	if err != nil {
+		return fmt.Errorf("tag inventory unavailable: %s", status.Code(err))
+	}
+	for _, tag := range tags {
+		if tag.GetMetadata().GetName() == "" || tag.GetMetadata().GetAtespace() == "" || tag.GetStatus().GetActorTemplateUid() == "" {
+			return fmt.Errorf("tag inventory lacks required identity fields")
+		}
+	}
+	var errs []error
+	for _, tmpl := range candidates {
 		name := tmpl.GetMetadata().GetName()
-		if !pattern.MatchString(name) {
+		uid := tmpl.GetMetadata().GetUid()
+		retained := false
+		for _, tag := range tags {
+			if tag.GetStatus().GetActorTemplateUid() == uid && !(tag.GetMetadata().GetAtespace() == "ate-golden" && tag.GetMetadata().GetName() == uid) {
+				retained = true
+				break
+			}
+		}
+		if retained {
+			slog.Info("retaining Substrate actor template for task", "atespace", atespace, "task", taskName, "template", name, "template_uid", uid, "reason", "tag_reference")
 			continue
 		}
 		slog.Info("deleting Substrate actor template for task", "atespace", atespace, "task", taskName, "template", name)

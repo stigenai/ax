@@ -154,7 +154,10 @@ func (s *Store) taskPubSubChannel(atespace, name string) string {
 	return fmt.Sprintf("%s:pubsub:task:%s:%s", s.opts.KeyPrefix, atespace, name)
 }
 
-// SaveTask stores or updates a task and publishes a reconcile event to the stream.
+// SaveTask stores or updates a task. It then publishes a reconcile event.
+// It returns ErrConflict when the stored phase is already Terminating.
+// This rule covers every task. It leaves the stored task unchanged.
+// It publishes no event. The check runs inside the store transaction.
 func (s *Store) SaveTask(ctx context.Context, task *v1alpha1.Task) error {
 	if task.Metadata == nil {
 		task.Metadata = &v1alpha1.ObjectMeta{}
@@ -194,7 +197,7 @@ func (s *Store) SaveTask(ctx context.Context, task *v1alpha1.Task) error {
 		if err != nil && !errors.Is(err, store.ErrNotFound) {
 			return err
 		}
-		if existing.GetSpec().GetSupervisorProfile() != "" && existing.GetStatus().GetPhase() == v1alpha1.PhaseTerminating {
+		if existing.GetStatus().GetPhase() == v1alpha1.PhaseTerminating {
 			return store.ErrConflict
 		}
 		_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {

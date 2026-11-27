@@ -17,6 +17,23 @@ kind: Namespace
 metadata:
   name: ax-system
 ---
+# Task records, workspaces and the task stream live here. The claim uses the
+# cluster default StorageClass. See docs/redis-persistence.md.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ax-redis-data
+  namespace: ax-system
+  labels:
+    app.kubernetes.io/name: ax-redis
+    app.kubernetes.io/part-of: ax
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -27,6 +44,9 @@ metadata:
     app.kubernetes.io/part-of: ax
 spec:
   replicas: 1
+  # The claim is ReadWriteOnce: two pods must not share one AOF dir.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: ax-redis
@@ -38,9 +58,20 @@ spec:
       containers:
         - name: redis
           image: redis:7-alpine
+          # args, not command: the image entrypoint then runs chown on /data.
+          args:
+            - --appendonly
+            - "yes"
+            - --appendfsync
+            - everysec
+            - --dir
+            - /data
           ports:
             - containerPort: 6379
               name: redis
+          volumeMounts:
+            - name: data
+              mountPath: /data
           resources:
             requests:
               cpu: 100m
@@ -48,6 +79,10 @@ spec:
             limits:
               cpu: 1000m
               memory: 1Gi
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: ax-redis-data
 ---
 apiVersion: v1
 kind: Service

@@ -15,8 +15,10 @@
 package controller_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"net"
 	"net/http"
 	"strings"
@@ -67,6 +69,33 @@ type mockControlServer struct {
 	// bounds the call with its own timeout instead of hanging forever
 	// (ax-9qu.11).
 	getActorDelay time.Duration
+	// liveActor is the actor stored by a successful UpdateActor.
+	// GetActor returns it ahead of existingActor.
+	liveActor *ateapipb.Actor
+	// updateRequests keeps every UpdateActor body. A rejected call stays in the list.
+	updateRequests []*ateapipb.Actor
+	// updateErr makes UpdateActor fail before it stores the actor.
+	updateErr error
+	// updateNil makes UpdateActor return a nil actor and a nil error.
+	updateNil bool
+	// loseUpdateResponse stores one actor, then returns Unavailable.
+	loseUpdateResponse bool
+	// getActorNil makes GetActor return a nil actor and a nil error.
+	getActorNil bool
+	// blankTemplateName makes CreateActorTemplate return an empty name.
+	blankTemplateName bool
+	// blankTemplateAtespace makes CreateActorTemplate return an empty atespace.
+	blankTemplateAtespace bool
+	// suspendErr makes SuspendActor fail.
+	suspendErr error
+	// calls lists Control method names in call order.
+	calls          []string
+	tagPages       map[string]*ateapipb.ListTagsResponse
+	tagErr         error
+	tagCalls       int
+	deleteTagCalls int
+	templateList   []*ateapipb.ActorTemplate
+	deleteActorErr error
 }
 
 // noSecrets is a SecretResolver for tests: it never finds a key and never touches a cluster.
@@ -75,6 +104,7 @@ func noSecrets(context.Context, string, string, string) (string, error) {
 }
 
 func (m *mockControlServer) GetActorTemplate(_ context.Context, req *ateapipb.GetActorTemplateRequest) (*ateapipb.ActorTemplate, error) {
+	m.calls = append(m.calls, "GetActorTemplate")
 	ref := req.GetActorTemplate()
 	if !m.actorTemplates[ref.GetName()] {
 		return nil, status.Error(codes.NotFound, "template not found")
@@ -86,6 +116,7 @@ func (m *mockControlServer) GetActorTemplate(_ context.Context, req *ateapipb.Ge
 }
 
 func (m *mockControlServer) CreateActorTemplate(_ context.Context, req *ateapipb.CreateActorTemplateRequest) (*ateapipb.ActorTemplate, error) {
+	m.calls = append(m.calls, "CreateActorTemplate")
 	if m.rejectTemplates != nil {
 		return nil, m.rejectTemplates
 	}
@@ -93,6 +124,18 @@ func (m *mockControlServer) CreateActorTemplate(_ context.Context, req *ateapipb
 		m.actorTemplates = make(map[string]bool)
 	}
 	tmpl := req.GetActorTemplate()
+	if m.blankTemplateName || m.blankTemplateAtespace {
+		tmpl = proto.Clone(tmpl).(*ateapipb.ActorTemplate)
+		if tmpl.Metadata == nil {
+			tmpl.Metadata = &ateapipb.ResourceMetadata{}
+		}
+		if m.blankTemplateName {
+			tmpl.Metadata.Name = ""
+		}
+		if m.blankTemplateAtespace {
+			tmpl.Metadata.Atespace = ""
+		}
+	}
 	m.lastTemplate = tmpl
 	m.actorTemplates[tmpl.GetMetadata().GetName()] = true
 	return tmpl, nil
@@ -107,7 +150,15 @@ func (m *mockControlServer) CreateAtespace(ctx context.Context, req *ateapipb.Cr
 	return &ateapipb.Atespace{Metadata: &ateapipb.ResourceMetadata{Name: name}}, nil
 }
 
+func cloneActor(actor *ateapipb.Actor) *ateapipb.Actor {
+	if actor == nil {
+		return nil
+	}
+	return proto.Clone(actor).(*ateapipb.Actor)
+}
+
 func (m *mockControlServer) GetActor(ctx context.Context, _ *ateapipb.GetActorRequest) (*ateapipb.Actor, error) {
+	m.calls = append(m.calls, "GetActor")
 	if m.getActorDelay > 0 {
 		select {
 		case <-time.After(m.getActorDelay):
@@ -118,14 +169,57 @@ func (m *mockControlServer) GetActor(ctx context.Context, _ *ateapipb.GetActorRe
 	if m.getActorErr != nil {
 		return nil, m.getActorErr
 	}
-	if m.getActorActor != nil {
-		return m.getActorActor, nil
+	if m.getActorNil {
+		return nil, nil
 	}
-	return m.existingActor, nil
+	if m.getActorActor != nil {
+		return cloneActor(m.getActorActor), nil
+	}
+	if m.liveActor != nil {
+		return cloneActor(m.liveActor), nil
+	}
+	return cloneActor(m.existingActor), nil
+}
+
+func (m *mockControlServer) currentActor() *ateapipb.Actor {
+	if m.liveActor != nil {
+		return m.liveActor
+	}
+	return m.existingActor
+}
+
+// UpdateActor enforces uid and version against the stored actor.
+// A match stores the request body and increments version.
+func (m *mockControlServer) UpdateActor(_ context.Context, req *ateapipb.UpdateActorRequest) (*ateapipb.Actor, error) {
+	m.calls = append(m.calls, "UpdateActor")
+	got := cloneActor(req.GetActor())
+	m.updateRequests = append(m.updateRequests, got)
+	current := m.currentActor()
+	if got.GetMetadata().GetUid() == "" || got.GetMetadata().GetVersion() == 0 {
+		return nil, status.Error(codes.InvalidArgument, "uid and version are required")
+	}
+	if current == nil || current.GetMetadata().GetUid() != got.GetMetadata().GetUid() || current.GetMetadata().GetVersion() != got.GetMetadata().GetVersion() {
+		return nil, status.Error(codes.Aborted, "uid or version conflict")
+	}
+	if m.updateErr != nil {
+		return nil, m.updateErr
+	}
+	if m.updateNil {
+		return nil, nil
+	}
+	stored := cloneActor(got)
+	stored.Metadata.Version = current.GetMetadata().GetVersion() + 1
+	m.liveActor = stored
+	if m.loseUpdateResponse {
+		m.loseUpdateResponse = false
+		return nil, status.Error(codes.Unavailable, "lost update response")
+	}
+	return cloneActor(stored), nil
 }
 
 func (m *mockControlServer) CreateActor(ctx context.Context, req *ateapipb.CreateActorRequest) (*ateapipb.Actor, error) {
-	if m.existingActor != nil {
+	m.calls = append(m.calls, "CreateActor")
+	if m.existingActor != nil || m.liveActor != nil {
 		return nil, status.Error(codes.AlreadyExists, "actor exists")
 	}
 	name := ""
@@ -142,6 +236,7 @@ func (m *mockControlServer) CreateActor(ctx context.Context, req *ateapipb.Creat
 }
 
 func (m *mockControlServer) ResumeActor(ctx context.Context, req *ateapipb.ResumeActorRequest) (*ateapipb.ResumeActorResponse, error) {
+	m.calls = append(m.calls, "ResumeActor")
 	m.resumeAttempts.Add(1)
 	if m.resumeErr != nil {
 		return nil, m.resumeErr
@@ -171,15 +266,23 @@ func (m *mockControlServer) ResumeActor(ctx context.Context, req *ateapipb.Resum
 }
 
 func (m *mockControlServer) SuspendActor(ctx context.Context, req *ateapipb.SuspendActorRequest) (*ateapipb.SuspendActorResponse, error) {
+	m.calls = append(m.calls, "SuspendActor")
 	name := ""
 	if req.Actor != nil {
 		name = req.Actor.Name
 	}
 	m.suspendedActors = append(m.suspendedActors, name)
+	if m.suspendErr != nil {
+		return nil, m.suspendErr
+	}
 	return &ateapipb.SuspendActorResponse{}, nil
 }
 
 func (m *mockControlServer) DeleteActor(ctx context.Context, req *ateapipb.DeleteActorRequest) (*ateapipb.Actor, error) {
+	m.calls = append(m.calls, "DeleteActor")
+	if m.deleteActorErr != nil {
+		return nil, m.deleteActorErr
+	}
 	m.deleteUID = req.GetOptions().GetUid()
 	if m.expectedDeleteUID != "" && m.deleteUID != m.expectedDeleteUID {
 		return nil, status.Error(codes.Aborted, "actor UID differs")
@@ -194,6 +297,12 @@ func (m *mockControlServer) DeleteActor(ctx context.Context, req *ateapipb.Delet
 		}
 	}
 	m.deletedActors = append(m.deletedActors, name)
+	if name != "" && m.existingActor.GetMetadata().GetName() == name {
+		m.existingActor = nil
+	}
+	if name != "" && m.liveActor.GetMetadata().GetName() == name {
+		m.liveActor = nil
+	}
 	return &ateapipb.Actor{Metadata: &ateapipb.ResourceMetadata{Name: name}}, nil
 }
 
@@ -217,7 +326,7 @@ func TestProtectedDeleteCannotTargetReplacementActor(t *testing.T) {
 	if err := reconciler.ReconcileDelete(context.Background(), "private", "job", "original-uid"); err != nil {
 		t.Fatal(err)
 	}
-	if mock.deleteUID != "original-uid" || len(mock.deletedActors) != 1 || len(mock.deletedTemplates) != 0 {
+	if mock.deleteUID != "original-uid" || len(mock.deletedActors) != 1 || len(mock.deletedTemplates) != 0 || mock.tagCalls != 0 {
 		t.Fatal("protected identity or template retention lost")
 	}
 	mock.expectedDeleteUID = "replacement-uid"
@@ -230,13 +339,145 @@ func TestProtectedDeleteCannotTargetReplacementActor(t *testing.T) {
 }
 
 func (m *mockControlServer) ListActorTemplates(ctx context.Context, req *ateapipb.ListActorTemplatesRequest) (*ateapipb.ListActorTemplatesResponse, error) {
+	if m.templateList != nil {
+		return &ateapipb.ListActorTemplatesResponse{ActorTemplates: m.templateList}, nil
+	}
 	resp := &ateapipb.ListActorTemplatesResponse{}
 	for name := range m.actorTemplates {
 		resp.ActorTemplates = append(resp.ActorTemplates, &ateapipb.ActorTemplate{
-			Metadata: &ateapipb.ResourceMetadata{Name: name, Atespace: req.GetAtespace()},
+			Metadata: &ateapipb.ResourceMetadata{Name: name, Atespace: req.GetAtespace(), Uid: name + "-uid"},
 		})
 	}
 	return resp, nil
+}
+
+func (m *mockControlServer) ListTags(ctx context.Context, req *ateapipb.ListTagsRequest) (*ateapipb.ListTagsResponse, error) {
+	m.tagCalls++
+	if req.GetAtespace() != "" {
+		return nil, status.Error(codes.InvalidArgument, "must list all atespaces")
+	}
+	if m.tagErr != nil {
+		return nil, m.tagErr
+	}
+	if page := m.tagPages[req.GetPageToken()]; page != nil {
+		return page, nil
+	}
+	return &ateapipb.ListTagsResponse{}, nil
+}
+
+func (m *mockControlServer) DeleteTag(context.Context, *ateapipb.DeleteTagRequest) (*ateapipb.Tag, error) {
+	m.deleteTagCalls++
+	return nil, status.Error(codes.Unimplemented, "must not delete tags")
+}
+
+func TestReconcileDeleteRetainsTaggedTemplates(t *testing.T) {
+	const name = "job-tmpl-0a1b2c3d"
+	const uid = name + "-uid"
+	tag := func(space, name, uid string, complete bool) *ateapipb.Tag {
+		v := &ateapipb.Tag{Metadata: &ateapipb.ResourceMetadata{Atespace: space, Name: name}, Status: &ateapipb.TagStatus{ActorTemplateUid: uid}}
+		if complete {
+			v.Status.Snapshot = &ateapipb.ExternalSnapshot{SnapshotUri: "private-snapshot-uri"}
+		}
+		return v
+	}
+	for _, tc := range []struct {
+		name        string
+		tags        []*ateapipb.Tag
+		later, keep bool
+	}{
+		{"complete", []*ateapipb.Tag{tag("default", "backup", uid, true)}, false, true},
+		{"pending", []*ateapipb.Tag{tag("default", "backup", uid, false)}, false, true},
+		{"later page", []*ateapipb.Tag{tag("default", "backup", uid, true)}, true, true},
+		{"other atespace", []*ateapipb.Tag{tag("other", "backup", uid, true)}, false, true},
+		{"none", nil, false, false},
+		{"other UID", []*ateapipb.Tag{tag("default", "backup", "other", true)}, false, false},
+		{"owned golden", []*ateapipb.Tag{tag("ate-golden", uid, uid, true)}, false, false},
+		{"other golden name", []*ateapipb.Tag{tag("ate-golden", "user-backup", uid, true)}, false, true},
+		{"golden plus user", []*ateapipb.Tag{tag("ate-golden", uid, uid, true), tag("default", "backup", uid, true)}, false, true},
+		{"golden name elsewhere", []*ateapipb.Tag{tag("other", uid, uid, true)}, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &mockControlServer{actorTemplates: map[string]bool{name: true}, tagPages: map[string]*ateapipb.ListTagsResponse{"": {Tags: tc.tags}}}
+			if tc.later {
+				m.tagPages = map[string]*ateapipb.ListTagsResponse{"": {NextPageToken: "opaque"}, "opaque": {Tags: tc.tags}}
+			}
+			var logs bytes.Buffer
+			old := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+			defer slog.SetDefault(old)
+			if err := newTestReconciler(t, m).ReconcileDelete(context.Background(), "default", "job"); err != nil {
+				t.Fatal(err)
+			}
+			if m.actorTemplates[name] != tc.keep {
+				t.Fatalf("template retained=%v, want %v", m.actorTemplates[name], tc.keep)
+			}
+			if len(m.deletedActors) != 1 || m.deleteTagCalls != 0 {
+				t.Fatal("actor or tag deletion differs")
+			}
+			if tc.keep {
+				for _, want := range []string{"atespace=default", "task=job", "template=" + name, "template_uid=" + uid, "reason=tag_reference"} {
+					if !strings.Contains(logs.String(), want) {
+						t.Errorf("log lacks %s", want)
+					}
+				}
+			}
+			if strings.Contains(logs.String(), "private-snapshot-uri") {
+				t.Fatal("snapshot URI in log")
+			}
+		})
+	}
+}
+
+func TestReconcileDeleteTagInventoryFailure(t *testing.T) {
+	valid := &ateapipb.Tag{Metadata: &ateapipb.ResourceMetadata{Name: "backup", Atespace: "default"}, Status: &ateapipb.TagStatus{ActorTemplateUid: "other"}}
+	for _, tc := range []struct {
+		name       string
+		tag        *ateapipb.Tag
+		err        error
+		missingUID bool
+	}{
+		{"RPC", valid, status.Error(codes.Unavailable, "private-snapshot-uri"), false},
+		{"cancel", valid, status.Error(codes.Canceled, "private-snapshot-uri"), false},
+		{"nil", nil, nil, false},
+		{"metadata", &ateapipb.Tag{Status: valid.Status}, nil, false},
+		{"name", &ateapipb.Tag{Metadata: &ateapipb.ResourceMetadata{Atespace: "default"}, Status: valid.Status}, nil, false},
+		{"atespace", &ateapipb.Tag{Metadata: &ateapipb.ResourceMetadata{Name: "backup"}, Status: valid.Status}, nil, false},
+		{"template UID", &ateapipb.Tag{Metadata: valid.Metadata}, nil, false},
+		{"candidate UID", valid, nil, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &mockControlServer{tagErr: tc.err, tagPages: map[string]*ateapipb.ListTagsResponse{"": {NextPageToken: "later"}, "later": {Tags: []*ateapipb.Tag{tc.tag}}}, templateList: []*ateapipb.ActorTemplate{
+				{Metadata: &ateapipb.ResourceMetadata{Name: "job-tmpl-0a1b2c3d", Uid: "one"}},
+				{Metadata: &ateapipb.ResourceMetadata{Name: "job-tmpl-deadbeef", Uid: "two"}},
+			}}
+			if tc.missingUID {
+				m.templateList[1].Metadata.Uid = ""
+			}
+			var logs bytes.Buffer
+			old := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+			defer slog.SetDefault(old)
+			if err := newTestReconciler(t, m).ReconcileDelete(context.Background(), "default", "job"); err != nil {
+				t.Fatal(err)
+			}
+			if len(m.deletedTemplates) != 0 || len(m.deletedActors) != 1 {
+				t.Fatal("cleanup did not fail closed after actor delete")
+			}
+			if !strings.Contains(logs.String(), "could not clean up actor templates for task") || strings.Contains(logs.String(), "private-snapshot-uri") {
+				t.Fatal("unsafe or absent cleanup warning")
+			}
+		})
+	}
+}
+
+func TestReconcileDeleteActorFailureSkipsTemplates(t *testing.T) {
+	m := &mockControlServer{deleteActorErr: status.Error(codes.Unavailable, "delete failed")}
+	if err := newTestReconciler(t, m).ReconcileDelete(context.Background(), "default", "job"); status.Code(err) != codes.Unavailable {
+		t.Fatalf("want actor delete error, got %v", err)
+	}
+	if m.tagCalls != 0 || len(m.deletedTemplates) != 0 {
+		t.Fatal("cleanup followed failed actor delete")
+	}
 }
 
 func (m *mockControlServer) DeleteActorTemplate(ctx context.Context, req *ateapipb.DeleteActorTemplateRequest) (*ateapipb.ActorTemplate, error) {
@@ -672,23 +913,31 @@ func TestTaskReconciler_SandboxClass(t *testing.T) {
 // spec.guestDevices sets the template's WorkerSelector and its name digest,
 // but stays out of AX_TASK_YAML, which a runner built before the field would refuse.
 func TestTaskReconciler_GuestDevices(t *testing.T) {
-	reconcile := func(devices []string) *ateapipb.ActorTemplate {
+	reconcile := func(devices []string, labels map[string]string) *ateapipb.ActorTemplate {
 		mockSrv := &mockControlServer{}
 		task := envTask("x")
 		task.Spec.SandboxClass = v1alpha1.SandboxClassMicroVM
 		task.Spec.GuestDevices = devices
-		if _, err := newTestReconciler(t, mockSrv).Reconcile(context.Background(), task); err != nil {
+		task.Spec.WorkerLabels = labels
+		r := newTestReconciler(t, mockSrv)
+		r.DefaultWorkerLabels = map[string]string{"workload": "ax"}
+		if _, err := r.Reconcile(context.Background(), task); err != nil {
 			t.Fatalf("Reconcile(%v) failed: %v", devices, err)
 		}
 		return mockSrv.lastTemplate
 	}
-	plain, fuse := reconcile(nil), reconcile([]string{v1alpha1.GuestDeviceFUSE})
+	devices := []string{v1alpha1.GuestDeviceFUSE}
+	plain, fuse := reconcile(nil, nil), reconcile(devices, nil)
 
-	if got := plain.GetWorkerSelector(); got != nil {
-		t.Errorf("no guest devices: WorkerSelector = %v, want nil", got)
+	if got := plain.GetWorkerSelector().GetMatchLabels(); len(got) != 1 || got["workload"] != "ax" {
+		t.Errorf("no guest devices: MatchLabels = %v, want workload=ax", got)
 	}
-	if got := fuse.GetWorkerSelector().GetMatchLabels()["ate.dev/guest-device-fuse"]; got != "true" {
+	if got := fuse.GetWorkerSelector().GetMatchLabels(); len(got) != 1 || got["ate.dev/guest-device-fuse"] != "true" {
 		t.Errorf("fuse: WorkerSelector = %v", fuse.GetWorkerSelector())
+	}
+	pinned := reconcile(devices, map[string]string{"workload": "ax-microvm-fuse", "ate.dev/guest-device-fuse": "false"})
+	if got := pinned.GetWorkerSelector().GetMatchLabels(); len(got) != 2 || got["workload"] != "ax-microvm-fuse" || got["ate.dev/guest-device-fuse"] != "true" {
+		t.Errorf("fuse with worker labels: MatchLabels = %v", got)
 	}
 	if plain.GetMetadata().GetName() == fuse.GetMetadata().GetName() {
 		t.Errorf("guest devices did not change the template name %q", plain.GetMetadata().GetName())
@@ -1311,5 +1560,83 @@ func TestFabriekSupervisorRejectsRetainedWorkerSelectorChange(t *testing.T) {
 				t.Fatal("changed placement overwrote the retained template")
 			}
 		})
+	}
+}
+
+func TestTaskReconcilerWorkerLabels(t *testing.T) {
+	for name, tc := range map[string]struct {
+		defaults map[string]string
+		task     map[string]string
+		want     map[string]string
+	}{
+		"task labels win":        {map[string]string{"workload": "ax"}, map[string]string{"workload": "sluis"}, map[string]string{"workload": "sluis"}},
+		"default when no labels": {map[string]string{"workload": "ax"}, nil, map[string]string{"workload": "ax"}},
+		"none":                   {nil, nil, nil},
+	} {
+		t.Run(name, func(t *testing.T) {
+			lis, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer lis.Close()
+			mockSrv := &mockControlServer{}
+			grpcServer := grpc.NewServer()
+			ateapipb.RegisterControlServer(grpcServer, mockSrv)
+			go grpcServer.Serve(lis)
+			defer grpcServer.Stop()
+			client, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+
+			r := controller.NewTaskReconciler(client, "test-template", "ax-system")
+			r.SecretResolver = noSecrets
+			r.WorkspaceReadyTimeout = 200 * time.Millisecond
+			r.DefaultWorkerLabels = tc.defaults
+			task := &v1alpha1.Task{
+				ApiVersion: v1alpha1.APIVersion,
+				Kind:       v1alpha1.KindTask,
+				Metadata:   &v1alpha1.ObjectMeta{Name: "label-task", Atespace: "default"},
+				Spec:       &v1alpha1.TaskSpec{Image: "ghrc.io/my-org/my-image", Command: []string{"/bin/task-runner"}, WorkerLabels: tc.task},
+			}
+			if _, err := r.Reconcile(context.Background(), task); err != nil {
+				t.Fatal(err)
+			}
+			var want *ateapipb.Selector
+			if tc.want != nil {
+				want = &ateapipb.Selector{MatchLabels: tc.want}
+			}
+			if got := mockSrv.lastTemplate.GetWorkerSelector(); !proto.Equal(got, want) {
+				t.Fatalf("worker selector = %v, want %v", got, want)
+			}
+		})
+	}
+}
+
+// spec.workerLabels choose the worker, but stay out of AX_TASK_YAML, which a
+// runner built before the field would refuse ("unknown field workerLabels").
+func TestTaskReconciler_WorkerLabelsNotInTaskYAML(t *testing.T) {
+	mockSrv := &mockControlServer{}
+	task := envTask("x")
+	task.Spec.WorkerLabels = map[string]string{"workload": "sluis"}
+	if _, err := newTestReconciler(t, mockSrv).Reconcile(context.Background(), task); err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	var found bool
+	for _, e := range mockSrv.lastTemplate.GetContainers()[0].GetEnv() {
+		if e.GetName() != "AX_TASK_YAML" {
+			continue
+		}
+		found = true
+		if strings.Contains(e.GetValue(), "sluis") || strings.Contains(e.GetValue(), "orkerLabels") {
+			t.Errorf("AX_TASK_YAML carries the worker labels: %q", e.GetValue())
+		}
+	}
+	if !found {
+		t.Fatal("template has no AX_TASK_YAML")
+	}
+	if task.Spec.WorkerLabels["workload"] != "sluis" {
+		t.Errorf("Reconcile changed the task's own worker labels: %v", task.Spec.WorkerLabels)
 	}
 }

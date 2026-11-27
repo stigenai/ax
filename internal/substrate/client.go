@@ -20,6 +20,7 @@ import (
 	"crypto/x509"
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
 	"sort"
 	"strings"
@@ -33,6 +34,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
+	"k8s.io/apimachinery/pkg/api/validate/content"
 )
 
 // ClientOptions configures connection to the Substrate Control API server.
@@ -70,6 +72,16 @@ func (t tokenAuth) RequireTransportSecurity() bool {
 type Client struct {
 	conn    *grpc.ClientConn
 	control ateapipb.ControlClient
+}
+
+// TaskTag contains the identity of a completed task snapshot.
+type TaskTag struct {
+	Atespace         string
+	Name             string
+	UID              string
+	SourceActorName  string
+	ActorTemplateUID string
+	CreateTime       time.Time
 }
 
 // NewClientWithOptions connects to Substrate with full TLS and auth configuration.
@@ -253,7 +265,7 @@ func sandboxConfigFor(sandboxClass string) *ateapipb.SandboxConfig {
 }
 
 // BuildActorTemplate constructs a Substrate ActorTemplate based on the standard ate-env specification.
-func BuildActorTemplate(atespace, name, image string, envMap map[string]string, command []string, snapshotsBucket, supervisorProfile, sandboxClass string, guestDevices []string, resources *v1alpha1.ResourceReqs, capabilities []string) *ateapipb.ActorTemplate {
+func BuildActorTemplate(atespace, name, image string, envMap map[string]string, command []string, snapshotsBucket, supervisorProfile, sandboxClass string, guestDevices []string, resources *v1alpha1.ResourceReqs, capabilities []string, workerLabels map[string]string) *ateapipb.ActorTemplate {
 	if atespace == "" {
 		atespace = "default"
 	}
@@ -352,25 +364,24 @@ func BuildActorTemplate(atespace, name, image string, envMap map[string]string, 
 			Name: "fabriek-supervisor", MountPath: "/run/substrate/fabriek-supervisor",
 		})
 	}
-	if len(guestDevices) > 0 {
-		// ValidateTask allows guest devices only on microvm tasks, which the
-		// Fabriek supervisor rejects, so this never replaces its selector.
-		labels := make(map[string]string, len(guestDevices))
-		for _, d := range guestDevices {
-			labels[v1alpha1.GuestDeviceLabel(d)] = "true"
-		}
-		tmpl.WorkerSelector = &ateapipb.Selector{MatchLabels: labels}
+	// The selector is the union of the supervisor label and workerLabels. It
+	// stays nil when both are empty.
+	selector := map[string]string{}
+	maps.Copy(selector, workerLabels)
+	for _, d := range guestDevices {
+		selector[v1alpha1.GuestDeviceLabel(d)] = "true"
 	}
 	if supervisorProfile == v1alpha1.FabriekSupervisorProfile {
-		tmpl.WorkerSelector = &ateapipb.Selector{MatchLabels: map[string]string{
-			"fabriek.dev/supervisor-profile": v1alpha1.FabriekSupervisorProfile,
-		}}
+		selector["fabriek.dev/supervisor-profile"] = v1alpha1.FabriekSupervisorProfile
+	}
+	if len(selector) > 0 {
+		tmpl.WorkerSelector = &ateapipb.Selector{MatchLabels: selector}
 	}
 	return tmpl
 }
 
 // EnsureActorTemplateWithImage creates an ActorTemplate using the specified container image and optional environment variables.
-func (c *Client) EnsureActorTemplateWithImage(ctx context.Context, baseAtespace, baseTemplate, targetAtespace, targetTemplate, image, supervisorProfile, sandboxClass string, guestDevices []string, resources *v1alpha1.ResourceReqs, capabilities []string, extraEnv ...map[string]string) (*ateapipb.ActorTemplate, error) {
+func (c *Client) EnsureActorTemplateWithImage(ctx context.Context, baseAtespace, baseTemplate, targetAtespace, targetTemplate, image, supervisorProfile, sandboxClass string, guestDevices []string, resources *v1alpha1.ResourceReqs, capabilities []string, workerLabels map[string]string, extraEnv ...map[string]string) (*ateapipb.ActorTemplate, error) {
 	envMap := make(map[string]string)
 	for _, envs := range extraEnv {
 		for k, v := range envs {
@@ -378,7 +389,7 @@ func (c *Client) EnsureActorTemplateWithImage(ctx context.Context, baseAtespace,
 		}
 	}
 
-	tmpl := BuildActorTemplate(targetAtespace, targetTemplate, image, envMap, nil, "", supervisorProfile, sandboxClass, guestDevices, resources, capabilities)
+	tmpl := BuildActorTemplate(targetAtespace, targetTemplate, image, envMap, nil, "", supervisorProfile, sandboxClass, guestDevices, resources, capabilities, workerLabels)
 	existing, err := c.GetActorTemplate(ctx, targetAtespace, targetTemplate)
 	if err == nil && existing != nil {
 		if supervisorProfile != "" && !sameTemplateSpec(existing, tmpl) {
@@ -420,72 +431,129 @@ func sameTemplateSpec(a, b *ateapipb.ActorTemplate) bool {
 	return proto.Equal(a, b)
 }
 
-// EnsureActor creates an Actor in the specified atespace deriving from an ActorTemplate.
-func (c *Client) EnsureActor(ctx context.Context, atespace, actorName, templateAtespace, templateName string, protectedSupervisor bool) (*ateapipb.Actor, error) {
+// EnsureActor returns the actor for atespace and actorName.
+// It creates the actor when none exists.
+// suspend is true when the task asks to stay suspended.
+// A suspended actor with a different template is repointed in place.
+// The call clones the actor and changes only ActorTemplate.
+// UpdateActor requires the current uid and a non-zero version.
+// The bool is true when that actor is already SUSPENDED.
+// A new actor returns false, so the caller still suspends it.
+// On that path, any other state returns an error.
+// An empty actor record returns an error.
+// A missing uid or version returns an error.
+// An empty desired template returns an error.
+// Those errors do not delete the actor.
+// They do not create a replacement.
+func (c *Client) EnsureActor(ctx context.Context, atespace, actorName, templateAtespace, templateName string, protectedSupervisor, suspend bool) (*ateapipb.Actor, bool, error) {
+	desired := &ateapipb.ObjectRef{
+		Atespace: templateAtespace,
+		Name:     templateName,
+	}
 	req := &ateapipb.CreateActorRequest{
 		Actor: &ateapipb.Actor{
 			Metadata: &ateapipb.ResourceMetadata{
 				Atespace: atespace,
 				Name:     actorName,
 			},
-			ActorTemplate: &ateapipb.ObjectRef{
-				Atespace: templateAtespace,
-				Name:     templateName,
-			},
+			ActorTemplate: desired,
 		},
 	}
 	actor, err := c.control.CreateActor(ctx, req)
-	if err != nil {
-		if status.Code(err) == codes.AlreadyExists {
-			existing, getErr := c.control.GetActor(ctx, &ateapipb.GetActorRequest{
+	if err == nil {
+		return actor, false, nil
+	}
+	if status.Code(err) != codes.AlreadyExists {
+		return nil, false, fmt.Errorf("creating actor %s/%s: %w", atespace, actorName, err)
+	}
+	existing, getErr := c.control.GetActor(ctx, &ateapipb.GetActorRequest{
+		Actor: &ateapipb.ObjectRef{
+			Atespace: atespace,
+			Name:     actorName,
+		},
+	})
+	if suspend && getErr != nil {
+		return nil, false, fmt.Errorf("template update: %w", getErr)
+	}
+	// gRPC delivers a nil body as an empty actor.
+	if suspend && (existing == nil || (existing.GetMetadata().GetUid() == "" && existing.GetStatus() == nil && existing.GetActorTemplate() == nil)) {
+		return nil, false, fmt.Errorf("template update: actor %s/%s has no record", atespace, actorName)
+	}
+	if getErr == nil && existing != nil {
+		same := proto.Equal(existing.GetActorTemplate(), desired)
+		if suspend && !same {
+			if existing.GetStatus().GetState() != ateapipb.ActorState_ACTOR_STATE_SUSPENDED {
+				return nil, false, fmt.Errorf("template update: actor %s/%s state %s", atespace, actorName, existing.GetStatus().GetState())
+			}
+			if existing.GetMetadata().GetUid() == "" || existing.GetMetadata().GetVersion() == 0 {
+				return nil, false, fmt.Errorf("template update: actor %s/%s has no uid or version", atespace, actorName)
+			}
+			if templateAtespace == "" || templateName == "" {
+				return nil, false, fmt.Errorf("template update: desired template is empty")
+			}
+			next := proto.Clone(existing).(*ateapipb.Actor)
+			next.ActorTemplate = desired
+			updated, upErr := c.control.UpdateActor(ctx, &ateapipb.UpdateActorRequest{Actor: next})
+			if upErr != nil {
+				return nil, false, fmt.Errorf("template update: %w", upErr)
+			}
+			// gRPC delivers a nil body as an empty actor.
+			if updated == nil || updated.GetMetadata().GetUid() == "" {
+				return nil, false, fmt.Errorf("template update: empty response")
+			}
+			slog.Info("updated suspended actor template",
+				"atespace", atespace,
+				"actor", actorName,
+				"uid", existing.GetMetadata().GetUid(),
+				"oldTemplateAtespace", existing.GetActorTemplate().GetAtespace(),
+				"oldTemplateName", existing.GetActorTemplate().GetName(),
+				"templateAtespace", templateAtespace,
+				"templateName", templateName,
+			)
+			return updated, updated.GetStatus().GetState() == ateapipb.ActorState_ACTOR_STATE_SUSPENDED, nil
+		}
+		if suspend && existing.GetStatus().GetState() == ateapipb.ActorState_ACTOR_STATE_SUSPENDED {
+			return existing, true, nil
+		}
+		if protectedSupervisor {
+			if !same {
+				return nil, false, fmt.Errorf("existing supervisor actor references another template")
+			}
+			return existing, false, nil
+		}
+		state := existing.GetStatus().GetState()
+		if state == ateapipb.ActorState_ACTOR_STATE_CRASHED {
+			slog.Warn("existing actor is crashed, deleting and recreating", "actor", actorName)
+			_, _ = c.control.DeleteActor(ctx, &ateapipb.DeleteActorRequest{
 				Actor: &ateapipb.ObjectRef{
 					Atespace: atespace,
 					Name:     actorName,
 				},
+				AnyState: true,
 			})
-			if getErr == nil && existing != nil {
-				if protectedSupervisor {
-					if !proto.Equal(existing.GetActorTemplate(), req.Actor.ActorTemplate) {
-						return nil, fmt.Errorf("existing supervisor actor references another template")
-					}
-					return existing, nil
+			state = ateapipb.ActorState_ACTOR_STATE_DELETING
+		}
+		if state == ateapipb.ActorState_ACTOR_STATE_DELETING {
+			// Wait briefly for previous actor deletion to finalize before recreating
+			for i := 0; i < 20; i++ {
+				select {
+				case <-ctx.Done():
+					return nil, false, ctx.Err()
+				case <-time.After(500 * time.Millisecond):
 				}
-				state := existing.GetStatus().GetState()
-				if state == ateapipb.ActorState_ACTOR_STATE_CRASHED {
-					slog.Warn("existing actor is crashed, deleting and recreating", "actor", actorName)
-					_, _ = c.control.DeleteActor(ctx, &ateapipb.DeleteActorRequest{
-						Actor: &ateapipb.ObjectRef{
-							Atespace: atespace,
-							Name:     actorName,
-						},
-						AnyState: true,
-					})
-					state = ateapipb.ActorState_ACTOR_STATE_DELETING
+				created, createErr := c.control.CreateActor(ctx, req)
+				if createErr == nil {
+					return created, false, nil
 				}
-				if state == ateapipb.ActorState_ACTOR_STATE_DELETING {
-					// Wait briefly for previous actor deletion to finalize before recreating
-					for i := 0; i < 20; i++ {
-						select {
-						case <-ctx.Done():
-							return nil, ctx.Err()
-						case <-time.After(500 * time.Millisecond):
-						}
-						actor, err = c.control.CreateActor(ctx, req)
-						if err == nil {
-							return actor, nil
-						}
-						if status.Code(err) != codes.AlreadyExists {
-							break
-						}
-					}
-					return nil, fmt.Errorf("actor %s/%s is still deleting; please retry", atespace, actorName)
+				if status.Code(createErr) != codes.AlreadyExists {
+					break
 				}
 			}
-			return existing, getErr
+			return nil, false, fmt.Errorf("actor %s/%s is still deleting; please retry", atespace, actorName)
 		}
-		return nil, fmt.Errorf("creating actor %s/%s: %w", atespace, actorName, err)
+		return existing, false, nil
 	}
-	return actor, nil
+	return existing, false, getErr
 }
 
 // ResumeActor resumes the specified actor onto a worker and returns the worker details.
@@ -573,6 +641,173 @@ func (c *Client) ListActors(ctx context.Context, atespace string) ([]*ateapipb.A
 			return actors, nil
 		}
 	}
+}
+
+// ListTags returns all tags. An empty atespace selects all atespaces.
+// An error returns no partial inventory.
+func (c *Client) ListTags(ctx context.Context, atespace string) ([]*ateapipb.Tag, error) {
+	var tags []*ateapipb.Tag
+	var token string
+	seen := make(map[string]bool)
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, status.FromContextError(err).Err()
+		}
+		resp, err := c.control.ListTags(ctx, &ateapipb.ListTagsRequest{Atespace: atespace, PageSize: 500, PageToken: token})
+		if err != nil {
+			return nil, err
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, status.FromContextError(err).Err()
+		}
+		tags = append(tags, resp.GetTags()...)
+		token = resp.GetNextPageToken()
+		if token == "" {
+			return tags, nil
+		}
+		if seen[token] {
+			return nil, fmt.Errorf("tag inventory repeats a page token")
+		}
+		seen[token] = true
+	}
+}
+
+func taskTagNameValid(name string) bool {
+	return len(content.IsDNS1123Label(name)) == 0
+}
+
+func taskTagInput(atespace string, names ...string) error {
+	if !taskTagNameValid(atespace) || atespace == "ate-golden" {
+		return status.Error(codes.InvalidArgument, "invalid task tag atespace")
+	}
+	for _, name := range names {
+		if !taskTagNameValid(name) {
+			return status.Error(codes.InvalidArgument, "invalid task tag name")
+		}
+	}
+	return nil
+}
+
+func taskTagError(ctx context.Context, err error) error {
+	if ctx.Err() != nil {
+		return status.FromContextError(ctx.Err()).Err()
+	}
+	if err == nil {
+		return nil
+	}
+	code := status.Code(err)
+	switch code {
+	case codes.Canceled, codes.DeadlineExceeded, codes.NotFound, codes.AlreadyExists,
+		codes.FailedPrecondition, codes.Unauthenticated, codes.PermissionDenied,
+		codes.Unavailable, codes.ResourceExhausted:
+	default:
+		code = codes.Internal
+	}
+	return status.Error(code, "task tag request failed")
+}
+
+func projectTaskTag(tag *ateapipb.Tag, atespace, name, source string) (*TaskTag, error) {
+	metadata, actor, state := tag.GetMetadata(), tag.GetSourceActor(), tag.GetStatus()
+	bad := status.Error(codes.DataLoss, "invalid task tag response")
+	if metadata.GetAtespace() != atespace || !taskTagNameValid(metadata.GetName()) || metadata.GetUid() == "" {
+		return nil, bad
+	}
+	if actor.GetAtespace() != atespace || !taskTagNameValid(actor.GetName()) || state.GetActorTemplateUid() == "" {
+		return nil, bad
+	}
+	if (name != "" && metadata.GetName() != name) || (source != "" && actor.GetName() != source) {
+		return nil, bad
+	}
+	if tag.GetScope() != ateapipb.TagScope_TAG_SCOPE_ATESPACE && tag.GetScope() != ateapipb.TagScope_TAG_SCOPE_PUBLISHED {
+		return nil, bad
+	}
+	var created time.Time
+	if timestamp := metadata.GetCreateTime(); timestamp != nil {
+		if timestamp.CheckValid() != nil {
+			return nil, bad
+		}
+		created = timestamp.AsTime()
+	}
+	snapshot := state.GetSnapshot()
+	if snapshot.GetSnapshotUri() != "" && snapshot.GetActorTemplateUid() != "" && snapshot.GetActorTemplateUid() != state.GetActorTemplateUid() {
+		return nil, bad
+	}
+	if tag.GetScope() == ateapipb.TagScope_TAG_SCOPE_PUBLISHED {
+		return nil, status.Error(codes.NotFound, "task tag not found")
+	}
+	if snapshot.GetSnapshotUri() == "" {
+		return nil, status.Error(codes.FailedPrecondition, "task tag copy is incomplete")
+	}
+	return &TaskTag{
+		Atespace: atespace, Name: metadata.GetName(), UID: metadata.GetUid(),
+		SourceActorName: actor.GetName(), ActorTemplateUID: state.GetActorTemplateUid(), CreateTime: created,
+	}, nil
+}
+
+// CreateTaskTag copies a suspended actor snapshot into one ATESPACE tag.
+// The caller must hold the task operation barrier through copy completion.
+// An error can leave a pending tag. This method does not retry or delete it.
+func (c *Client) CreateTaskTag(ctx context.Context, atespace, actorName, tagName string) (*TaskTag, error) {
+	if err := taskTagInput(atespace, actorName, tagName); err != nil {
+		return nil, err
+	}
+	if err := taskTagError(ctx, nil); err != nil {
+		return nil, err
+	}
+	tag, err := c.control.CreateTag(ctx, &ateapipb.CreateTagRequest{Tag: &ateapipb.Tag{
+		Metadata:    &ateapipb.ResourceMetadata{Atespace: atespace, Name: tagName},
+		Scope:       ateapipb.TagScope_TAG_SCOPE_ATESPACE,
+		SourceActor: &ateapipb.ObjectRef{Atespace: atespace, Name: actorName},
+	}})
+	if err := taskTagError(ctx, err); err != nil {
+		return nil, err
+	}
+	if tag.GetScope() != ateapipb.TagScope_TAG_SCOPE_ATESPACE {
+		return nil, status.Error(codes.DataLoss, "invalid task tag response")
+	}
+	return projectTaskTag(tag, atespace, tagName, actorName)
+}
+
+// GetTaskTag returns a completed ATESPACE tag without storage details.
+func (c *Client) GetTaskTag(ctx context.Context, atespace, tagName string) (*TaskTag, error) {
+	if err := taskTagInput(atespace, tagName); err != nil {
+		return nil, err
+	}
+	if err := taskTagError(ctx, nil); err != nil {
+		return nil, err
+	}
+	tag, err := c.control.GetTag(ctx, &ateapipb.GetTagRequest{Tag: &ateapipb.ObjectRef{Atespace: atespace, Name: tagName}})
+	if err := taskTagError(ctx, err); err != nil {
+		return nil, err
+	}
+	return projectTaskTag(tag, atespace, tagName, "")
+}
+
+// ListTaskTags returns all completed ATESPACE tags in one explicit atespace.
+// An error returns no partial result. The raw cleanup inventory stays unchanged.
+func (c *Client) ListTaskTags(ctx context.Context, atespace string) ([]*TaskTag, error) {
+	if err := taskTagInput(atespace); err != nil {
+		return nil, err
+	}
+	tags, err := c.ListTags(ctx, atespace)
+	if err := taskTagError(ctx, err); err != nil {
+		return nil, err
+	}
+	var result []*TaskTag
+	for _, tag := range tags {
+		value, err := projectTaskTag(tag, atespace, "", "")
+		if status.Code(err) == codes.NotFound || status.Code(err) == codes.FailedPrecondition {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, value)
+	}
+	if err := taskTagError(ctx, nil); err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 // ListActorTemplates returns all ActorTemplates in the given atespace.

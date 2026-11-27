@@ -66,6 +66,10 @@ func taskKey(atespace, name string) string {
 	return fmt.Sprintf("%s:%s", atespace, name)
 }
 
+// SaveTask stores or updates a task. It then publishes a reconcile event.
+// It returns ErrConflict when the stored phase is already Terminating.
+// This rule covers every task. It leaves the stored task unchanged.
+// It publishes no event. The check runs inside the store lock.
 func (s *MemoryStore) SaveTask(ctx context.Context, task *v1alpha1.Task) error {
 	if task.Metadata == nil {
 		task.Metadata = &v1alpha1.ObjectMeta{}
@@ -86,7 +90,7 @@ func (s *MemoryStore) SaveTask(ctx context.Context, task *v1alpha1.Task) error {
 	key := taskKey(task.Metadata.Atespace, task.Metadata.Name)
 
 	s.mu.Lock()
-	if existing := s.tasks[key]; existing.GetSpec().GetSupervisorProfile() != "" && existing.GetStatus().GetPhase() == v1alpha1.PhaseTerminating {
+	if existing := s.tasks[key]; existing.GetStatus().GetPhase() == v1alpha1.PhaseTerminating {
 		s.mu.Unlock()
 		return store.ErrConflict
 	}

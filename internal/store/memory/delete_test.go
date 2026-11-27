@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/ax/internal/store"
 	"github.com/google/ax/pkg/apis/v1alpha1"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -186,4 +187,130 @@ func TestUpdateTaskSuspendEmitsReconcileEvent(t *testing.T) {
 		t.Fatalf("UpdateTaskSuspend emitted a second event: %+v", ev)
 	default:
 	}
+}
+
+func drainMemoryEvents(s *MemoryStore) int {
+	n := 0
+	for {
+		select {
+		case <-s.events:
+			n++
+		default:
+			return n
+		}
+	}
+}
+
+// TestSaveTaskRejectsTerminating checks that SaveTask refuses to replace a
+// Terminating task. The check holds for an ordinary task and a supervisor.
+func TestSaveTaskRejectsTerminating(t *testing.T) {
+	ctx := context.Background()
+	profiles := []struct {
+		name    string
+		profile string
+	}{
+		{"ordinary", ""},
+		{"supervisor", v1alpha1.FabriekSupervisorProfile},
+	}
+	statuses := []struct {
+		name   string
+		status *v1alpha1.TaskStatus
+	}{
+		{"nil", nil},
+		{"pending", &v1alpha1.TaskStatus{Phase: "Pending"}},
+		{"suspended", &v1alpha1.TaskStatus{Phase: "Suspended"}},
+		{"running", &v1alpha1.TaskStatus{Phase: "Running"}},
+	}
+	for _, profile := range profiles {
+		for _, incoming := range statuses {
+			t.Run(profile.name+"/"+incoming.name, func(t *testing.T) {
+				s := NewStore()
+				created := time.Date(2026, 11, 12, 12, 0, 0, 0, time.UTC)
+				stored := &v1alpha1.Task{
+					Metadata: &v1alpha1.ObjectMeta{Name: "job", Atespace: "private", CreationTimestamp: timestamppb.New(created)},
+					Spec:     &v1alpha1.TaskSpec{Image: "ghcr.io/example/app:a", SupervisorProfile: profile.profile},
+					Status:   &v1alpha1.TaskStatus{Phase: "Running"},
+				}
+				if err := s.SaveTask(ctx, stored); err != nil {
+					t.Fatal(err)
+				}
+				if profile.profile == "" {
+					if err := s.MarkTaskDeleting(ctx, "private", "job"); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					pre := store.TaskDeletePreconditions{ActorUID: "actor-uid", CreationTimestamp: created.Format(time.RFC3339Nano)}
+					if err := s.MarkTaskDeleting(ctx, "private", "job", pre); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if drainMemoryEvents(s) == 0 {
+					t.Fatal("setup emitted no event")
+				}
+				before, err := s.GetTask(ctx, "private", "job")
+				if err != nil {
+					t.Fatal(err)
+				}
+				replacement := &v1alpha1.Task{
+					Metadata: &v1alpha1.ObjectMeta{Name: "job", Atespace: "private"},
+					Spec: &v1alpha1.TaskSpec{
+						Image:             "ghcr.io/example/app:b",
+						Suspend:           true,
+						SupervisorProfile: profile.profile,
+					},
+					Status: incoming.status,
+				}
+				if err := s.SaveTask(ctx, replacement); !errors.Is(err, store.ErrConflict) {
+					t.Fatalf("err %v", err)
+				}
+				after, err := s.GetTask(ctx, "private", "job")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !proto.Equal(before, after) {
+					t.Fatalf("stored task changed\nbefore %v\nafter  %v", before, after)
+				}
+				if drainMemoryEvents(s) != 0 {
+					t.Fatal("rejected SaveTask emitted an event")
+				}
+			})
+		}
+	}
+
+	t.Run("create", func(t *testing.T) {
+		s := NewStore()
+		if err := s.SaveTask(ctx, &v1alpha1.Task{Metadata: &v1alpha1.ObjectMeta{Name: "new", Atespace: "private"}}); err != nil {
+			t.Fatal(err)
+		}
+		got, err := s.GetTask(ctx, "private", "new")
+		if err != nil || got.GetStatus().GetPhase() != "Pending" {
+			t.Fatalf("create: %v phase %q", err, got.GetStatus().GetPhase())
+		}
+	})
+
+	t.Run("update live", func(t *testing.T) {
+		s := NewStore()
+		if err := s.SaveTask(ctx, &v1alpha1.Task{
+			Metadata: &v1alpha1.ObjectMeta{Name: "job", Atespace: "private"},
+			Spec:     &v1alpha1.TaskSpec{Image: "ghcr.io/example/app:a"},
+			Status:   &v1alpha1.TaskStatus{Phase: "Running"},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		drainMemoryEvents(s)
+		if err := s.SaveTask(ctx, &v1alpha1.Task{
+			Metadata: &v1alpha1.ObjectMeta{Name: "job", Atespace: "private"},
+			Spec:     &v1alpha1.TaskSpec{Image: "ghcr.io/example/app:b"},
+			Status:   &v1alpha1.TaskStatus{Phase: "Running"},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		got, err := s.GetTask(ctx, "private", "job")
+		if err != nil || got.GetSpec().GetImage() != "ghcr.io/example/app:b" || got.GetStatus().GetPhase() != "Running" {
+			t.Fatalf("update: %v image %q phase %q", err, got.GetSpec().GetImage(), got.GetStatus().GetPhase())
+		}
+		if drainMemoryEvents(s) != 1 {
+			t.Fatal("live update emitted no reconcile event")
+		}
+	})
 }

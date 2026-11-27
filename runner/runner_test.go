@@ -106,6 +106,26 @@ func TestRun_StopsRunningCommandOnCancel(t *testing.T) {
 	}
 }
 
+// TestRun_GivesCommandTimeToSaveWorkOnStop checks that a command that saves its
+// work after SIGTERM gets more than 10 seconds. A node drain or a Spot
+// interruption stops a task this way, and a worker must push its work first.
+func TestRun_GivesCommandTimeToSaveWorkOnStop(t *testing.T) {
+	if testing.Short() {
+		t.Skip("takes 11 seconds")
+	}
+	h := newHarness(t)
+	h.task.Spec.Command = []string{"sh", "-c", "trap 'sleep 11; exit 0' TERM; sleep 60 & wait"}
+	h.start(t)
+
+	time.Sleep(100 * time.Millisecond)
+	h.cancel()
+
+	h.waitFinished(t, 30*time.Second)
+	if exit := h.waitExit(t); exit.Err != nil || exit.ExitCode != 0 {
+		t.Errorf("expected the command to finish its stop work and exit 0, got %+v", exit)
+	}
+}
+
 func TestRun_WithoutCommandWaitsForContext(t *testing.T) {
 	h := newHarness(t)
 	h.start(t)

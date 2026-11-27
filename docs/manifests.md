@@ -33,8 +33,12 @@ spec:
   debug: true   # serve guest services inside the sandbox so `ax ssh` works; off by default
   capabilities: ["SETUID", "SETGID"]   # added to the container's default set; see below
   sandboxClass: gvisor   # gvisor (default) or microvm; see below
-  guestDevices: [fuse]   # microvm only: add /dev/fuse to the guest; see below
+  workerLabels: {workload: sluis}   # run only on workers whose WorkerPool labels contain all of these; see below
 ```
+
+### Worker labels
+
+`spec.workerLabels` (protojson name `workerLabels`) pins a task to the workers whose WorkerPool labels contain all the given pairs. It becomes the `workerSelector.matchLabels` of the task's ActorTemplate. Keys must be Kubernetes label names, values must be label values, and a task may set at most 8 pairs. A task that sets none runs on the workers that match `AX_DEFAULT_WORKER_LABELS`, a comma-separated `key=value` list (for example `workload=ax`) that ax-controller reads. If the variable is empty or unset, such a task can use any worker. A malformed value stops ax-controller at start. The labels apply when the task's ActorTemplate is created; an existing template is not changed.
 
 ### Capabilities
 
@@ -48,11 +52,20 @@ A root Nix build inside a `microvm` task also needs capabilities, because Nix ch
 
 ### Guest devices
 
-`spec.guestDevices` adds device nodes to the guest of a `microvm` task. The only value is `fuse`, which adds `/dev/fuse` for FUSE filesystems such as LayerFS. AX refuses the field on other sandbox classes.
+`spec.guestDevices` requests device nodes in the guest of a `microvm` task. Use `guestDevices: [fuse]` to request `/dev/fuse`. AX rejects this field on other sandbox classes.
 
-For each device, the task's ActorTemplate selects WorkerPools with the label `ate.dev/guest-device-<name>: "true"`. The operator puts that label on a `microvm` WorkerPool that sets the same Substrate `spec.guestDevices`. If no such pool has a free worker, the task stays pending. A FUSE mount also needs `SYS_ADMIN` in `spec.capabilities`. LayerFS also needs `SETUID` and `SETGID`, because it runs its command as a non-root user.
+```yaml
+spec:
+  sandboxClass: microvm
+  guestDevices: [fuse]
+  capabilities: [SYS_ADMIN, SETUID, SETGID]
+```
 
-A `microvm` task without `guestDevices` has no WorkerSelector, so it can also run on a FUSE pool.
+The ActorTemplate selects WorkerPools with the label `ate.dev/guest-device-fuse: "true"`. Set that label on a `microvm` WorkerPool that sets the same Substrate `spec.guestDevices`. If no pool with that label has a free worker, the task stays pending.
+
+The device selector replaces `AX_DEFAULT_WORKER_LABELS`. If the task sets `spec.workerLabels`, AX adds the device label to those labels. The device label takes precedence if the task sets the same key.
+
+A FUSE mount also needs `SYS_ADMIN` in `spec.capabilities`. LayerFS needs `SETUID` and `SETGID` to run its command as a non-root user.
 
 ### Binding several workspaces
 
@@ -142,3 +155,7 @@ spec:
   parameters:
     maxTokens: 16000
 ```
+
+## Redis persistence
+
+See [`redis-persistence.md`](redis-persistence.md) for how ax-redis keeps its data, how to migrate a running cluster, and how to find actors that have no task record.

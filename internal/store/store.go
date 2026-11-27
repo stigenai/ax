@@ -97,6 +97,10 @@ type Subscription interface {
 type Store interface {
 	EventQueue
 
+	// SaveTask stores or updates a task. It then publishes a reconcile event.
+	// It returns ErrConflict when the stored phase is already "Terminating",
+	// for every task. It leaves the stored task unchanged and publishes no
+	// event. The check runs inside the store lock or transaction.
 	SaveTask(ctx context.Context, task *v1alpha1.Task) error
 	GetTask(ctx context.Context, atespace, name string) (*v1alpha1.Task, error)
 	ListTasks(ctx context.Context, atespace string, limit, offset int64) ([]*v1alpha1.Task, error)

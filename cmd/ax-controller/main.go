@@ -316,6 +316,11 @@ func main() {
 		slog.Error("invalid --default-task-memory / AX_DEFAULT_TASK_MEMORY", "error", err)
 		os.Exit(1)
 	}
+	defaultWorkerLabels, err := v1alpha1.ParseWorkerLabels(os.Getenv("AX_DEFAULT_WORKER_LABELS"))
+	if err != nil {
+		slog.Error("invalid AX_DEFAULT_WORKER_LABELS", "error", err)
+		os.Exit(1)
+	}
 	if envMax := os.Getenv("AX_MAX_TASK_MEMORY"); envMax != "" {
 		maxTaskMemory = envMax
 	}
@@ -397,6 +402,7 @@ func main() {
 	reconciler.DefaultTaskMemory = defaultTaskMemory
 	reconciler.MaxTaskMemory = maxTaskMemoryQuantity
 	reconciler.MaxTaskCPU = maxTaskCPUQuantity
+	reconciler.DefaultWorkerLabels = defaultWorkerLabels
 	if nativeTLSDestination != "" {
 		if err := reconciler.ConfigureNativeTLS(nativeTLSDestination, os.Getenv("POD_NAMESPACE"), substrateEndpoint, substrateAuthority, substrateInsecureTLS || substratePlaintext); err != nil {
 			slog.Error("invalid native TLS configuration", "error", err)
