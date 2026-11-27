@@ -466,6 +466,79 @@ func (f *failGetWorkspaceStore) GetWorkspace(context.Context, string, string) (*
 	return nil, f.err
 }
 
+// A task above the configured cpu or memory cap is refused, not stored and not
+// given an actor, because no worker could ever run it. The cap applies to the
+// profile the task runs, its own or its Workspace's.
+func TestCreateTask_RejectsResourcesAboveCap(t *testing.T) {
+	profile := func(cpu, memory string) *v1alpha1.Profile {
+		return &v1alpha1.Profile{Image: "alpine", Resources: &v1alpha1.ResourcesSpec{Limits: &v1alpha1.ResourceList{Cpu: cpu, Memory: memory}}}
+	}
+	for _, tc := range []struct {
+		name        string
+		task        *v1alpha1.Profile
+		workspace   *v1alpha1.Profile
+		wantMessage string
+	}{
+		{name: "memory over", task: profile("", "32Gi"), wantMessage: `limits.memory: "32Gi" exceeds the maximum`},
+		{name: "cpu over", task: profile("8", ""), wantMessage: `limits.cpu: "8" exceeds the maximum of 6000m`},
+		{name: "workspace profile over", workspace: profile("", "32Gi"), wantMessage: `limits.memory: "32Gi" exceeds the maximum`},
+		{name: "at the caps", task: profile("6", "16Gi")},
+		{name: "no limits", task: profile("", "")},
+		{name: "own profile hides the workspace's", task: profile("1", "1Gi"), workspace: profile("", "32Gi")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			mem := memory.NewStore()
+			task := &v1alpha1.Task{Metadata: &v1alpha1.ObjectMeta{Name: "task"}, Spec: &v1alpha1.TaskSpec{Profile: tc.task}}
+			if tc.workspace != nil {
+				if err := mem.SaveWorkspace(ctx, &v1alpha1.Workspace{
+					Metadata: &v1alpha1.ObjectMeta{Atespace: "default", Name: "data"},
+					Spec:     &v1alpha1.WorkspaceSpec{Profile: tc.workspace},
+				}); err != nil {
+					t.Fatalf("SaveWorkspace: %v", err)
+				}
+				task.Spec.Workspace = &v1alpha1.WorkspaceRef{Name: "data"}
+			}
+			sub := substratetest.NewServer(t)
+			srv := server.NewServer(mem, newTestTaskManager(sub), server.Options{
+				MaxTaskCPUMillicores: 6000,
+				MaxTaskMemoryBytes:   16 << 30,
+			})
+
+			_, err := srv.CreateTask(ctx, &v1alpha1.CreateTaskRequest{Task: task})
+			if tc.wantMessage == "" {
+				if err != nil {
+					t.Fatalf("CreateTask: %v", err)
+				}
+				return
+			}
+			if status.Code(err) != codes.InvalidArgument || !strings.Contains(status.Convert(err).Message(), tc.wantMessage) {
+				t.Fatalf("CreateTask: got %v, want InvalidArgument containing %q", err, tc.wantMessage)
+			}
+			if _, getErr := mem.GetTask(ctx, "default", "task"); !errors.Is(getErr, store.ErrNotFound) {
+				t.Errorf("stored task after rejection: got %v, want ErrNotFound", getErr)
+			}
+			if _, ok := sub.Actor("default", "task"); ok {
+				t.Error("a rejected task got an actor")
+			}
+		})
+	}
+}
+
+// With no cap configured, which is the default, CreateTask accepts any size.
+func TestCreateTask_NoCapAcceptsAnySize(t *testing.T) {
+	srv := server.NewServer(memory.NewStore(), newTestTaskManager(substratetest.NewServer(t)))
+	_, err := srv.CreateTask(t.Context(), &v1alpha1.CreateTaskRequest{Task: &v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{Name: "task"},
+		Spec: &v1alpha1.TaskSpec{Profile: &v1alpha1.Profile{Image: "alpine", Resources: &v1alpha1.ResourcesSpec{
+			Limits: &v1alpha1.ResourceList{Cpu: "32", Memory: "64Gi"},
+		}}},
+	}})
+	if err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+}
+
 // A task is immutable, so CreateTask must not save or provision a task whose
 // Workspace does not exist yet: it would run with an empty workspace forever.
 func TestCreateTask_RequiresBoundWorkspace(t *testing.T) {

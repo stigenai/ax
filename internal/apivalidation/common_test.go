@@ -167,3 +167,43 @@ func TestValidateResources(t *testing.T) {
 		t.Fatalf("ValidateTask rejected valid limits: %v", err)
 	}
 }
+
+func TestValidateResourceCaps(t *testing.T) {
+	limits := func(cpu, memory string) *v1alpha1.ResourcesSpec {
+		return &v1alpha1.ResourcesSpec{Limits: &v1alpha1.ResourceList{Cpu: cpu, Memory: memory}}
+	}
+	const maxCPU, maxMemory = 6000, 16 << 30
+	tests := []struct {
+		name              string
+		reqs              *v1alpha1.ResourcesSpec
+		maxCPU, maxMemory int64
+		wantErr           string
+	}{
+		{name: "nil", maxCPU: maxCPU, maxMemory: maxMemory},
+		{name: "no limits", reqs: limits("", ""), maxCPU: maxCPU, maxMemory: maxMemory},
+		{name: "no caps", reqs: limits("32", "64Gi")},
+		{name: "cpu at cap", reqs: limits("6", ""), maxCPU: maxCPU},
+		{name: "cpu at cap in millicores", reqs: limits("6000m", ""), maxCPU: maxCPU},
+		{name: "cpu one millicore over", reqs: limits("6001m", ""), maxCPU: maxCPU, wantErr: `spec.profile.resources.limits.cpu: "6001m" exceeds the maximum of 6000m`},
+		{name: "cpu over", reqs: limits("32", ""), maxCPU: maxCPU, wantErr: `limits.cpu: "32" exceeds`},
+		{name: "cpu cap off", reqs: limits("32", ""), maxMemory: maxMemory},
+		{name: "memory at cap", reqs: limits("", "16Gi"), maxMemory: maxMemory},
+		{name: "memory one Mi over", reqs: limits("", "16385Mi"), maxMemory: maxMemory, wantErr: `spec.profile.resources.limits.memory: "16385Mi" exceeds the maximum of 17179869184 bytes`},
+		{name: "memory cap off", reqs: limits("", "64Gi"), maxCPU: maxCPU},
+		{name: "unparsable limit is left to ValidateResources", reqs: limits("many", "lots"), maxCPU: maxCPU, maxMemory: maxMemory},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := apivalidation.ValidateResourceCaps(tt.reqs, tt.maxCPU, tt.maxMemory)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("error = %v, want containing %q", err, tt.wantErr)
+			}
+		})
+	}
+}

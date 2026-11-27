@@ -90,3 +90,35 @@ func TestDescribeStore(t *testing.T) {
 		})
 	}
 }
+
+func TestParseTaskCaps(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		cpu, mem   string
+		wantCPU    int64
+		wantMem    int64
+		wantErrSub string
+	}{
+		{name: "empty disables both"},
+		{name: "both set", cpu: "6", mem: "16Gi", wantCPU: 6000, wantMem: 16 << 30},
+		{name: "millicores", cpu: "500m", wantCPU: 500},
+		{name: "only memory", mem: "512Mi", wantMem: 512 << 20},
+		{name: "cpu not a quantity", cpu: "six", wantErrSub: "max task cpu"},
+		{name: "cpu zero", cpu: "0", wantErrSub: "max task cpu"},
+		{name: "memory negative", mem: "-1Gi", wantErrSub: "max task memory"},
+		{name: "memory not a quantity", mem: "lots", wantErrSub: "max task memory"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cpu, mem, err := parseTaskCaps(tt.cpu, tt.mem)
+			if tt.wantErrSub != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErrSub) {
+					t.Fatalf("parseTaskCaps(%q, %q) error = %v, want it to contain %q", tt.cpu, tt.mem, err, tt.wantErrSub)
+				}
+				return
+			}
+			if err != nil || cpu != tt.wantCPU || mem != tt.wantMem {
+				t.Fatalf("parseTaskCaps(%q, %q) = %d, %d, %v; want %d, %d", tt.cpu, tt.mem, cpu, mem, err, tt.wantCPU, tt.wantMem)
+			}
+		})
+	}
+}

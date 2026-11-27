@@ -90,6 +90,25 @@ func validateResources(field string, reqs *v1alpha1.ResourcesSpec) error {
 	return nil
 }
 
+// ValidateResourceCaps reports whether a profile's cpu and memory limits fit
+// within the largest task a worker can hold. A zero cap disables its check,
+// and an omitted limit passes, because the default limits are small. A limit
+// that does not parse also passes: ValidateResources reports it.
+func ValidateResourceCaps(reqs *v1alpha1.ResourcesSpec, maxCPUMillicores, maxMemoryBytes int64) error {
+	limits := reqs.GetLimits()
+	if cpu := limits.GetCpu(); cpu != "" && maxCPUMillicores > 0 {
+		if v, err := resources.ParseCPUMillicores(cpu); err == nil && v > maxCPUMillicores {
+			return fmt.Errorf("spec.profile.resources.limits.cpu: %q exceeds the maximum of %dm", cpu, maxCPUMillicores)
+		}
+	}
+	if memory := limits.GetMemory(); memory != "" && maxMemoryBytes > 0 {
+		if v, err := resources.ParseMemoryBytes(memory); err == nil && v > maxMemoryBytes {
+			return fmt.Errorf("spec.profile.resources.limits.memory: %q exceeds the maximum of %d bytes", memory, maxMemoryBytes)
+		}
+	}
+	return nil
+}
+
 // validateProfile reports the first problem with a profile. A nil or empty
 // profile is valid and means the profile is omitted. A profile that sets any
 // field must name the container image to run, through image or

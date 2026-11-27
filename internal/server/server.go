@@ -51,6 +51,12 @@ type Options struct {
 	// When omitted, NewServer constructs one backed by taskManager's Substrate
 	// client and Locker; it has no SetupRunner, so it does not pre-warm.
 	WorkspaceManager *controller.WorkspaceManager
+	// MaxTaskCPUMillicores and MaxTaskMemoryBytes are the largest cpu and
+	// memory limits CreateTask accepts, the size of the largest task a worker
+	// can hold. A task above them could only wait in Pending. Zero, the
+	// default, turns the check off.
+	MaxTaskCPUMillicores int64
+	MaxTaskMemoryBytes   int64
 }
 
 // Server provides the gRPC API for AX.
@@ -64,6 +70,8 @@ type Server struct {
 	// task's status owned by its actor, which the store never holds.
 	substrate  *substrate.Client
 	grpcServer *grpc.Server
+
+	maxTaskCPUMillicores, maxTaskMemoryBytes int64
 }
 
 // NewServer creates a new AX API server.
@@ -93,6 +101,9 @@ func NewServer(s store.Store, taskManager *controller.TaskManager, opts ...Optio
 		taskManager: taskManager,
 		workspaces:  workspaces,
 		substrate:   taskManager.Client(),
+
+		maxTaskCPUMillicores: opt.MaxTaskCPUMillicores,
+		maxTaskMemoryBytes:   opt.MaxTaskMemoryBytes,
 	}
 	srv.grpcServer = grpc.NewServer(grpc.StatsHandler(telemetry.ServerStatsHandler(func() map[string]grpc.ServiceInfo {
 		return srv.grpcServer.GetServiceInfo()
@@ -221,6 +232,12 @@ func (s *Server) CreateTask(ctx context.Context, req *v1alpha1.CreateTaskRequest
 	// image to fall back to.
 	if !apivalidation.ProfileNamesImage(task.GetSpec().GetProfile()) && !apivalidation.ProfileNamesImage(workspace.GetSpec().GetProfile()) {
 		return nil, status.Errorf(codes.InvalidArgument, "spec.profile: image or ateTemplate.name is required because workspace %q sets no spec.profile", task.GetSpec().GetWorkspace().GetName())
+	}
+	// A task above the largest size a worker can hold would stay Pending
+	// forever, so reject it now. An ateTemplate profile sets no limits here.
+	effective := controller.EffectiveProfile(workspace.GetSpec().GetProfile(), task.GetSpec().GetProfile())
+	if err := apivalidation.ValidateResourceCaps(effective.GetResources(), s.maxTaskCPUMillicores, s.maxTaskMemoryBytes); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 	// A task gets its Gateway's rules when it is created, so the Gateway must
 	// already exist.

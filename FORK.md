@@ -293,3 +293,26 @@ Entries are in stack order, the same order as the commits.
 **Reason:** Factory workers use `ax stdio` as an ssh ProxyCommand for long sessions.
 
 **Removal condition:** Remove the carry when stigenai stops using it, or when upstream adds the same behavior.
+
+## Task cpu and memory caps in ax-server
+
+**Bead:** `ax-m1q` · **Branch:** `stigenai/deploy` · **Upstream status:** `upstream-candidate`
+
+**Upstream files edited:**
+
+- `cmd/ax-server/main.go`
+- `internal/apivalidation/common.go`
+- `internal/server/server.go`
+- `docs/manifests.md`
+
+**Tests:**
+
+- `cmd/ax-server/main_test.go`
+- `internal/apivalidation/common_test.go`
+- `internal/server/server_test.go`
+
+**Notes:** `--max-task-cpu` and `--max-task-memory` (env `AX_MAX_TASK_CPU`, `AX_MAX_TASK_MEMORY`) are empty by default, and an empty value turns the cap off. The overlay must set them. Donation branch: `donate/task-resource-caps`.
+
+**Reason:** A task above the size of the largest worker is accepted and then waits in Pending for ever. CreateTask now rejects it when a cap is set.
+
+**Removal condition:** Remove the carry when upstream merges an equal change.

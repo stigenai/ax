@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/google/ax/internal/controller"
+	"github.com/google/ax/internal/resources"
 	"github.com/google/ax/internal/server"
 	"github.com/google/ax/internal/store/postgres"
 	"github.com/google/ax/internal/substrate"
@@ -51,6 +52,8 @@ func main() {
 		substratePlaintext   bool
 		routerURL            string
 		runnerVolumeImage    string
+		maxTaskCPU           string
+		maxTaskMemory        string
 	)
 
 	flag.StringVar(&listenAddr, "addr", ":8080", "HTTP listen address")
@@ -64,6 +67,8 @@ func main() {
 	flag.BoolVar(&substratePlaintext, "substrate-plaintext", false, "Use insecure plaintext gRPC connection to Substrate")
 	flag.StringVar(&routerURL, "router-url", "https://atenet-router.ate-system.svc.cluster.local:443", "Agent Substrate router (atenet-router) base URL, no trailing slash")
 	flag.StringVar(&runnerVolumeImage, "runner-volume-image", "", "Digest-pinned runner volume image (Dockerfile.runner-volume) to mount read-only into task containers and run the runner from; empty runs the runner baked into the task image (env: AX_RUNNER_VOLUME_IMAGE)")
+	flag.StringVar(&maxTaskCPU, "max-task-cpu", "", "Largest cpu limit a task may ask for, a Kubernetes quantity such as 6; CreateTask rejects a task above it. Empty disables the check (env: AX_MAX_TASK_CPU)")
+	flag.StringVar(&maxTaskMemory, "max-task-memory", "", "Largest memory limit a task may ask for, a Kubernetes quantity such as 16Gi; CreateTask rejects a task above it. Empty disables the check (env: AX_MAX_TASK_MEMORY)")
 	flag.Parse()
 
 	if envAddr := os.Getenv("ADDR"); envAddr != "" {
@@ -79,6 +84,13 @@ func main() {
 		runnerVolumeImage = envImage
 	}
 
+	if env := os.Getenv("AX_MAX_TASK_CPU"); env != "" {
+		maxTaskCPU = env
+	}
+	if env := os.Getenv("AX_MAX_TASK_MEMORY"); env != "" {
+		maxTaskMemory = env
+	}
+
 	logger := slog.New(telemetry.NewLogHandler(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})))
 	slog.SetDefault(logger)
 
@@ -88,6 +100,11 @@ func main() {
 	}
 	if err := validateRouterURL(routerURL); err != nil {
 		slog.Error("invalid router URL", "error", err)
+		os.Exit(1)
+	}
+	maxCPUMillicores, maxMemoryBytes, err := parseTaskCaps(maxTaskCPU, maxTaskMemory)
+	if err != nil {
+		slog.Error("invalid task resource cap", "error", err)
 		os.Exit(1)
 	}
 
@@ -147,8 +164,10 @@ func main() {
 	})
 	manager.WorkspaceManager = workspaces
 	srv := server.NewServer(backend, manager, server.Options{
-		Locker:           backend,
-		WorkspaceManager: workspaces,
+		Locker:               backend,
+		WorkspaceManager:     workspaces,
+		MaxTaskCPUMillicores: maxCPUMillicores,
+		MaxTaskMemoryBytes:   maxMemoryBytes,
 	})
 
 	httpServer := &http.Server{
@@ -205,6 +224,22 @@ func validateRunnerVolumeImage(image string) error {
 		return fmt.Errorf("%q must be pinned by digest (name@sha256:...): %w", image, err)
 	}
 	return nil
+}
+
+// parseTaskCaps parses the --max-task-cpu and --max-task-memory values into
+// millicores and bytes. An empty value is zero, which disables its cap.
+func parseTaskCaps(cpu, memory string) (cpuMillicores, memoryBytes int64, err error) {
+	if cpu != "" {
+		if cpuMillicores, err = resources.ParseCPUMillicores(cpu); err != nil {
+			return 0, 0, fmt.Errorf("max task cpu: %w", err)
+		}
+	}
+	if memory != "" {
+		if memoryBytes, err = resources.ParseMemoryBytes(memory); err != nil {
+			return 0, 0, fmt.Errorf("max task memory: %w", err)
+		}
+	}
+	return cpuMillicores, memoryBytes, nil
 }
 
 // validateRouterURL checks that the router URL is an http:// or https:// URL,

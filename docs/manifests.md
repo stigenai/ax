@@ -102,6 +102,8 @@ If Agent Substrate refuses one of the rules, `ax apply` fails and the task is no
 
 `spec.profile.resources.limits` caps the CPU and memory of the task's sandbox. The controller copies the limits onto the Substrate `ActorTemplate` it provisions for the task, using Kubernetes quantity syntax (`500m`, `2`, `4Gi`). Only `cpu` and `memory` are supported, each quantity must be greater than zero, and the CPU limit must be below 1000 cores. `ax apply` rejects values outside these rules, and a task whose limits Substrate refuses is not created rather than run without them. Because Substrate requires both CPU and memory limits on every `ActorTemplate`, any omitted dimension defaults to `1` CPU (`1000m`) and `512Mi` memory.
 
+An operator can cap the limits a task may ask for with `ax-server --max-task-cpu` and `--max-task-memory` (or `AX_MAX_TASK_CPU` and `AX_MAX_TASK_MEMORY`), set to the size of the largest task a worker can hold. A task above a cap is rejected at creation instead of waiting in `Pending`. The cap applies to the limits the task runs with, whether they come from its own `spec.profile` or its Workspace's, and not to an `ateTemplate`. Both are unset by default, which accepts any size.
+
 Substrate sizes sandboxes by limits alone, so `spec.profile.resources.requests` is not supported and `ax apply` rejects a manifest that sets it.
 
 ### Goal, retries, and session ID
