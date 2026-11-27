@@ -170,6 +170,10 @@ type WorkspaceManagerOptions struct {
 	// ax-server is redeployed with a new flag/env digest, never mutated
 	// dynamically at runtime).
 	RunnerImage string
+
+	// DefaultWorkerLabels are the worker labels for templates built from a
+	// profile that sets none; see TaskManager.DefaultWorkerLabels.
+	DefaultWorkerLabels map[string]string
 	// MaxSetupAttempts bounds how many times buildSnapshotWithSetupActor tries
 	// running a fresh setup actor on non-spec runtime failures (defaults to 2).
 	MaxSetupAttempts int
@@ -184,6 +188,7 @@ type WorkspaceManager struct {
 	store            WorkspaceStore
 	setup            SetupRunner
 	runnerImage      string
+	workerLabels     map[string]string
 	maxSetupAttempts int
 }
 
@@ -207,6 +212,7 @@ func NewWorkspaceManager(client *substrate.Client, opts ...WorkspaceManagerOptio
 		store:            opt.Store,
 		setup:            opt.SetupRunner,
 		runnerImage:      opt.RunnerImage,
+		workerLabels:     opt.DefaultWorkerLabels,
 		maxSetupAttempts: attempts,
 	}
 }
@@ -326,7 +332,7 @@ func (m *WorkspaceManager) ensureSnapshotTag(ctx context.Context, ws *v1alpha1.W
 	if err := m.client.EnsureAtespace(ctx, atespace); err != nil {
 		return "", &stageError{reason: v1alpha1.ReasonAtespaceCreationFailed, underlyingErr: fmt.Errorf("ensuring atespace %q: %w", atespace, err)}
 	}
-	_, templateName, err := ensureProfileTemplate(ctx, m.client, atespace, prof, m.runnerImage)
+	_, templateName, err := ensureProfileTemplate(ctx, m.client, atespace, prof, m.runnerImage, m.workerLabels)
 	if err != nil {
 		return "", &stageError{reason: v1alpha1.ReasonTemplateCreationFailed, underlyingErr: err}
 	}

@@ -15,6 +15,7 @@
 package apivalidation_test
 
 import (
+	"maps"
 	"strings"
 	"testing"
 
@@ -203,6 +204,39 @@ func TestValidateResourceCaps(t *testing.T) {
 			}
 			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
 				t.Fatalf("error = %v, want containing %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestParseWorkerLabels(t *testing.T) {
+	tests := []struct {
+		name    string
+		in      string
+		want    map[string]string
+		wantErr string
+	}{
+		{name: "empty"},
+		{name: "blank", in: "  "},
+		{name: "one", in: "workload=ax", want: map[string]string{"workload": "ax"}},
+		{name: "several with prefix and empty value", in: "workload=ax, ate.dev/class=gvisor,flag=", want: map[string]string{"workload": "ax", "ate.dev/class": "gvisor", "flag": ""}},
+		{name: "no equals", in: "workload", wantErr: "want key=value"},
+		{name: "trailing comma", in: "a=b,", wantErr: "want key=value"},
+		{name: "bad key", in: "-a=b", wantErr: "invalid label key"},
+		{name: "bad value", in: "a=b c", wantErr: "invalid label value"},
+		{name: "duplicate", in: "a=b,a=c", wantErr: "duplicate"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := apivalidation.ParseWorkerLabels(tc.in)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("ParseWorkerLabels(%q) error = %v, want containing %q", tc.in, err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil || !maps.Equal(got, tc.want) {
+				t.Fatalf("ParseWorkerLabels(%q) = %v, %v; want %v", tc.in, got, err, tc.want)
 			}
 		})
 	}

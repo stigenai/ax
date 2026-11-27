@@ -119,8 +119,10 @@ cluster uses a different one.
 Create a WorkerPool using the pinned [WorkerPool guide](https://github.com/agent-substrate/substrate/blob/f86fde9dfb5424c8d16f613de80469bdbef06541/docs/reference/api-guide.md#1-workerpool-the-physical-capacity),
 with `spec.sandboxClasses: [{name: gvisor}]`, and wait for its worker pods to be
 ready. Installing the Substrate control plane alone does not create this pool.
-This recipe uses gVisor, but AX sets no `workerSelector`: it does not restrict
-selection to that sandbox class or to the task's atespace. Inspect the pools with:
+This recipe uses gVisor, but by default AX sets no `workerSelector`: it does not restrict
+selection to that sandbox class or to the task's atespace. To pin tasks to a pool, label the
+WorkerPool and set `spec.profile.workerLabels` on the task, or `--default-worker-labels` on
+ax-server for tasks that set none (see [manifests](manifests.md#worker-labels)). Inspect the pools with:
 
 ```bash
 kubectl get workerpools -A

@@ -15,6 +15,7 @@
 package controller_test
 
 import (
+	"maps"
 	"strings"
 	"testing"
 
@@ -247,4 +248,126 @@ func hasImageVolume(vols []*ateapipb.Volume, ref string) bool {
 		}
 	}
 	return false
+}
+
+func TestResolveProfileTemplate_WorkerLabels(t *testing.T) {
+	const runner = "runner@sha256:r1"
+	base := &v1alpha1.Profile{Image: "img@sha256:abc"}
+
+	// A profile with no selector keeps the template name it had before
+	// workerLabels existed, so upgrading does not recreate templates.
+	_, plain, plainTmpl, err := controller.ResolveProfileTemplate("default", base, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "ax-67f389856900aad7"; plain != want {
+		t.Errorf("template name without selector = %q, want unchanged %q", plain, want)
+	}
+	if plainTmpl.GetWorkerSelector() != nil {
+		t.Errorf("WorkerLabels = %v, want nil without a selector", plainTmpl.GetWorkerSelector())
+	}
+	_, empty, _, err := controller.ResolveProfileTemplate("default", &v1alpha1.Profile{Image: "img@sha256:abc", WorkerLabels: map[string]string{}}, runner)
+	if err != nil || empty != plain {
+		t.Errorf("empty selector map: name %q, err %v; want %q", empty, err, plain)
+	}
+
+	sel := map[string]string{"ate.dev/sandboxClass": "gvisor", "zone": "a"}
+	_, withSel, tmpl, err := controller.ResolveProfileTemplate("default", &v1alpha1.Profile{Image: "img@sha256:abc", WorkerLabels: sel}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if withSel == plain {
+		t.Errorf("selector did not change the template name %q", plain)
+	}
+	if got := tmpl.GetWorkerSelector().GetMatchLabels(); !maps.Equal(sel, got) {
+		t.Errorf("WorkerLabels.MatchLabels mismatch = %v, want %v", got, sel)
+	}
+	sel["zone"] = "mutated"
+	if tmpl.GetWorkerSelector().GetMatchLabels()["zone"] != "a" {
+		t.Error("template shares the profile's selector map")
+	}
+
+	_, other, _, _ := controller.ResolveProfileTemplate("default", &v1alpha1.Profile{Image: "img@sha256:abc", WorkerLabels: map[string]string{"ate.dev/sandboxClass": "gvisor", "zone": "b"}}, runner)
+	if other == withSel {
+		t.Error("different selector values produced the same template name")
+	}
+
+	// ateTemplate is used as-is: a selector does not apply to it.
+	_, name, direct, err := controller.ResolveProfileTemplate("default", &v1alpha1.Profile{AteTemplate: &v1alpha1.ObjectRef{Name: "gpu-base"}, WorkerLabels: map[string]string{"a": "b"}}, runner)
+	if err != nil || name != "gpu-base" || direct != nil {
+		t.Errorf("ateTemplate with selector = (%q, %v, %v), want (\"gpu-base\", nil, nil)", name, direct, err)
+	}
+}
+
+func TestEffectiveProfile_WorkerLabels(t *testing.T) {
+	ws := &v1alpha1.Profile{Image: "ws@sha256:a", WorkerLabels: map[string]string{"pool": "ws"}}
+
+	// The task profile replaces the workspace profile as a whole: its
+	// selector is used, and an omitted selector is not inherited.
+	got := controller.EffectiveProfile(ws, &v1alpha1.Profile{Image: "t@sha256:b", WorkerLabels: map[string]string{"pool": "task"}})
+	if got := got.GetWorkerLabels(); !maps.Equal(map[string]string{"pool": "task"}, got) {
+		t.Errorf("task selector = %v, want %v", got, map[string]string{"pool": "task"})
+	}
+	got = controller.EffectiveProfile(ws, &v1alpha1.Profile{Image: "t@sha256:b"})
+	if len(got.GetWorkerLabels()) != 0 {
+		t.Errorf("task without selector inherited %v from the workspace", got.GetWorkerLabels())
+	}
+
+	// With no task profile, the workspace selector applies, as a copy.
+	got = controller.EffectiveProfile(ws, nil)
+	if got := got.GetWorkerLabels(); !maps.Equal(map[string]string{"pool": "ws"}, got) {
+		t.Errorf("workspace selector = %v, want %v", got, map[string]string{"pool": "ws"})
+	}
+	got.WorkerLabels["pool"] = "changed"
+	if ws.WorkerLabels["pool"] != "ws" {
+		t.Error("EffectiveProfile mutated workspaceProfile.WorkerLabels")
+	}
+}
+
+func TestWithDefaultWorkerLabels(t *testing.T) {
+	const runner = "runner@sha256:r1"
+	defaults := map[string]string{"workload": "ax"}
+	base := &v1alpha1.Profile{Image: "img@sha256:abc"}
+
+	// The default applies to an image profile that sets no labels, reaches the
+	// template's selector, and does not mutate the input.
+	withDefault := controller.WithDefaultWorkerLabels(base, defaults)
+	if got := withDefault.GetWorkerLabels(); !maps.Equal(defaults, got) {
+		t.Fatalf("default labels = %v, want %v", got, defaults)
+	}
+	if len(base.GetWorkerLabels()) != 0 {
+		t.Error("WithDefaultWorkerLabels mutated its input")
+	}
+	_, nDefault, tmpl, err := controller.ResolveProfileTemplate("default", withDefault, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := tmpl.GetWorkerSelector().GetMatchLabels(); !maps.Equal(defaults, got) {
+		t.Errorf("template selector = %v, want %v", got, defaults)
+	}
+	_, nPlain, _, _ := controller.ResolveProfileTemplate("default", base, runner)
+	if nDefault == nPlain {
+		t.Error("default labels did not change the template name")
+	}
+
+	// An empty default changes nothing, so existing template names are kept.
+	for _, empty := range []map[string]string{nil, {}} {
+		got := controller.WithDefaultWorkerLabels(base, empty)
+		_, name, _, _ := controller.ResolveProfileTemplate("default", got, runner)
+		if name != "ax-67f389856900aad7" {
+			t.Errorf("empty default %v: template name %q, want ax-67f389856900aad7", empty, name)
+		}
+	}
+
+	// Explicit labels win over the default, as a replacement.
+	explicit := &v1alpha1.Profile{Image: "img@sha256:abc", WorkerLabels: map[string]string{"zone": "a"}}
+	if got := controller.WithDefaultWorkerLabels(explicit, defaults).GetWorkerLabels(); !maps.Equal(explicit.WorkerLabels, got) {
+		t.Errorf("explicit labels = %v, want %v", got, explicit.WorkerLabels)
+	}
+
+	// An ateTemplate profile is used as-is.
+	ate := &v1alpha1.Profile{AteTemplate: &v1alpha1.ObjectRef{Name: "gpu-base"}}
+	if got := controller.WithDefaultWorkerLabels(ate, defaults); len(got.GetWorkerLabels()) != 0 {
+		t.Errorf("ateTemplate profile got default labels %v", got.GetWorkerLabels())
+	}
 }

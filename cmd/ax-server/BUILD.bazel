@@ -9,6 +9,7 @@ go_library(
     importpath = "github.com/google/ax/cmd/ax-server",
     visibility = ["//visibility:private"],
     deps = [
+        "//internal/apivalidation",
         "//internal/controller",
         "//internal/resources",
         "//internal/server",

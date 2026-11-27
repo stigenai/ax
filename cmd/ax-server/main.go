@@ -28,6 +28,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/google/ax/internal/apivalidation"
 	"github.com/google/ax/internal/controller"
 	"github.com/google/ax/internal/resources"
 	"github.com/google/ax/internal/server"
@@ -54,6 +55,7 @@ func main() {
 		runnerVolumeImage    string
 		maxTaskCPU           string
 		maxTaskMemory        string
+		defaultWorkerLabels  string
 		tlsCertFile          string
 		tlsKeyFile           string
 		plainAddr            string
@@ -72,6 +74,7 @@ func main() {
 	flag.StringVar(&runnerVolumeImage, "runner-volume-image", "", "Digest-pinned runner volume image (Dockerfile.runner-volume) to mount read-only into task containers and run the runner from; empty runs the runner baked into the task image (env: AX_RUNNER_VOLUME_IMAGE)")
 	flag.StringVar(&maxTaskCPU, "max-task-cpu", "", "Largest cpu limit a task may ask for, a Kubernetes quantity such as 6; CreateTask rejects a task above it. Empty disables the check (env: AX_MAX_TASK_CPU)")
 	flag.StringVar(&maxTaskMemory, "max-task-memory", "", "Largest memory limit a task may ask for, a Kubernetes quantity such as 16Gi; CreateTask rejects a task above it. Empty disables the check (env: AX_MAX_TASK_MEMORY)")
+	flag.StringVar(&defaultWorkerLabels, "default-worker-labels", "", "Comma-separated key=value worker labels, such as workload=ax, set as the worker selector of templates built from a profile that sets no workerLabels. Empty sets none (env: AX_DEFAULT_WORKER_LABELS)")
 	flag.StringVar(&tlsCertFile, "tls-cert-file", "", "PEM certificate file; with --tls-key-file serves --addr over TLS. Both files reload on change. Plaintext when unset")
 	flag.StringVar(&tlsKeyFile, "tls-key-file", "", "PEM private key file for --tls-cert-file")
 	flag.StringVar(&plainAddr, "plain-addr", "", "Extra plaintext listen address, for probes and the ax tunnel; only with TLS on. Off when unset")
@@ -97,6 +100,10 @@ func main() {
 		maxTaskMemory = env
 	}
 
+	if env := os.Getenv("AX_DEFAULT_WORKER_LABELS"); env != "" {
+		defaultWorkerLabels = env
+	}
+
 	logger := slog.New(telemetry.NewLogHandler(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})))
 	slog.SetDefault(logger)
 
@@ -106,6 +113,11 @@ func main() {
 	}
 	if err := validateRouterURL(routerURL); err != nil {
 		slog.Error("invalid router URL", "error", err)
+		os.Exit(1)
+	}
+	workerLabels, err := apivalidation.ParseWorkerLabels(defaultWorkerLabels)
+	if err != nil {
+		slog.Error("invalid --default-worker-labels / AX_DEFAULT_WORKER_LABELS", "error", err)
 		os.Exit(1)
 	}
 	maxCPUMillicores, maxMemoryBytes, err := parseTaskCaps(maxTaskCPU, maxTaskMemory)
@@ -176,6 +188,7 @@ func main() {
 
 	manager := controller.NewTaskManager(subClient)
 	manager.RunnerVolumeImage = runnerVolumeImage
+	manager.DefaultWorkerLabels = workerLabels
 	manager.RouterURL = routerURL
 	manager.GatewayStore = backend
 	workspaces := controller.NewWorkspaceManager(subClient, controller.WorkspaceManagerOptions{
@@ -183,6 +196,8 @@ func main() {
 		Store:       backend,
 		SetupRunner: controller.NewHTTPSetupRunner(routerURL),
 		RunnerImage: runnerVolumeImage,
+
+		DefaultWorkerLabels: workerLabels,
 	})
 	manager.WorkspaceManager = workspaces
 	srv := server.NewServer(backend, manager, server.Options{

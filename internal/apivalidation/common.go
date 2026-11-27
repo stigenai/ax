@@ -17,7 +17,10 @@ package apivalidation
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"regexp"
+	"slices"
+	"strings"
 
 	"github.com/google/ax/internal/resources"
 	"github.com/google/ax/pkg/apis/v1alpha1"
@@ -132,15 +135,84 @@ func validateProfile(field string, p *v1alpha1.Profile) error {
 		if p.GetImage() != "" || p.GetResources() != nil {
 			return fmt.Errorf("%s.ateTemplate: cannot be combined with image or resources", field)
 		}
+		if len(p.GetWorkerLabels()) > 0 {
+			return fmt.Errorf("%s.ateTemplate: cannot be combined with workerLabels", field)
+		}
 		return nil
+	}
+	if err := validateWorkerLabels(field+".workerLabels", p.GetWorkerLabels()); err != nil {
+		return err
 	}
 	if err := validateResources(field+".resources", p.GetResources()); err != nil {
 		return err
 	}
-	if p.GetImage() == "" && p.GetResources() != nil {
+	if p.GetImage() == "" && (p.GetResources() != nil || len(p.GetWorkerLabels()) > 0) {
 		return fmt.Errorf("%s: image or ateTemplate.name is required", field)
 	}
 	return nil
+}
+
+// Substrate matches a worker selector against WorkerPool labels and accepts at
+// most maxWorkerLabelsLabels of them, each a valid Kubernetes label.
+const maxWorkerLabelsLabels = 10
+
+var (
+	labelNameRegexp  = regexp.MustCompile(`^[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$`)
+	labelValueRegexp = regexp.MustCompile(`^([A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?)?$`)
+	dnsSubdomain     = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`)
+)
+
+func validateWorkerLabels(field string, labels map[string]string) error {
+	if len(labels) > maxWorkerLabelsLabels {
+		return fmt.Errorf("%s: at most %d labels are allowed", field, maxWorkerLabelsLabels)
+	}
+	for _, k := range slices.Sorted(maps.Keys(labels)) {
+		if !validLabelKey(k) {
+			return fmt.Errorf("%s: invalid label key %q: must be a Kubernetes label key", field, k)
+		}
+		if v := labels[k]; len(v) > 63 || !labelValueRegexp.MatchString(v) {
+			return fmt.Errorf("%s[%q]: invalid label value %q: must be a Kubernetes label value", field, k, v)
+		}
+	}
+	return nil
+}
+
+// ParseWorkerLabels parses a comma-separated key=value list, such as
+// "workload=ax,zone=a", into worker labels and validates them like
+// spec.profile.workerLabels. An empty string yields nil.
+func ParseWorkerLabels(s string) (map[string]string, error) {
+	if strings.TrimSpace(s) == "" {
+		return nil, nil
+	}
+	labels := map[string]string{}
+	for _, pair := range strings.Split(s, ",") {
+		k, v, ok := strings.Cut(strings.TrimSpace(pair), "=")
+		if !ok {
+			return nil, fmt.Errorf("invalid worker label %q: want key=value", pair)
+		}
+		if _, dup := labels[k]; dup {
+			return nil, fmt.Errorf("duplicate worker label key %q", k)
+		}
+		labels[k] = v
+	}
+	if err := validateWorkerLabels("worker labels", labels); err != nil {
+		return nil, err
+	}
+	return labels, nil
+}
+
+// validLabelKey reports whether k is a Kubernetes label key: a name of at most
+// 63 characters, optionally preceded by a DNS subdomain prefix of at most 253
+// characters and a slash.
+func validLabelKey(k string) bool {
+	prefix, name, hasPrefix := strings.Cut(k, "/")
+	if !hasPrefix {
+		prefix, name = "", k
+	}
+	if len(name) > 63 || !labelNameRegexp.MatchString(name) {
+		return false
+	}
+	return !hasPrefix || (len(prefix) <= 253 && dnsSubdomain.MatchString(prefix))
 }
 
 // ProfileNamesImage reports whether p names the container image to run, either

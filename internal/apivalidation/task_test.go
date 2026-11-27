@@ -104,6 +104,62 @@ func TestValidateTask(t *testing.T) {
 			wantErr: "cannot be combined with image or resources",
 		},
 		{
+			name: "profile ateTemplate.name combined with workerLabels",
+			spec: &v1alpha1.TaskSpec{
+				Profile: &v1alpha1.Profile{
+					AteTemplate:  &v1alpha1.ObjectRef{Name: "base-template"},
+					WorkerLabels: map[string]string{"pool": "gvisor"},
+				},
+			},
+			wantErr: "ateTemplate: cannot be combined with workerLabels",
+		},
+		{
+			name: "profile workerLabels",
+			spec: &v1alpha1.TaskSpec{
+				Profile: &v1alpha1.Profile{
+					Image:        "us-docker.pkg.dev/p/img@sha256:abc",
+					WorkerLabels: map[string]string{"ate.dev/sandboxClass": "gvisor", "empty": ""},
+				},
+			},
+		},
+		{
+			name: "profile workerLabels without image",
+			spec: &v1alpha1.TaskSpec{
+				Profile: &v1alpha1.Profile{WorkerLabels: map[string]string{"pool": "gvisor"}},
+			},
+			wantErr: "spec.profile: image or ateTemplate.name is required",
+		},
+		{
+			name: "profile workerLabels bad key",
+			spec: &v1alpha1.TaskSpec{
+				Profile: &v1alpha1.Profile{Image: "img@sha256:abc", WorkerLabels: map[string]string{"-bad": "x"}},
+			},
+			wantErr: `spec.profile.workerLabels: invalid label key "-bad"`,
+		},
+		{
+			name: "profile workerLabels bad key prefix",
+			spec: &v1alpha1.TaskSpec{
+				Profile: &v1alpha1.Profile{Image: "img@sha256:abc", WorkerLabels: map[string]string{"Bad_Prefix/name": "x"}},
+			},
+			wantErr: "invalid label key",
+		},
+		{
+			name: "profile workerLabels bad value",
+			spec: &v1alpha1.TaskSpec{
+				Profile: &v1alpha1.Profile{Image: "img@sha256:abc", WorkerLabels: map[string]string{"pool": "has space"}},
+			},
+			wantErr: `invalid label value "has space"`,
+		},
+		{
+			name: "profile workerLabels too many labels",
+			spec: &v1alpha1.TaskSpec{
+				Profile: &v1alpha1.Profile{Image: "img@sha256:abc", WorkerLabels: map[string]string{
+					"a": "", "b": "", "c": "", "d": "", "e": "", "f": "", "g": "", "h": "", "i": "", "j": "", "k": "",
+				}},
+			},
+			wantErr: "at most 10 labels",
+		},
+		{
 			name: "profile ateTemplate.name combined with resources",
 			spec: &v1alpha1.TaskSpec{
 				Profile: &v1alpha1.Profile{

@@ -74,6 +74,14 @@ message Profile {
   // mount at /run/ate/egress-trust-bundle/trust-bundle.pem when outbound HTTPS
   // traverses a Gateway).
   ObjectRef ate_template = 3;
+  // Optional labels the Substrate scheduler matches against WorkerPool labels
+  // to choose which pool runs the task, set as the generated ActorTemplate's
+  // worker_selector.match_labels. Keys and values must be valid Kubernetes
+  // label keys and values, and at most 10 are allowed. Requires image;
+  // mutually exclusive with ate_template, whose own template already decides
+  // placement. Part of the generated template's identity, so profiles that
+  // differ only in worker_labels get different templates.
+  map<string, string> worker_labels = 4;
 }
 
 // ObjectRef names another resource, optionally in a different atespace.

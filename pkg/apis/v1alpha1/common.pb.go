@@ -334,7 +334,15 @@ type Profile struct {
 	// port 80, durable /workspace volume, and the egress-trust-bundle SystemInfo
 	// mount at /run/ate/egress-trust-bundle/trust-bundle.pem when outbound HTTPS
 	// traverses a Gateway).
-	AteTemplate   *ObjectRef `protobuf:"bytes,3,opt,name=ate_template,json=ateTemplate,proto3" json:"ate_template,omitempty"`
+	AteTemplate *ObjectRef `protobuf:"bytes,3,opt,name=ate_template,json=ateTemplate,proto3" json:"ate_template,omitempty"`
+	// Optional labels the Substrate scheduler matches against WorkerPool labels
+	// to choose which pool runs the task, set as the generated ActorTemplate's
+	// worker_selector.match_labels. Keys and values must be valid Kubernetes
+	// label keys and values, and at most 10 are allowed. Requires image;
+	// mutually exclusive with ate_template, whose own template already decides
+	// placement. Part of the generated template's identity, so profiles that
+	// differ only in worker_labels get different templates.
+	WorkerLabels  map[string]string `protobuf:"bytes,4,rep,name=worker_labels,json=workerLabels,proto3" json:"worker_labels,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -386,6 +394,13 @@ func (x *Profile) GetResources() *ResourcesSpec {
 func (x *Profile) GetAteTemplate() *ObjectRef {
 	if x != nil {
 		return x.AteTemplate
+	}
+	return nil
+}
+
+func (x *Profile) GetWorkerLabels() map[string]string {
+	if x != nil {
+		return x.WorkerLabels
 	}
 	return nil
 }
@@ -478,11 +493,15 @@ const file_pkg_apis_v1alpha1_common_proto_rawDesc = "" +
 	"\vupdate_time\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\n" +
 	"updateTime\x12\x16\n" +
 	"\x06reason\x18\x04 \x01(\tR\x06reason\x12\x18\n" +
-	"\amessage\x18\x05 \x01(\tR\amessage\"\x94\x01\n" +
+	"\amessage\x18\x05 \x01(\tR\amessage\"\xa2\x02\n" +
 	"\aProfile\x12\x14\n" +
 	"\x05image\x18\x01 \x01(\tR\x05image\x128\n" +
 	"\tresources\x18\x02 \x01(\v2\x1a.ax.v1alpha1.ResourcesSpecR\tresources\x129\n" +
-	"\fate_template\x18\x03 \x01(\v2\x16.ax.v1alpha1.ObjectRefR\vateTemplate\";\n" +
+	"\fate_template\x18\x03 \x01(\v2\x16.ax.v1alpha1.ObjectRefR\vateTemplate\x12K\n" +
+	"\rworker_labels\x18\x04 \x03(\v2&.ax.v1alpha1.Profile.WorkerLabelsEntryR\fworkerLabels\x1a?\n" +
+	"\x11WorkerLabelsEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\";\n" +
 	"\tObjectRef\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1a\n" +
 	"\batespace\x18\x02 \x01(\tR\batespaceB(Z&github.com/google/ax/pkg/apis/v1alpha1b\x06proto3"
@@ -499,7 +518,7 @@ func file_pkg_apis_v1alpha1_common_proto_rawDescGZIP() []byte {
 	return file_pkg_apis_v1alpha1_common_proto_rawDescData
 }
 
-var file_pkg_apis_v1alpha1_common_proto_msgTypes = make([]protoimpl.MessageInfo, 7)
+var file_pkg_apis_v1alpha1_common_proto_msgTypes = make([]protoimpl.MessageInfo, 8)
 var file_pkg_apis_v1alpha1_common_proto_goTypes = []any{
 	(*ObjectMeta)(nil),            // 0: ax.v1alpha1.ObjectMeta
 	(*ResourcesSpec)(nil),         // 1: ax.v1alpha1.ResourcesSpec
@@ -508,22 +527,24 @@ var file_pkg_apis_v1alpha1_common_proto_goTypes = []any{
 	(*Profile)(nil),               // 4: ax.v1alpha1.Profile
 	(*ObjectRef)(nil),             // 5: ax.v1alpha1.ObjectRef
 	nil,                           // 6: ax.v1alpha1.ObjectMeta.LabelsEntry
-	(*timestamppb.Timestamp)(nil), // 7: google.protobuf.Timestamp
+	nil,                           // 7: ax.v1alpha1.Profile.WorkerLabelsEntry
+	(*timestamppb.Timestamp)(nil), // 8: google.protobuf.Timestamp
 }
 var file_pkg_apis_v1alpha1_common_proto_depIdxs = []int32{
-	7, // 0: ax.v1alpha1.ObjectMeta.create_time:type_name -> google.protobuf.Timestamp
+	8, // 0: ax.v1alpha1.ObjectMeta.create_time:type_name -> google.protobuf.Timestamp
 	6, // 1: ax.v1alpha1.ObjectMeta.labels:type_name -> ax.v1alpha1.ObjectMeta.LabelsEntry
-	7, // 2: ax.v1alpha1.ObjectMeta.update_time:type_name -> google.protobuf.Timestamp
-	7, // 3: ax.v1alpha1.ObjectMeta.delete_time:type_name -> google.protobuf.Timestamp
+	8, // 2: ax.v1alpha1.ObjectMeta.update_time:type_name -> google.protobuf.Timestamp
+	8, // 3: ax.v1alpha1.ObjectMeta.delete_time:type_name -> google.protobuf.Timestamp
 	2, // 4: ax.v1alpha1.ResourcesSpec.limits:type_name -> ax.v1alpha1.ResourceList
-	7, // 5: ax.v1alpha1.Condition.update_time:type_name -> google.protobuf.Timestamp
+	8, // 5: ax.v1alpha1.Condition.update_time:type_name -> google.protobuf.Timestamp
 	1, // 6: ax.v1alpha1.Profile.resources:type_name -> ax.v1alpha1.ResourcesSpec
 	5, // 7: ax.v1alpha1.Profile.ate_template:type_name -> ax.v1alpha1.ObjectRef
-	8, // [8:8] is the sub-list for method output_type
-	8, // [8:8] is the sub-list for method input_type
-	8, // [8:8] is the sub-list for extension type_name
-	8, // [8:8] is the sub-list for extension extendee
-	0, // [0:8] is the sub-list for field type_name
+	7, // 8: ax.v1alpha1.Profile.worker_labels:type_name -> ax.v1alpha1.Profile.WorkerLabelsEntry
+	9, // [9:9] is the sub-list for method output_type
+	9, // [9:9] is the sub-list for method input_type
+	9, // [9:9] is the sub-list for extension type_name
+	9, // [9:9] is the sub-list for extension extendee
+	0, // [0:9] is the sub-list for field type_name
 }
 
 func init() { file_pkg_apis_v1alpha1_common_proto_init() }
@@ -537,7 +558,7 @@ func file_pkg_apis_v1alpha1_common_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_pkg_apis_v1alpha1_common_proto_rawDesc), len(file_pkg_apis_v1alpha1_common_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   7,
+			NumMessages:   8,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

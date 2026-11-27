@@ -20,6 +20,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"maps"
+	"slices"
 
 	"github.com/google/ax/internal/resources"
 	"github.com/google/ax/internal/substrate"
@@ -39,7 +41,9 @@ import (
 //     CPU/memory limit), EffectiveProfile returns a copy of taskProfile as-is
 //     and ignores workspaceProfile completely. Omitted fields within
 //     taskProfile fall back to server/Substrate defaults, never to
-//     workspaceProfile. If the resulting profile differs from workspaceProfile,
+//     workspaceProfile. Likewise workerLabels is never inherited from the
+//     Workspace: a task that sets it replaces the Workspace's map as a whole,
+//     and a task that omits it runs with no selector. If the resulting profile differs from workspaceProfile,
 //     the task simply misses the pre-warmed snapshot and cold-boots workspace
 //     setup in its own sandbox profile.
 //   - When taskProfile is nil or empty, EffectiveProfile falls back to a copy
@@ -59,7 +63,8 @@ func isProfileEmpty(p *v1alpha1.Profile) bool {
 	return p.GetAteTemplate().GetName() == "" &&
 		p.GetImage() == "" &&
 		p.GetResources().GetLimits().GetCpu() == "" &&
-		p.GetResources().GetLimits().GetMemory() == ""
+		p.GetResources().GetLimits().GetMemory() == "" &&
+		len(p.GetWorkerLabels()) == 0
 }
 
 // DefaultProfileSnapshotFidelity is the Substrate snapshot fidelity configured
@@ -73,6 +78,9 @@ type profile struct {
 	memoryBytes   int64
 	// Defaults to DefaultProfileSnapshotFidelity (SNAPSHOT_FIDELITY_ROOTFS).
 	snapshotFidelity ateapipb.SnapshotFidelity
+	// Labels for the template's worker selector. Hashed only when non-empty,
+	// so a profile without a selector keeps the template name it always had.
+	workerLabels map[string]string
 }
 
 func (p profile) templateName(runnerImage string) string {
@@ -84,8 +92,25 @@ func (p profile) templateName(runnerImage string) string {
 		p.memoryBytes,
 		p.snapshotFidelity.String(),
 	)
+	if len(p.workerLabels) > 0 {
+		for _, k := range slices.Sorted(maps.Keys(p.workerLabels)) {
+			_, _ = fmt.Fprintf(h, "\x00selector\x00%s\x00%s", k, p.workerLabels[k])
+		}
+	}
 	sum := h.Sum(nil)
 	return "ax-" + hex.EncodeToString(sum[:8])
+}
+
+// WithDefaultWorkerLabels returns p with defaults as its workerLabels when p
+// builds an AX-managed template (it names no ateTemplate) and sets none of its
+// own. Otherwise it returns p itself. Neither input is mutated.
+func WithDefaultWorkerLabels(p *v1alpha1.Profile, defaults map[string]string) *v1alpha1.Profile {
+	if len(defaults) == 0 || len(p.GetWorkerLabels()) > 0 || p.GetAteTemplate().GetName() != "" {
+		return p
+	}
+	out := proto.Clone(p).(*v1alpha1.Profile)
+	out.WorkerLabels = maps.Clone(defaults)
+	return out
 }
 
 // ResolveProfileTemplate resolves p into a deterministic Substrate
@@ -103,6 +128,9 @@ func (p profile) templateName(runnerImage string) string {
 // limits, SnapshotConfig.PreferredFidelity defaults to SNAPSHOT_FIDELITY_ROOTFS,
 // and the content-addressed template ("ax-<16-char-sha256>", hashed over the
 // profile and runner volume image) is returned ready for EnsureActorTemplate.
+// A non-empty workerLabels becomes the template's worker_selector and is
+// part of the hash; it is ignored when ateTemplate.name is set, because the
+// referenced template is used as-is.
 // A non-empty runnerImage is mounted read-only into the template's container,
 // which then runs the runner from it (see substrate.MountRunnerVolume).
 func ResolveProfileTemplate(atespace string, p *v1alpha1.Profile, runnerImage string) (string, string, *ateapipb.ActorTemplate, error) {
@@ -141,6 +169,7 @@ func ResolveProfileTemplate(atespace string, p *v1alpha1.Profile, runnerImage st
 		cpuMillicores:    cpuMillicores,
 		memoryBytes:      memoryBytes,
 		snapshotFidelity: DefaultProfileSnapshotFidelity,
+		workerLabels:     p.GetWorkerLabels(),
 	}
 	name := resolved.templateName(runnerImage)
 
@@ -151,6 +180,9 @@ func ResolveProfileTemplate(atespace string, p *v1alpha1.Profile, runnerImage st
 		},
 	})
 	tmpl.SnapshotConfig.PreferredFidelity = resolved.snapshotFidelity
+	if len(resolved.workerLabels) > 0 {
+		tmpl.WorkerSelector = &ateapipb.Selector{MatchLabels: maps.Clone(resolved.workerLabels)}
+	}
 	substrate.MountRunnerVolume(tmpl, runnerImage)
 	return atespace, name, tmpl, nil
 }
@@ -172,8 +204,8 @@ func ProfileTemplateAtespace(taskAtespace string, p *v1alpha1.Profile) string {
 // name and ensures it exists on Substrate: verifying user-supplied ateTemplate
 // references via GetActorTemplate without mutating them, or provisioning
 // AX-managed templates via EnsureActorTemplate.
-func ensureProfileTemplate(ctx context.Context, client *substrate.Client, atespace string, p *v1alpha1.Profile, runnerImage string) (string, string, error) {
-	tplAtespace, tplName, tplSpec, err := ResolveProfileTemplate(atespace, p, runnerImage)
+func ensureProfileTemplate(ctx context.Context, client *substrate.Client, atespace string, p *v1alpha1.Profile, runnerImage string, defaultWorkerLabels map[string]string) (string, string, error) {
+	tplAtespace, tplName, tplSpec, err := ResolveProfileTemplate(atespace, WithDefaultWorkerLabels(p, defaultWorkerLabels), runnerImage)
 	if err != nil {
 		return "", "", err
 	}

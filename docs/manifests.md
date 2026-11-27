@@ -25,6 +25,7 @@ spec:
       limits:
         cpu: "2"
         memory: "4Gi"
+    workerLabels: {workload: gpu}   # optional; run only on workers whose WorkerPool labels contain all of these
     # Or use an existing Substrate ActorTemplate directly (mutually exclusive with image and resources):
     # ateTemplate:
     #   name: "base-tmpl"
@@ -79,6 +80,12 @@ A Task runs the image named by its `spec.profile.image` or `spec.profile.ateTemp
 
 - **Omitted `Task.spec.profile` (warm path):** the task uses `Workspace.spec.profile` and starts directly from the Workspace's pre-warmed snapshot. ax-server rejects a Task that omits `spec.profile` unless it binds a Workspace whose `spec.profile` sets `image` or `ateTemplate.name`.
 - **Explicit `Task.spec.profile` (independent override / cold-boot on mismatch):** it must set `image` or `ateTemplate.name` and is used **as-is**; `Workspace.spec.profile` never constrains or leaks fields into it. Unset `resources.limits` default to `1` CPU (`1000m`) and `512Mi` memory, never to `Workspace.spec.profile`. If the profile differs from `Workspace.spec.profile`, the task misses the pre-warmed snapshot and cold-boots to run workspace setup in its own sandbox first.
+
+#### Worker labels
+
+`spec.profile.workerLabels` pins the task to the workers whose WorkerPool labels contain all the given pairs. AX sets them as the `worker_selector.match_labels` of the generated `ActorTemplate`. They are part of the template name, so profiles that differ only in `workerLabels` get different templates, and a profile without them keeps the template name it always had. Keys and values must be valid Kubernetes label keys and values, and at most 10 pairs are allowed. `workerLabels` needs `image` and cannot be combined with `ateTemplate`, which is used as-is.
+
+Like every other profile field, `workerLabels` follows whole-profile selection: a Task's `spec.profile.workerLabels` replaces the Workspace's as a whole, and an explicit Task profile without them does not inherit the Workspace's. A profile that sets none uses the labels from `ax-server --default-worker-labels` (env `AX_DEFAULT_WORKER_LABELS`), a comma-separated `key=value` list such as `workload=ax`, which also applies to Workspace profiles. It is empty by default, which sets no selector. A malformed value stops ax-server at start. The labels apply when the `ActorTemplate` is created; an existing template is not changed.
 
 Substrate requires `spec.profile.image` (and a Workspace's `spec.profile.image`) to be pinned by digest, e.g. `ghcr.io/my-org/my-agent-image@sha256:...`. A tag-only reference such as `my-agent:v1` is rejected when the ActorTemplate is created, because a tag can move and would silently invalidate the actor's snapshots. If that happens `ax apply` fails with the Substrate error and the task is not created. Resolve a tag to its digest with `docker buildx imagetools inspect <image:tag>` or `crane digest <image:tag>`.
 

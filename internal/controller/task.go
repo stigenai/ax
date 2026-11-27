@@ -79,6 +79,11 @@ type TaskManager struct {
 	// Empty keeps running the runner baked into the task image.
 	RunnerVolumeImage string
 
+	// DefaultWorkerLabels, when set, are the worker labels of AX-managed
+	// templates whose profile sets no workerLabels of its own. They are part
+	// of the template name. Empty leaves such templates without a selector.
+	DefaultWorkerLabels map[string]string
+
 	// RouterURL is the base URL of atenet-router (no trailing slash), through
 	// which a task's runner is reached.
 	RouterURL string
@@ -182,7 +187,7 @@ func (m *TaskManager) ensureSubstrateResources(ctx context.Context, task *v1alph
 	actorName := task.Metadata.Name
 
 	// 3. Resolve or provision the ActorTemplate for the task.
-	templateAtespace, templateName, err := ensureProfileTemplate(ctx, m.client, atespace, effective, m.RunnerVolumeImage)
+	templateAtespace, templateName, err := ensureProfileTemplate(ctx, m.client, atespace, effective, m.RunnerVolumeImage, m.DefaultWorkerLabels)
 	if err != nil {
 		if substrate.IsTransientError(err) {
 			m.setNotReady(task, v1alpha1.ReasonSubstrateUnavailable, err.Error(), now)

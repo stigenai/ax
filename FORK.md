@@ -430,3 +430,37 @@ Entries are in stack order, the same order as the commits.
 **Reason:** After an actor moves, atenet-router can answer 421 once. `ax ssh` then fails, but a second try works.
 
 **Removal condition:** Remove the carry when upstream merges an equal change.
+
+## Profile workerLabels and default worker labels
+
+**Bead:** `ax-d9n` (also carries `ax-6tw`) · **Branch:** `stigenai/deploy` · **Upstream status:** `upstream-candidate`
+
+**Upstream files edited:**
+
+- `pkg/apis/v1alpha1/common.proto`
+- `pkg/apis/v1alpha1/common.pb.go` (generated)
+- `internal/controller/profile.go`
+- `internal/controller/task.go`
+- `internal/controller/workspace.go`
+- `internal/apivalidation/common.go`
+- `cmd/ax-server/main.go`
+- `docs/manifests.md`
+- `docs/installation.md`
+
+**Tests:**
+
+- `internal/controller/profile_test.go`
+- `internal/apivalidation/common_test.go`
+- `internal/apivalidation/task_test.go`
+
+**Notes:**
+
+- `spec.profile.workerLabels` (Profile field 4) becomes the `workerSelector.matchLabels` of the actor template, and it enters the template-name hash only when it is set. `TestResolveProfileTemplate_WorkerLabels` pins the old name for a profile with no labels.
+- `--default-worker-labels` (env `AX_DEFAULT_WORKER_LABELS`, `key=value,...`) applies to a profile that builds a template and sets no labels. It is empty by default. The overlay sets `workload=ax`.
+- It replaces the old `spec.workerLabels` of `ax-6tw` and the sandboxClass of `ax-d9n`. Callers must move `spec.workerLabels` to `spec.profile.workerLabels`.
+- The name is not `workerSelector`, because upstream #580 rejects that name on purpose.
+- Donation branch: `donate/profile-worker-labels`. On upstream `main` it uses the declarative `+k8s:` validation tags.
+
+**Reason:** Tasks must run only on the WorkerPool that is for them. For example, normal tasks must stay off the `sluis` pool.
+
+**Removal condition:** Remove the carry when upstream merges an equal change.
