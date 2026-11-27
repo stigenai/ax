@@ -38,11 +38,11 @@ REDIS_MANIFEST="$(pwd -P)/deploy/redis.yaml"
 test -r "$REDIS_MANIFEST" || exit 1
 WORK="$HOME/ax-redis-migration.$(date +%Y%m%d%H%M%S).$$"
 mkdir -m 700 "$WORK" || exit 1
-test "$(stat -c '%u %a' "$WORK")" = "$(id -u) 700" || exit 1
+test -O "$WORK" && test "$(ls -ld "$WORK" | cut -c1-10)" = "drwx------" || exit 1
 cd "$WORK" || exit 1
 ```
 
-`REDIS_MANIFEST` keeps the absolute path of the manifest. If a command fails, stop. Do not start a capture. The `stat` check makes sure that you own the directory and that its mode is 700. The `kubectl exec` command does not use the local umask. Set the mode of each directory in the pod yourself.
+`REDIS_MANIFEST` keeps the absolute path of the manifest. If a command fails, stop. Do not start a capture. The `test -O` and `ls -ld` checks make sure that you own the directory and that its mode is 700. They work on Linux and macOS. Use the same shell for all steps. If you must use a new shell, run `umask 077` and set `REDIS_MANIFEST` again from the checkout root before step 1. Step 3 needs `REDIS_MANIFEST`. The `kubectl exec` command does not use the local umask. Set the mode of each directory in the pod yourself.
 
 ## Task inventory
 
