@@ -406,3 +406,27 @@ Entries are in stack order, the same order as the commits.
 **Reason:** Upstream ax-server accepts every caller.
 
 **Removal condition:** Remove the carry when upstream merges an equal change.
+
+## ax ssh: one retry on a 421 from atenet-router
+
+**Bead:** `ax-ifv` · **Branch:** `stigenai/deploy` · **Upstream status:** `upstream-candidate`
+
+**Upstream files edited:**
+
+- `cmd/ax/main.go`
+- `internal/guest/client.go`
+
+**New files:**
+
+- `cmd/ax/ssh_stale.go`
+
+**Tests:**
+
+- `cmd/ax/ssh_stale_test.go`
+- `internal/guest/stale_test.go`
+
+**Notes:** Upstream v0.4.0 already sends `ax ssh` only through atenet-router, and `ATENET_ROUTER_ADDR` replaces the fork's `AX_ROUTER` (so `ax-p6s` has no commit). This carry keeps only the retry. Donation branch: `donate/ssh-stale-retry`.
+
+**Reason:** After an actor moves, atenet-router can answer 421 once. `ax ssh` then fails, but a second try works.
+
+**Removal condition:** Remove the carry when upstream merges an equal change.

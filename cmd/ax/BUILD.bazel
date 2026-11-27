@@ -6,6 +6,7 @@ go_library(
         "install_cmd.go",
         "main.go",
         "promote.go",
+        "ssh_stale.go",
         "studio_cmd.go",
         "task.go",
         "trace.go",
@@ -55,6 +56,7 @@ go_test(
         "main_test.go",
         "promote_test.go",
         "ssh_interrupt_test.go",
+        "ssh_stale_test.go",
         "studio_cmd_test.go",
         "trace_test.go",
     ],
@@ -63,6 +65,7 @@ go_test(
     tags = ["manual"],  # keep
     deps = [
         "//internal/controller",
+        "//internal/guest",
         "//internal/install/axdeploy",
         "//internal/install/cluster",
         "//internal/install/executil",

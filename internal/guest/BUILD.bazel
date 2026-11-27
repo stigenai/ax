@@ -20,6 +20,7 @@ go_test(
     srcs = [
         "client_stdio_test.go",
         "client_test.go",
+        "stale_test.go",
     ],
     embed = [":guest"],
     deps = [

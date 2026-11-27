@@ -1185,7 +1185,11 @@ func runSSH(serverURL, atespace, kubeContext, axNamespace string, args []string,
 		})
 	}
 
-	exitCode, err := guestClient.Exec(execCtx, opts)
+	exitCode, err := execRetryStale(func() (int, error) { return guestClient.Exec(execCtx, opts) }, func() (*v1alpha1.Task, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		return client.GetTask(ctx, &v1alpha1.GetTaskRequest{Atespace: atespace, Name: taskName})
+	}, taskName, sshRetryDelay)
 	if err != nil && stdio && execCtx.Err() != nil {
 		return nil // A signal ended it, e.g. ssh closed its ProxyCommand.
 	}

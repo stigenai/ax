@@ -111,6 +111,10 @@ type ExecOptions struct {
 	LiveOutput bool
 }
 
+// ErrStartProcess wraps an Exec error from the call that starts the process.
+// No process ran and no input was read, so the caller may call Exec again.
+var ErrStartProcess = errors.New("starting process")
+
 // Exec runs a command inside the task container, feeding it opts.Stdin and
 // streaming stdout/stderr until completion. It returns the process exit code.
 func (c *Client) Exec(ctx context.Context, opts ExecOptions) (code int, err error) {
@@ -128,7 +132,7 @@ func (c *Client) Exec(ctx context.Context, opts ExecOptions) (code int, err erro
 		LiveOutput: opts.LiveOutput,
 	})
 	if err != nil {
-		return 1, fmt.Errorf("starting process: %w", err)
+		return 1, fmt.Errorf("%w: %w", ErrStartProcess, err)
 	}
 
 	pid := proc.GetProcessId()
