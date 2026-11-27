@@ -517,3 +517,27 @@ Entries are in stack order, the same order as the commits.
 **Reason:** The pool size and limits are stigenai fleet sizing. The comments in the file keep the sizing history.
 
 **Removal condition:** none. It is fleet config.
+
+## stigenai deploy overlay
+
+**Bead:** `ax-h83` · **Branch:** `stigenai/deploy` · **Upstream status:** `fork-only`
+
+**Upstream files edited:** none.
+
+**New files:**
+
+- `deploy/stigenai/kustomization.yaml`
+
+**Tests:** none. Check it with `kubectl kustomize --load-restrictor LoadRestrictionsNone deploy/stigenai`, then `kubectl apply --dry-run=server` on the output.
+
+**Notes:**
+
+- The base is `deploy/ax-server.yaml`. The overlay adds `workerpool.yaml` (`ax-rrr`).
+- The operator applies `deploy/postgres.yaml` alone first. Kustomize refuses its second `ax-system` Namespace.
+- `ax-server`: TLS on 8443 with Secret `ax-server-tls`, plaintext on 8080, `AX_MAX_TASK_CPU=6`, `AX_MAX_TASK_MEMORY=16Gi`, `AX_DEFAULT_WORKER_LABELS=workload=ax` and `AX_AUTH_TOKEN` from Secret `ax-server-auth`.
+- The `ax-server` and `ax-runner-volume` images come from this stack. The file marks their digests `STAGE-0` until stage 0 of the cutover pushes them.
+- The overlay sets no default task image, no default task memory and no snapshot bucket. Callers set the image and the memory. Substrate sets the snapshot location.
+
+**Reason:** The overlay holds stigenai images, caps, labels and Secrets.
+
+**Removal condition:** none. It is fleet config.

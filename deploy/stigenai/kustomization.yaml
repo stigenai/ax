@@ -1,0 +1,110 @@
+# The stigenai fleet runs ax-server on Postgres and Substrate 1.0 (bead ax-h83).
+#
+# Secrets:
+#   - ax-postgres (key password): make it once by hand before the first apply.
+#   - ax-server-tls: cert-manager makes it.
+#   - ax-server-auth: it exists.
+#
+# STAGE-0 marks two image digests. Stage 0 of the cutover runbook builds both
+# images from this stack and pushes them (specs/001-v040-cutover/quickstart.md).
+# Put the digests in place of STAGE-0 before an apply. Do not use the upstream
+# runner volume: the stack runner reads AX_STOP_GRACE_PERIOD, and the upstream
+# runner does not.
+#
+# Apply postgres.yaml alone first. It repeats the ax-system Namespace, so it
+# cannot share this kustomization with ax-server.yaml:
+#   kubectl apply -f deploy/postgres.yaml
+#   kubectl kustomize --load-restrictor LoadRestrictionsNone deploy/stigenai | kubectl apply -f -
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../ax-server.yaml
+  - workerpool.yaml
+
+patches:
+  # ax-server serves TLS on 8443 with Secret ax-server-tls. Plaintext stays on
+  # 8080 for the probes, ax tunnels and callers in the cluster. The Secret
+  # volume is not optional, so the pod stays Pending until the Secret exists.
+  # This patch keeps the base args, changes --addr and adds the TLS flags.
+  - target:
+      kind: Deployment
+      name: ax-server
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/image
+        value: ghcr.io/stigenai/ax/ax-server:v0.4.0-stigenai.1@sha256:STAGE-0
+      - op: test
+        path: /spec/template/spec/containers/0/args/0
+        value: "--addr=:8080"
+      - op: replace
+        path: /spec/template/spec/containers/0/args/0
+        value: "--addr=:8443"
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: "--plain-addr=:8080"
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: "--tls-cert-file=/etc/ax-server-tls/tls.crt"
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: "--tls-key-file=/etc/ax-server-tls/tls.key"
+  - patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: ax-server
+        namespace: ax-system
+      spec:
+        template:
+          spec:
+            containers:
+              - name: ax-server
+                env:
+                  - name: AX_RUNNER_VOLUME_IMAGE
+                    value: ghcr.io/stigenai/ax/ax-runner-volume:v0.4.0-stigenai.1@sha256:STAGE-0
+                  # CreateTask refuses a task above these caps. They must
+                  # equal limits.memory (16Gi) and limits.cpu (6) in
+                  # workerpool.yaml; see the reverse note there.
+                  - name: AX_MAX_TASK_MEMORY
+                    value: 16Gi
+                  - name: AX_MAX_TASK_CPU
+                    value: "6"
+                  # A task with no spec.profile.workerLabels runs only on
+                  # WorkerPool ax (label workload: ax). WorkerPool sluis
+                  # (workload: sluis, in nix-fleet-hosts ax-sluis) stays free
+                  # for sluis tasks.
+                  - name: AX_DEFAULT_WORKER_LABELS
+                    value: workload=ax
+                  # Caller auth. Without the Secret the server runs with auth
+                  # off. With it, every gRPC call needs
+                  # "authorization: Bearer <token>" (32 bytes or more).
+                  - name: AX_AUTH_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: ax-server-auth
+                        key: token
+                        optional: true
+                ports:
+                  - containerPort: 8443
+                    name: https
+                volumeMounts:
+                  - name: tls
+                    mountPath: /etc/ax-server-tls
+                    readOnly: true
+            volumes:
+              - name: tls
+                secret:
+                  secretName: ax-server-tls
+                  optional: false
+  - patch: |-
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: ax-server
+        namespace: ax-system
+      spec:
+        ports:
+          - port: 8443
+            targetPort: 8443
+            name: https
