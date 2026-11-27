@@ -116,6 +116,36 @@ func TestRun_StopsRunningCommandOnCancel(t *testing.T) {
 	}
 }
 
+// TestRun_StopGracePeriodLetsCommandSaveWork checks that a command that needs
+// longer than the default 10 seconds to exit after SIGTERM can be given more
+// time with Config.StopGracePeriod. The test shortens both times in proportion.
+func TestRun_StopGracePeriodLetsCommandSaveWork(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		grace       time.Duration
+		wantCleanOK bool
+	}{
+		{name: "long enough grace", grace: 10 * time.Second, wantCleanOK: true},
+		{name: "short grace kills the command", grace: 500 * time.Millisecond},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			h.cfg.StopGracePeriod = tc.grace
+			h.task.Spec.Commands = []string{"sh", "-c", "trap 'sleep 2; exit 0' TERM; sleep 60 & wait"}
+			h.start(t)
+
+			time.Sleep(100 * time.Millisecond)
+			h.cancel()
+
+			h.waitFinished(t, 30*time.Second)
+			exit := h.waitExit(t)
+			if clean := exit.Err == nil && exit.ExitCode == 0; clean != tc.wantCleanOK {
+				t.Errorf("exit = %+v, want a clean exit: %v", exit, tc.wantCleanOK)
+			}
+		})
+	}
+}
+
 func TestRun_WithoutCommandWaitsForContext(t *testing.T) {
 	h := newHarness(t)
 	h.start(t)

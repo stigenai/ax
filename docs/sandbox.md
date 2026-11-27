@@ -8,7 +8,7 @@ Every task container starts with `ax-runner` as PID 1. On boot it:
 4. On the first run, prepares each workspace at its own path, in binding order: clones Git repos and sets up the skills path. The task reports not-ready until every workspace has finished.
 5. Starts `spec.commands` as a child process, with the workspace path as its working directory and `AX_METADATA_URL` plus `spec.env` in its environment, and supervises it.
 
-The runner stays up as PID 1 whether or not the command is still running, so the metadata server keeps answering and `ax ssh` still works after the command has exited. Its exit code is logged. When the sandbox is stopped or suspended, the runner sends the command's process group `SIGTERM`, waits ten seconds, and then kills whatever is left.
+The runner stays up as PID 1 whether or not the command is still running, so the metadata server keeps answering and `ax ssh` still works after the command has exited. Its exit code is logged. When the sandbox is stopped or suspended, the runner sends the command's process group `SIGTERM`, waits ten seconds, and then kills whatever is left. Set `AX_STOP_GRACE_PERIOD` (a Go duration such as `90s`) in the runner's environment, or pass `--stop-grace-period`, to give the command more time.
 
 ## Probes
 

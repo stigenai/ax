@@ -316,3 +316,23 @@ Entries are in stack order, the same order as the commits.
 **Reason:** A task above the size of the largest worker is accepted and then waits in Pending for ever. CreateTask now rejects it when a cap is set.
 
 **Removal condition:** Remove the carry when upstream merges an equal change.
+
+## Task command stop grace period
+
+**Bead:** `ax-wtb` · **Branch:** `stigenai/deploy` · **Upstream status:** `upstream-candidate`
+
+**Upstream files edited:**
+
+- `runner/runner.go`
+- `cmd/ax-runner/main.go`
+- `docs/sandbox.md`
+
+**Tests:**
+
+- `runner/runner_test.go`
+
+**Notes:** `--stop-grace-period` (env `AX_STOP_GRACE_PERIOD`) keeps the upstream 10 s default. The fork must set `AX_STOP_GRACE_PERIOD=90s` in its task images or template env, and the pod termination grace must be longer than 90 s. Donation branch: `donate/runner-stop-grace-period`.
+
+**Reason:** A node drain or a Spot interruption stops a task with SIGTERM, and 10 s is too short for a worker to commit and push.
+
+**Removal condition:** Remove the carry when upstream merges an equal change.

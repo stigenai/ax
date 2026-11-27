@@ -26,10 +26,12 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/google/ax/pkg/apis/v1alpha1"
 	"github.com/google/ax/runner"
@@ -45,7 +47,15 @@ func main() {
 	flag.IntVar(&cfg.MetadataPort, "metadata-port", runner.DefaultMetadataPort, "Loopback-only port for the metadata endpoints")
 	flag.StringVar(&taskFile, "task-file", "", "Read the Task YAML from this file instead of AX_TASK_YAML")
 	flag.StringVar(&wsFile, "workspace-file", "", "Read the Workspace YAML from this file instead of AX_WORKSPACE_YAML")
+	flag.DurationVar(&cfg.StopGracePeriod, "stop-grace-period", 0, "How long the task command gets to exit after SIGTERM before it is killed; zero means 10s (env: AX_STOP_GRACE_PERIOD)")
 	flag.Parse()
+	if env := os.Getenv("AX_STOP_GRACE_PERIOD"); env != "" {
+		d, err := time.ParseDuration(env)
+		if err != nil {
+			fatal(fmt.Errorf("invalid AX_STOP_GRACE_PERIOD: %w", err))
+		}
+		cfg.StopGracePeriod = d
+	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)

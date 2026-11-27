@@ -50,9 +50,10 @@ const (
 	// Config.MetadataPort is zero.
 	DefaultMetadataPort = 8099
 
-	// stopGracePeriod is how long a running task command gets to exit after
-	// SIGTERM before it is killed during shutdown.
-	stopGracePeriod = 10 * time.Second
+	// DefaultStopGracePeriod is how long a running task command gets to exit
+	// after SIGTERM before it is killed during shutdown, unless
+	// Config.StopGracePeriod says otherwise.
+	DefaultStopGracePeriod = 10 * time.Second
 )
 
 // DefaultWorkspacePath is the command's working directory unless the task's
@@ -98,6 +99,11 @@ type Config struct {
 	// DropPrivileges overrides whether a pushed task's command runs as UID and
 	// GID 1000 when the runner runs as root, which it does by default.
 	DropPrivileges *bool
+	// StopGracePeriod is how long a running task command gets to exit after
+	// SIGTERM before it is killed during shutdown. A command that must save
+	// its work when its node drains can need longer than the default. Zero
+	// means DefaultStopGracePeriod.
+	StopGracePeriod time.Duration
 }
 
 // CommandExit describes how the task command finished.
@@ -304,7 +310,7 @@ func runTask(ctx context.Context, cfg Config, metaServer *metadata.Server, task 
 		// Keep the sandbox up and inspectable until told to stop.
 		<-ctx.Done()
 	case <-ctx.Done():
-		reportExit(cfg, cmd, stopCommand(cmd, exited))
+		reportExit(cfg, cmd, stopCommand(cmd, exited, cfg.StopGracePeriod))
 	}
 	return nil
 }
@@ -339,8 +345,12 @@ func markWorkspaceReady(metaServer *metadata.Server, wsPath string) {
 }
 
 // stopCommand asks the command's process group to terminate, kills it if it has
-// not exited within the grace period, and returns the command's exit result.
-func stopCommand(cmd *exec.Cmd, exited <-chan error) error {
+// not exited within the grace period (DefaultStopGracePeriod if zero), and
+// returns the command's exit result.
+func stopCommand(cmd *exec.Cmd, exited <-chan error, stopGracePeriod time.Duration) error {
+	if stopGracePeriod <= 0 {
+		stopGracePeriod = DefaultStopGracePeriod
+	}
 	pid := cmd.Process.Pid
 	slog.Info("stopping task command", "pid", pid)
 	_ = syscall.Kill(-pid, syscall.SIGTERM)
