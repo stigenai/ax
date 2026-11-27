@@ -364,8 +364,7 @@ func BuildActorTemplate(atespace, name, image string, envMap map[string]string, 
 			Name: "fabriek-supervisor", MountPath: "/run/substrate/fabriek-supervisor",
 		})
 	}
-	// The selector is the union of the supervisor label and workerLabels. It
-	// stays nil when both are empty.
+	// Add device and supervisor labels after the task's worker labels.
 	selector := map[string]string{}
 	maps.Copy(selector, workerLabels)
 	for _, d := range guestDevices {

@@ -38,7 +38,9 @@ spec:
 
 ### Worker labels
 
-`spec.workerLabels` (protojson name `workerLabels`) pins a task to the workers whose WorkerPool labels contain all the given pairs. It becomes the `workerSelector.matchLabels` of the task's ActorTemplate. Keys must be Kubernetes label names, values must be label values, and a task may set at most 8 pairs. A task that sets none runs on the workers that match `AX_DEFAULT_WORKER_LABELS`, a comma-separated `key=value` list (for example `workload=ax`) that ax-controller reads. If the variable is empty or unset, such a task can use any worker. A malformed value stops ax-controller at start. The labels apply when the task's ActorTemplate is created; an existing template is not changed.
+`spec.workerLabels` (protojson name `workerLabels`) sets the `workerSelector.matchLabels` of the task's ActorTemplate. The WorkerPool must match the selector. Use Kubernetes label names and label values. A task can set up to 8 pairs.
+
+The controller reads `AX_DEFAULT_WORKER_LABELS` as a comma-separated `key=value` list (for example `workload=ax`). AX uses those defaults for tasks without worker labels, guest devices or a supervisor profile. An empty or unset variable adds no labels. An invalid value stops ax-controller at start. AX applies these labels when it creates the ActorTemplate.
 
 ### Capabilities
 
