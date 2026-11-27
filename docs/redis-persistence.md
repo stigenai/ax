@@ -48,11 +48,11 @@ The `test -O` and `ls -ld` checks make sure that you own the directory and that 
 
 Use this one shell for all steps. The steps use relative paths in `WORK`. Step 3 needs `REDIS_MANIFEST`. Cleanup needs `WORK`.
 
-If you lose the shell before the first capture or before step 1, start again from the checkout root. Make a new private directory.
+If you lose the shell before the first capture, start again from the checkout root. Make a new private directory.
 
-If you lose the shell after step 1, stop. Do not repeat step 1. Do not make a new directory. Keep the original directory. It holds the dump and the baseline.
+If you lose the shell after any capture or after the start of step 1, stop. Do not repeat step 1. Do not make a new directory. Keep the original directory and all files that you captured so far.
 
-Seed, rollback and cleanup need the dump and the baseline. Ask the owner how to go on.
+Partial shutdown, seed, rollback and cleanup need these files. Ask the owner how to go on.
 
 The `kubectl exec` command does not use the local umask. Set the mode of each directory in the pod yourself.
 
