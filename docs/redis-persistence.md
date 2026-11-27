@@ -30,7 +30,7 @@ One class must show `(default)`.
 
 The migration operator keeps the rollback copy. The operator is the person who runs the migration. Keep the copy on persistent local storage outside the checkout. Do not use shared temporary storage (`/tmp`) or a path with automatic cleanup.
 
-Make one new private directory under your home. Run all local steps in it. Start at the root of the checkout. Run `umask 077` in each new shell before the first capture.
+Make one new private directory under your home. Run all local steps in it. Start at the root of the checkout. Run `umask 077` before the first capture.
 
 ```bash
 umask 077
@@ -42,7 +42,15 @@ test -O "$WORK" && test "$(ls -ld "$WORK" | cut -c1-10)" = "drwx------" || exit 
 cd "$WORK" || exit 1
 ```
 
-`REDIS_MANIFEST` keeps the absolute path of the manifest. If a command fails, stop. Do not start a capture. The `test -O` and `ls -ld` checks make sure that you own the directory and that its mode is 700. They work on Linux and macOS. Use the same shell for all steps. If you must use a new shell, run `umask 077` and set `REDIS_MANIFEST` again from the checkout root before step 1. Step 3 needs `REDIS_MANIFEST`. The `kubectl exec` command does not use the local umask. Set the mode of each directory in the pod yourself.
+`REDIS_MANIFEST` keeps the absolute path of the manifest. If a command fails, stop. Do not start a capture.
+
+The `test -O` and `ls -ld` checks make sure that you own the directory and that its mode is 700. They work on Linux and macOS.
+
+Use this one shell for all steps. The steps use relative paths in `WORK`. Step 3 needs `REDIS_MANIFEST`. Cleanup needs `WORK`.
+
+If you lose the shell, stop. Do not go on. Start again from the checkout root with a new private directory, before step 1.
+
+The `kubectl exec` command does not use the local umask. Set the mode of each directory in the pod yourself.
 
 ## Task inventory
 
