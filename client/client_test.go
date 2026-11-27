@@ -16,6 +16,7 @@ package client
 
 import (
 	"context"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"net"
@@ -25,6 +26,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/google/ax/internal/tunnel"
 	"github.com/google/ax/pkg/apis/v1alpha1"
@@ -110,6 +112,40 @@ func TestDial(t *testing.T) {
 	_, err = client.GetModel(context.Background(), &v1alpha1.GetModelRequest{})
 	if got := status.Code(err); got != codes.Unimplemented {
 		t.Errorf("GetModel() code = %v (%v), want Unimplemented", got, err)
+	}
+}
+
+func TestDialTLS(t *testing.T) {
+	isolate(t)
+	srv := grpc.NewServer()
+	v1alpha1.RegisterAXServer(srv, v1alpha1.UnimplementedAXServer{})
+	ts := httptest.NewUnstartedServer(http.HandlerFunc(srv.ServeHTTP))
+	ts.EnableHTTP2 = true
+	ts.StartTLS()
+	t.Cleanup(ts.Close)
+	ca := filepath.Join(t.TempDir(), "ca.pem")
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: ts.Certificate().Raw})
+	if err := os.WriteFile(ca, certPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	call := func() error {
+		client, conn, err := Dial(context.Background(), Options{ServerURL: "https://" + ts.Listener.Addr().String()})
+		if err != nil {
+			return err
+		}
+		defer conn.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_, err = client.GetModel(ctx, &v1alpha1.GetModelRequest{})
+		return err
+	}
+
+	if got := status.Code(call()); got != codes.Unavailable {
+		t.Errorf("without AX_CA_FILE: code = %v, want Unavailable", got)
+	}
+	t.Setenv("AX_CA_FILE", ca)
+	if got := status.Code(call()); got != codes.Unimplemented {
+		t.Errorf("with AX_CA_FILE: code = %v, want Unimplemented", got)
 	}
 }
 

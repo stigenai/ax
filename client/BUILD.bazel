@@ -9,7 +9,6 @@ go_library(
         "//internal/tunnel",
         "//pkg/apis/v1alpha1",
         "@org_golang_google_grpc//:grpc",
-        "@org_golang_google_grpc//credentials/insecure",
     ],
 )
 

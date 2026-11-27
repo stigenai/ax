@@ -28,12 +28,10 @@ package client
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	"github.com/google/ax/internal/tunnel"
 	"github.com/google/ax/pkg/apis/v1alpha1"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 )
 
 // ErrKubectlNotFound reports that a port-forward to ax-server has to be
@@ -84,16 +82,20 @@ func ServerURL(ctx context.Context, opts Options) (string, error) {
 // Dial returns a client for the ax-server at ServerURL(ctx, opts). The caller
 // closes the returned connection.
 //
-// The connection is plaintext, which is what ax-server serves. dialOpts are
-// applied after that default.
+// The connection is plaintext, which is what ax-server serves by default. An
+// "https://" server URL uses TLS instead,
+// trusting the system roots plus the PEM certificates in $AX_CA_FILE.
+// dialOpts are applied after that default.
 func Dial(ctx context.Context, opts Options, dialOpts ...grpc.DialOption) (v1alpha1.AXClient, *grpc.ClientConn, error) {
 	serverURL, err := ServerURL(ctx, opts)
 	if err != nil {
 		return nil, nil, err
 	}
-	target := strings.TrimPrefix(serverURL, "http://")
-	target = strings.TrimPrefix(target, "https://")
-	all := append([]grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}, dialOpts...)
+	target, creds, err := tunnel.TransportCredentials(serverURL)
+	if err != nil {
+		return nil, nil, fmt.Errorf("connecting to %s: %w", serverURL, err)
+	}
+	all := append([]grpc.DialOption{grpc.WithTransportCredentials(creds)}, dialOpts...)
 	conn, err := grpc.NewClient(target, all...)
 	if err != nil {
 		return nil, nil, fmt.Errorf("connecting to %s: %w", target, err)

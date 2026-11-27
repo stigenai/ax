@@ -5,6 +5,7 @@ go_library(
     srcs = [
         "context.go",
         "router_tls.go",
+        "transport.go",
         "tunnel.go",
     ],
     importpath = "github.com/google/ax/internal/tunnel",
@@ -12,6 +13,8 @@ go_library(
     deps = [
         "//pkg/apis/v1alpha1",
         "@in_gopkg_yaml_v3//:yaml_v3",
+        "@org_golang_google_grpc//credentials",
+        "@org_golang_google_grpc//credentials/insecure",
     ],
 )
 
@@ -20,7 +23,13 @@ go_test(
     srcs = [
         "context_test.go",
         "router_tls_test.go",
+        "transport_test.go",
         "tunnel_test.go",
     ],
     embed = [":tunnel"],
+    deps = [
+        "@org_golang_google_grpc//:grpc",
+        "@org_golang_google_grpc//health",
+        "@org_golang_google_grpc//health/grpc_health_v1",
+    ],
 )

@@ -336,3 +336,27 @@ Entries are in stack order, the same order as the commits.
 **Reason:** A node drain or a Spot interruption stops a task with SIGTERM, and 10 s is too short for a worker to commit and push.
 
 **Removal condition:** Remove the carry when upstream merges an equal change.
+
+## ax CLI dials ax-server with TLS
+
+**Bead:** `ax-u1x` · **Branch:** `stigenai/deploy` · **Upstream status:** `upstream-candidate`
+
+**Upstream files edited:**
+
+- `client/client.go`
+- `cmd/ax/main.go`
+
+**New files:**
+
+- `internal/tunnel/transport.go`
+
+**Tests:**
+
+- `client/client_test.go`
+- `internal/tunnel/transport_test.go`
+
+**Notes:** Only an `https://` server URL dials with TLS. A bare `host:port` stays plaintext, as upstream. Upstream already has the router mTLS dial (`tunnel.RouterTLSConfig`). Donation branch: `donate/cli-tls`.
+
+**Reason:** Upstream `client.Dial` removes the scheme and dials plaintext, so the CLI cannot reach an ax-server behind TLS.
+
+**Removal condition:** Remove the carry when upstream merges an equal change.

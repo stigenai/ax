@@ -297,6 +297,7 @@ Flags:
   -n, --namespace string      Kubernetes namespace where AX is installed (default: "ax-system")
   --context string            Kubernetes context (defaults to active kubectx / current-context)
   --server string             AX API server address (default: auto-detected from kube context or $AX_SERVER)
+                              https:// uses TLS; $AX_CA_FILE adds a CA to the system roots
   --trace                     Trace this command and print its trace ID to stderr`)
 }
 
