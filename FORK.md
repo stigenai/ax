@@ -166,3 +166,34 @@ Entries are in stack order, the same order as the commits.
 **Reason:** The fork tracks work with bd; upstream does not. The fork does not edit the upstream `AGENTS.md`.
 
 **Removal condition:** Remove the carry when stigenai stops using it, or when upstream adds the same behavior.
+
+## Bazel build with BuildBuddy
+
+**Bead:** `ax-k2q` · **Branch:** `stigenai/deploy` · **Upstream status:** `fork-only`
+
+**Upstream files edited:**
+
+- `.gitignore`
+
+**New files:**
+
+- `.bazelrc`
+- `.bazelversion`
+- `BUILD.bazel`
+- `MODULE.bazel`
+- `MODULE.bazel.lock`
+- `.github/workflows/bazel.yml`
+- `BUILD.bazel` in each Go package (made by `bazel run //:gazelle`)
+
+**Tests:**
+
+- `.github/workflows/bazel.yml`: the Go test packages equal the Bazel `go_test` targets, gazelle has no drift, and the Postgres store tests run with no skip.
+
+**Notes:**
+
+- `//cmd/ax:ax_test` is `manual`. The test runs `go build .`, and the Bazel sandbox has no go tool. `deploy-ci.yml` runs it with `go test`.
+- `//internal/install/substrate:substrate_test` and `//internal/install/cluster:cluster_test` get `go.mod` and the Substrate manifests as `data`, because they read them by path.
+
+**Reason:** Upstream builds with go and make, not Bazel.
+
+**Removal condition:** Remove the carry when stigenai stops using it, or when upstream adds the same behavior.

@@ -1,0 +1,19 @@
+load("@rules_go//go:def.bzl", "go_test")
+
+go_test(
+    name = "e2e_test",
+    srcs = [
+        "e2e_test.go",
+        "harness_test.go",
+        "promote_test.go",
+    ],
+    deps = [
+        "//internal/substrate",
+        "//pkg/apis/v1alpha1",
+        "@dev_ate_go_substrate//api/ateapi/v1:ateapi",
+        "@org_golang_google_grpc//:grpc",
+        "@org_golang_google_grpc//codes",
+        "@org_golang_google_grpc//credentials/insecure",
+        "@org_golang_google_grpc//status",
+    ],
+)

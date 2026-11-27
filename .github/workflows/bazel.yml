@@ -1,0 +1,111 @@
+# Bazel CI for the stigenai/deploy branch (ax-qov).
+#
+# This job runs next to build-vet-test (deploy-ci.yml). It does not replace it.
+# Without the BUILDBUDDY_API_KEY secret, Bazel runs local with no remote config.
+# With the secret, Bazel uses BuildBuddy remote execution and the build UI.
+
+name: Bazel
+
+on:
+  pull_request:
+    branches: [ "stigenai/deploy" ]
+  push:
+    branches: [ "stigenai/deploy" ]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bazel-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  bazel-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: ax
+          POSTGRES_PASSWORD: ax
+          POSTGRES_DB: ax
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ax -d ax"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Go
+        uses: actions/setup-go@f111f3307d8850f501ac008e886eec1fd1932a34 # v5.3.0
+        with:
+          go-version-file: go.mod
+
+      - name: Enable BuildBuddy
+        env:
+          BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
+        run: |
+          if [ -z "${BUILDBUDDY_API_KEY}" ]; then
+            echo "BUILDBUDDY_API_KEY not set - RBE disabled, building local."
+            exit 0
+          fi
+          {
+            echo "build:rbe --remote_header=x-buildbuddy-api-key=${BUILDBUDDY_API_KEY}"
+            echo "build:bes --bes_header=x-buildbuddy-api-key=${BUILDBUDDY_API_KEY}"
+          } >> "${HOME}/.bazelrc"
+          echo "RBE_CONFIG=--config=rbe" >> "${GITHUB_ENV}"
+          echo "BuildBuddy RBE and BES enabled (stigen-ai-bb, Pool=gtr)"
+
+      - name: Go test packages equal Bazel go_test targets
+        run: |
+          go list -f '{{if or .TestGoFiles .XTestGoFiles}}{{.ImportPath}}{{end}}' ./... \
+            | sed -e 's#^github.com/google/ax/##' -e 's#^github.com/google/ax$##' | sort > /tmp/go-tests.txt
+          bazel query --config=ci 'kind(go_test, //...)' --output=label \
+            | sed -e 's#^//##' -e 's#:.*##' | sort > /tmp/bazel-tests.txt
+          diff -u /tmp/go-tests.txt /tmp/bazel-tests.txt
+
+      - name: Gazelle has no drift
+        run: |
+          bazel run --config=ci //:gazelle
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::BUILD.bazel files are stale. Run bazel run //:gazelle and commit."
+            git status --porcelain
+            exit 1
+          fi
+
+      - name: Build
+        run: |
+          # shellcheck disable=SC2086
+          bazel build --config=ci ${RBE_CONFIG:-} //...
+
+      - name: Test
+        run: |
+          # shellcheck disable=SC2086
+          bazel test --config=ci ${RBE_CONFIG:-} //... \
+            --test_env=AX_TEST_POSTGRES_URL=postgres://ax:ax@localhost:5432/ax?sslmode=disable \
+            --test_arg=-test.v
+
+      - name: Verify Postgres-gated store tests ran, none skipped
+        run: |
+          log=bazel-testlogs/internal/store/postgres/postgres_test/test.log
+          if [ ! -f "${log}" ]; then
+            echo "::error::${log} not found; the Postgres test target did not run"
+            exit 1
+          fi
+          if grep -q -- '--- SKIP' "${log}"; then
+            echo "::error::internal/store/postgres tests were skipped; the Postgres service was not reachable"
+            grep -- '--- SKIP' "${log}"
+            exit 1
+          fi
+          if ! grep -q -- '--- PASS' "${log}"; then
+            echo "::error::no --- PASS lines found in ${log}"
+            exit 1
+          fi
+          echo "Postgres-gated store tests ran with no SKIP."

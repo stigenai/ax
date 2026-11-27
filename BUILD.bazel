@@ -1,0 +1,13 @@
+load("@gazelle//:def.bzl", "gazelle")
+
+# gazelle:prefix github.com/google/ax
+# gazelle:proto disable_global
+# gazelle:exclude docs
+# gazelle:exclude examples
+# gazelle:exclude assets
+# gazelle:exclude .beads
+
+gazelle(name = "gazelle")
+
+# The install tests read go.mod by path.
+exports_files(["go.mod"])

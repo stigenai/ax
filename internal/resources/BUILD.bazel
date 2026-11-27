@@ -1,0 +1,14 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "resources",
+    srcs = ["quantity.go"],
+    importpath = "github.com/google/ax/internal/resources",
+    visibility = ["//:__subpackages__"],
+)
+
+go_test(
+    name = "resources_test",
+    srcs = ["quantity_test.go"],
+    deps = [":resources"],
+)

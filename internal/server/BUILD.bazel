@@ -1,0 +1,61 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "server",
+    srcs = [
+        "gateway.go",
+        "server.go",
+        "workspace.go",
+    ],
+    importpath = "github.com/google/ax/internal/server",
+    visibility = ["//:__subpackages__"],
+    deps = [
+        "//internal/apivalidation",
+        "//internal/controller",
+        "//internal/lock",
+        "//internal/store",
+        "//internal/substrate",
+        "//internal/telemetry",
+        "//pkg/apis/v1alpha1",
+        "@com_github_google_uuid//:uuid",
+        "@dev_ate_go_substrate//api/ateapi/v1:ateapi",
+        "@org_golang_google_grpc//:grpc",
+        "@org_golang_google_grpc//codes",
+        "@org_golang_google_grpc//status",
+        "@org_golang_google_protobuf//proto",
+        "@org_golang_google_protobuf//types/known/emptypb",
+        "@org_golang_google_protobuf//types/known/timestamppb",
+    ],
+)
+
+go_test(
+    name = "server_test",
+    srcs = [
+        "actor_status_test.go",
+        "server_test.go",
+        "status_test.go",
+        "telemetry_test.go",
+        "workspace_test.go",
+    ],
+    embed = [":server"],
+    deps = [
+        "//internal/controller",
+        "//internal/lock",
+        "//internal/store",
+        "//internal/store/memory",
+        "//internal/substrate/substratetest",
+        "//pkg/apis/v1alpha1",
+        "@dev_ate_go_substrate//api/ateapi/v1:ateapi",
+        "@io_opentelemetry_go_otel//:otel",
+        "@io_opentelemetry_go_otel_sdk//trace",
+        "@io_opentelemetry_go_otel_sdk//trace/tracetest",
+        "@io_opentelemetry_go_otel_trace//:trace",
+        "@io_opentelemetry_go_otel_trace//noop",
+        "@org_golang_google_grpc//:grpc",
+        "@org_golang_google_grpc//codes",
+        "@org_golang_google_grpc//credentials/insecure",
+        "@org_golang_google_grpc//metadata",
+        "@org_golang_google_grpc//status",
+        "@org_golang_google_protobuf//types/known/timestamppb",
+    ],
+)

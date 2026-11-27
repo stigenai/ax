@@ -1,0 +1,26 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "tunnel",
+    srcs = [
+        "context.go",
+        "router_tls.go",
+        "tunnel.go",
+    ],
+    importpath = "github.com/google/ax/internal/tunnel",
+    visibility = ["//:__subpackages__"],
+    deps = [
+        "//pkg/apis/v1alpha1",
+        "@in_gopkg_yaml_v3//:yaml_v3",
+    ],
+)
+
+go_test(
+    name = "tunnel_test",
+    srcs = [
+        "context_test.go",
+        "router_tls_test.go",
+        "tunnel_test.go",
+    ],
+    embed = [":tunnel"],
+)

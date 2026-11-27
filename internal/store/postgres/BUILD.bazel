@@ -1,0 +1,32 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "postgres",
+    srcs = [
+        "lock.go",
+        "schema.go",
+        "store.go",
+    ],
+    embedsrcs = ["schema.sql"],
+    importpath = "github.com/google/ax/internal/store/postgres",
+    visibility = ["//:__subpackages__"],
+    deps = [
+        "//internal/lock",
+        "//internal/store",
+        "//pkg/apis/v1alpha1",
+        "@com_github_jackc_pgx_v5//:pgx",
+        "@com_github_jackc_pgx_v5//pgxpool",
+        "@org_golang_google_protobuf//encoding/protojson",
+        "@org_golang_google_protobuf//proto",
+    ],
+)
+
+go_test(
+    name = "postgres_test",
+    srcs = ["store_test.go"],
+    embed = [":postgres"],
+    deps = [
+        "//internal/store",
+        "//pkg/apis/v1alpha1",
+    ],
+)

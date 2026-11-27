@@ -1,0 +1,49 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "substrate",
+    srcs = [
+        "bootstrap.go",
+        "pki.go",
+    ],
+    embedsrcs = [
+        "manifests/01-crds.yaml",
+        "manifests/02-podcert-controller.yaml",
+        "manifests/03-sandboxconfig.yaml",
+        "manifests/04-postgres.yaml",
+        "manifests/05-ate-system.yaml",
+        "manifests/06-credprovider.yaml",
+        "manifests/07-atenet-egress.yaml",
+        "manifests/08-workerpool.yaml",
+        "manifests/version.txt",
+    ],
+    importpath = "github.com/google/ax/internal/install/substrate",
+    visibility = ["//:__subpackages__"],
+    deps = [
+        "//internal/install/executil",
+        "//pkg/apis/v1alpha1",
+        "@dev_ate_go_substrate//pkg/postgressetup",
+        "@in_gopkg_yaml_v3//:yaml_v3",
+    ],
+)
+
+go_test(
+    name = "substrate_test",
+    srcs = [
+        "bootstrap_test.go",
+        "pki_test.go",
+    ],
+    data = ["//:go.mod"],  # keep
+    embed = [":substrate"],
+    deps = [
+        "//internal/install/executil",
+        "@in_gopkg_yaml_v3//:yaml_v3",
+    ],
+)
+
+# The cluster tests read these manifests by path.
+filegroup(
+    name = "manifests",
+    srcs = glob(["manifests/*.yaml"]),
+    visibility = ["//internal/install:__subpackages__"],
+)

@@ -1,0 +1,30 @@
+load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
+
+go_library(
+    name = "ax-server_lib",
+    srcs = ["main.go"],
+    importpath = "github.com/google/ax/cmd/ax-server",
+    visibility = ["//visibility:private"],
+    deps = [
+        "//internal/controller",
+        "//internal/server",
+        "//internal/store/postgres",
+        "//internal/substrate",
+        "//internal/telemetry",
+        "@com_github_google_go_containerregistry//pkg/name",
+        "@com_github_jackc_pgx_v5//pgconn",
+        "@org_golang_google_grpc//:grpc",
+    ],
+)
+
+go_binary(
+    name = "ax-server",
+    embed = [":ax-server_lib"],
+    visibility = ["//visibility:public"],
+)
+
+go_test(
+    name = "ax-server_test",
+    srcs = ["main_test.go"],
+    embed = [":ax-server_lib"],
+)

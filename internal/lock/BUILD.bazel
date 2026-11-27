@@ -1,0 +1,14 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "lock",
+    srcs = ["lock.go"],
+    importpath = "github.com/google/ax/internal/lock",
+    visibility = ["//:__subpackages__"],
+)
+
+go_test(
+    name = "lock_test",
+    srcs = ["lock_test.go"],
+    deps = [":lock"],
+)

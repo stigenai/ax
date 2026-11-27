@@ -1,0 +1,22 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "workspace",
+    srcs = [
+        "git.go",
+        "setup.go",
+    ],
+    importpath = "github.com/google/ax/internal/workspace",
+    visibility = ["//:__subpackages__"],
+    deps = ["//pkg/apis/v1alpha1"],
+)
+
+go_test(
+    name = "workspace_test",
+    srcs = [
+        "command_test.go",
+        "setup_test.go",
+    ],
+    embed = [":workspace"],
+    deps = ["//pkg/apis/v1alpha1"],
+)

@@ -1,0 +1,21 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "executil",
+    srcs = [
+        "rollout.go",
+        "runner.go",
+        "tools.go",
+    ],
+    importpath = "github.com/google/ax/internal/install/executil",
+    visibility = ["//:__subpackages__"],
+)
+
+go_test(
+    name = "executil_test",
+    srcs = [
+        "rollout_test.go",
+        "runner_test.go",
+    ],
+    embed = [":executil"],
+)

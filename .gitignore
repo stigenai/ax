@@ -16,3 +16,4 @@ bin/
 .beads-credential-key
 .beads/proxieddb/
 *.gate.lock*
+/bazel-*
