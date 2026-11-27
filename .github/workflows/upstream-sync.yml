@@ -1,13 +1,20 @@
-# This workflow is fork carry. FORK.md on stigenai/deploy lists it.
+# FORK.md on stigenai/deploy lists this workflow as fork carry.
 #
-# Each week, the job merges google/ax main into each fork branch on the runner.
-# Then it runs the tests on that tree.
-# If the merge or a test fails, the job fails.
-# The job summary shows each conflicted file and the FORK.md entries for it.
+# stigenai/deploy is a patch stack on a google/ax tag.
+# Each week, the job finds the newest google/ax tag. It includes -rc tags.
+# If the stack is on an older tag, the job rebases the stack on the runner.
 # The job does not push.
 #
-# Keep this file on main. GitHub reads schedule triggers only from the
-# default branch.
+# Then the job runs the tests and hack/fork/fork.sh check.
+#
+# The job fails if the rebase stops on a conflict.
+# The summary then shows the commit and its files.
+# The job also fails if a test or the check fails.
+# If the stack is on an older tag, the job fails at the end.
+# A human then does the rebase, as FORK.md tells.
+#
+# Keep this file on main.
+# GitHub reads schedule triggers only from the default branch.
 
 name: upstream-sync
 
@@ -20,11 +27,7 @@ permissions:
   contents: read
 
 jobs:
-  trial-merge:
-    strategy:
-      fail-fast: false
-      matrix:
-        branch: [main, stigenai/deploy]
+  trial-rebase:
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -43,40 +46,42 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: ${{ matrix.branch }}
+          ref: stigenai/deploy
           fetch-depth: 0
 
-      - name: Trial merge of google/ax main
+      - name: Trial rebase onto the newest upstream tag
+        id: rebase
         run: |
           git config user.name "upstream-sync"
           git config user.email "upstream-sync@users.noreply.github.com"
-          git fetch --quiet https://github.com/google/ax.git main
-          base=$(git merge-base HEAD FETCH_HEAD)
+          git fetch --quiet --tags https://github.com/google/ax.git
+          newest=$(git -c versionsort.suffix=-rc tag -l 'v[0-9]*' --sort=-v:refname | grep -v -- '-stigenai' | head -1)
+          base=$(hack/fork/fork.sh base)
+          echo "behind=$([ "$base" = "$newest" ] && echo false || echo true)" >> "$GITHUB_OUTPUT"
           {
-            echo "## ${{ matrix.branch }} + google/ax $(git rev-parse --short FETCH_HEAD)"
+            echo "## stigenai/deploy on $base, newest upstream tag $newest"
             echo
-            echo "- Upstream commits not merged: $(git rev-list --count HEAD..FETCH_HEAD)"
-            echo "- Fork commits: $(git rev-list --count --no-merges FETCH_HEAD..HEAD)"
-            echo "- Merge base: $(git log -1 --format='%h %cs' "$base")"
+            echo "- Fork commits: $(git rev-list --count --no-merges "$base..HEAD")"
+            echo "- Upstream commits from $base to $newest: $(git rev-list --count "$base..$newest")"
             echo
           } >> "$GITHUB_STEP_SUMMARY"
-          if git merge --no-edit --no-ff FETCH_HEAD; then
-            echo "Merge: clean" >> "$GITHUB_STEP_SUMMARY"
+          [ "$base" = "$newest" ] && exit 0
+          if hack/fork/fork.sh rebase "$newest"; then
+            echo "Rebase onto $newest: clean. The tests below run on the rebased stack." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
           {
-            echo "### Merge conflicts"
+            echo "### Rebase onto $newest stopped"
             echo
-            echo "| File | FORK.md entries that edit it |"
-            echo "|---|---|"
-            git diff --name-only --diff-filter=U | while read -r f; do
-              entries=""
-              if [ -f FORK.md ]; then
-                entries=$(awk -v f="- \`$f\`" '/^## /{t=substr($0,4)} $0==f{print t}' FORK.md | sort -u | paste -sd ';' -)
-              fi
-              echo "| \`$f\` | ${entries:-none} |"
-            done
+            echo "- Commit: $(git log -1 --format='%h %s' REBASE_HEAD)"
+            echo "- Fork-Topic: $(git log -1 --format='%(trailers:key=Fork-Topic,valueonly)' REBASE_HEAD)"
+            echo "- Fork commits applied before it: $(git rev-list --count "$newest..HEAD")"
+            echo
+            echo "Conflicted files:"
+            echo
+            git diff --name-only --diff-filter=U | while read -r f; do echo "- \`$f\`"; done
           } >> "$GITHUB_STEP_SUMMARY"
+          git rebase --abort
           exit 1
 
       - name: Set up Go
@@ -84,7 +89,16 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Test the merged tree
+      - name: Test the stack
         env:
           AX_TEST_POSTGRES_URL: postgres://ax:ax@localhost:5432/ax?sslmode=disable
         run: go test ./...
+
+      - name: Check the fork trailers
+        run: hack/fork/fork.sh check
+
+      - name: Fail if the stack is not on the newest tag
+        if: steps.rebase.outputs.behind == 'true'
+        run: |
+          echo "The trial rebase passed. Rebase stigenai/deploy onto the newest tag as FORK.md tells you."
+          exit 1
