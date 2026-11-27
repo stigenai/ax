@@ -55,6 +55,10 @@ metadata:
     app.kubernetes.io/part-of: ax
 spec:
   replicas: 1
+  # Stop the old controller before the new controller saves a Redis checkpoint.
+  strategy:
+    type: Recreate
+    rollingUpdate: null
   selector:
     matchLabels:
       app.kubernetes.io/name: ax-controller

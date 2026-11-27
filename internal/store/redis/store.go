@@ -73,7 +73,7 @@ type Options struct {
 	// This field has no effect when reclaim is off.
 	ClaimInterval time.Duration
 	// MaxDeliveries caps how many times a subscription may deliver the same
-	// event. A subscription acks and drops a claimed event past this count,
+	// event. A subscription acks and drops an event past this count,
 	// so a poison event cannot crash-loop the process that reads it forever.
 	// Zero uses the default: 5.
 	MaxDeliveries int64
@@ -813,16 +813,147 @@ func (s *Store) GetWorkspace(ctx context.Context, atespace, name string) (*v1alp
 	return &w, nil
 }
 
-// Subscribe joins a Redis Streams consumer group, creating the group (and the
-// stream) if needed. A new group starts at the tail of the stream, so it only
-// sees events published after it was created; an existing group keeps its
-// position and any pending entries.
+// Subscribe joins a Redis Streams consumer group and saves its state.
+// A group with no prior state starts at the tail of the stream.
+// A group from a saved checkpoint keeps its position and pending entries.
 func (s *Store) Subscribe(ctx context.Context, group, consumer string) (store.Subscription, error) {
-	err := s.client.XGroupCreateMkStream(ctx, s.opts.StreamName, group, "$").Err()
-	if err != nil && !strings.Contains(err.Error(), "BUSYGROUP") {
-		return nil, fmt.Errorf("creating consumer group %q: %w", group, err)
+	if _, err := s.consumerGroupCheckpoint(ctx, group, "subscribe", ""); err != nil {
+		return nil, fmt.Errorf("subscribing to consumer group %q: %w", group, err)
 	}
 	return &subscription{store: s, group: group, consumer: consumer, claimCursor: "0-0"}, nil
+}
+
+// A group checkpoint retains its cursor and pending entries across group loss.
+// Save new pending entries in batches of at most 256 before dispatch.
+// Remove each acknowledged entry from the checkpoint in the same script as the ACK.
+var checkpointGroup = redis.NewScript(`
+local stream, checkpoint = KEYS[1], KEYS[2]
+local group, operation, id = ARGV[1], ARGV[2], ARGV[3]
+local streamType = redis.call('TYPE', stream).ok
+local checkpointType = redis.call('TYPE', checkpoint).ok
+if (streamType ~= 'none' and streamType ~= 'stream') or
+   (checkpointType ~= 'none' and checkpointType ~= 'hash') then
+    return redis.error_reply('WRONGTYPE invalid stream or group checkpoint type')
+end
+
+local function field(info, name)
+    for i = 1, #info, 2 do
+        if info[i] == name then return info[i + 1] end
+    end
+end
+
+local position
+if streamType == 'stream' then
+    for _, info in ipairs(redis.call('XINFO', 'GROUPS', stream)) do
+        if field(info, 'name') == group then
+            position = field(info, 'last-delivered-id')
+            break
+        end
+    end
+end
+
+local saved = redis.call('HGET', checkpoint, 'cursor')
+if checkpointType == 'hash' and not saved then
+    return redis.error_reply('ERR missing group checkpoint cursor')
+end
+if operation == 'ack' then
+    if not position then return redis.error_reply('NOGROUP consumer group no longer exists') end
+    if not saved then return redis.error_reply('ERR missing group checkpoint') end
+    if redis.acl_check_cmd and not redis.acl_check_cmd('XACK', stream, group, id) then
+        return redis.error_reply('NOPERM cannot acknowledge stream entries')
+    end
+    redis.call('HDEL', checkpoint, id)
+    return redis.call('XACK', stream, group, id)
+end
+
+if not position then
+    if operation == 'deliver' then return redis.error_reply('NOGROUP consumer group no longer exists') end
+    if saved then
+        local fields = redis.call('HGETALL', checkpoint)
+        local pending = {}
+        for i = 1, #fields, 2 do
+            if fields[i] ~= 'cursor' then
+                local entry = cmsgpack.unpack(fields[i + 1])
+                local pendingID = fields[i]
+                if redis.acl_check_cmd and
+                   (not redis.acl_check_cmd('XCLAIM', stream, group, entry[1], 0, pendingID, 'FORCE') or
+                    not redis.acl_check_cmd('HDEL', checkpoint, pendingID)) then
+                    return redis.error_reply('NOPERM cannot restore pending stream entries')
+                end
+                pending[pendingID] = entry
+            end
+        end
+        redis.call('XGROUP', 'CREATE', stream, group, saved, 'MKSTREAM')
+        for pendingID, entry in pairs(pending) do
+            local claimed = redis.call('XCLAIM', stream, group, entry[1], 0, pendingID,
+                'TIME', entry[2], 'RETRYCOUNT', entry[3], 'FORCE', 'JUSTID')
+            if #claimed == 0 then redis.call('HDEL', checkpoint, pendingID) end
+        end
+        return 1
+    end
+    position = '0-0'
+    if operation == 'subscribe' and streamType == 'stream' then
+        position = field(redis.call('XINFO', 'STREAM', stream), 'last-generated-id')
+    end
+    if redis.acl_check_cmd and not redis.acl_check_cmd('HSET', checkpoint, 'cursor', position) then
+        return redis.error_reply('NOPERM cannot save the group checkpoint')
+    end
+    redis.call('XGROUP', 'CREATE', stream, group, position, 'MKSTREAM')
+    redis.call('HSET', checkpoint, 'cursor', position)
+    if operation == 'subscribe' then return 0 end
+    return 1
+end
+if operation == 'recover' or (operation == 'subscribe' and saved) then return 0 end
+
+local clock = redis.call('TIME')
+local now = clock[1] * 1000 + math.floor(clock[2] / 1000)
+
+local function save(entry)
+    redis.call('HSET', checkpoint, entry[1], cmsgpack.pack({
+        entry[2], math.max(0, now - entry[3]), entry[4]
+    }))
+end
+
+if operation == 'subscribe' then
+    local start, page = '-', {}
+    repeat
+        page = redis.call('XPENDING', stream, group, start, '+', 256)
+        for _, entry in ipairs(page) do save(entry) end
+        if #page == 256 then start = '(' .. page[#page][1] end
+    until #page < 256
+    redis.call('HSET', checkpoint, 'cursor', position)
+    return 0
+end
+
+if not saved then return redis.error_reply('ERR missing group checkpoint') end
+if saved ~= position then
+    local page = redis.call('XPENDING', stream, group, '(' .. saved, position, 256)
+    for _, entry in ipairs(page) do
+        save(entry)
+    end
+    if #page == 256 and page[#page][1] ~= position then
+        redis.call('HSET', checkpoint, 'cursor', page[#page][1])
+        return -2
+    end
+    redis.call('HSET', checkpoint, 'cursor', position)
+end
+local match = redis.call('XPENDING', stream, group, id, id, 1)
+if #match == 0 then return -1 end
+save(match[1])
+return match[1][4]
+`)
+
+func (s *Store) checkpointKey(group string) string {
+	stream := s.opts.StreamName
+	return fmt.Sprintf("ax:stream-checkpoint:%d:%s:%s", len(stream), stream, group)
+}
+
+func (s *Store) consumerGroupCheckpoint(ctx context.Context, group, operation, id string) (int, error) {
+	result, err := checkpointGroup.Run(ctx, s.client, []string{s.opts.StreamName, s.checkpointKey(group)}, group, operation, id).Int()
+	if err == nil && result == 1 && (operation == "subscribe" || operation == "recover") {
+		slog.Warn("restored Redis consumer group", "stream", s.opts.StreamName, "group", group)
+	}
+	return result, err
 }
 
 // subscription reads from a consumer group in batches.
@@ -847,20 +978,56 @@ type subscription struct {
 	lastClaim time.Time
 }
 
+func (sub *subscription) restoreConsumerGroup(ctx context.Context) error {
+	_, err := sub.store.consumerGroupCheckpoint(ctx, sub.group, "recover", "")
+	if err != nil {
+		return fmt.Errorf("restoring consumer group %q: %w", sub.group, err)
+	}
+	sub.claimCursor = "0-0"
+	sub.lastClaim = time.Now()
+	return nil
+}
+
 func (sub *subscription) Next(ctx context.Context) (store.TaskEvent, error) {
-	for len(sub.pending) == 0 {
+	for {
 		if err := ctx.Err(); err != nil {
 			return store.TaskEvent{}, err
 		}
-		events, err := sub.read(ctx)
-		if err != nil {
-			return store.TaskEvent{}, err
+		if len(sub.pending) == 0 {
+			events, err := sub.read(ctx)
+			if err != nil {
+				return store.TaskEvent{}, err
+			}
+			sub.pending = events
+			continue
 		}
-		sub.pending = events
+		ev := sub.pending[0]
+		deliveries, err := sub.store.consumerGroupCheckpoint(ctx, sub.group, "deliver", ev.ID)
+		if redis.HasErrorPrefix(err, "NOGROUP") {
+			if err = sub.restoreConsumerGroup(ctx); err == nil {
+				continue
+			}
+		}
+		if err != nil {
+			return store.TaskEvent{}, fmt.Errorf("saving pending task event %s: %w", ev.ID, err)
+		}
+		// Redis saved one page. Keep this event until it saves the rest.
+		if deliveries == -2 {
+			continue
+		}
+		sub.pending = sub.pending[1:]
+		if deliveries < 0 {
+			continue
+		}
+		if int64(deliveries) <= sub.store.opts.MaxDeliveries {
+			return ev, nil
+		}
+		if err := sub.Ack(ctx, ev); err != nil {
+			return store.TaskEvent{}, fmt.Errorf("acking poison task event %s: %w", ev.ID, err)
+		}
+		slog.Error("dropping task event after too many deliveries",
+			"id", ev.ID, "atespace", ev.Atespace, "name", ev.Name, "action", ev.Action, "deliveries", deliveries)
 	}
-	ev := sub.pending[0]
-	sub.pending = sub.pending[1:]
-	return ev, nil
 }
 
 // read returns the next batch of events. When reclaim is on (ClaimMinIdle >
@@ -890,6 +1057,9 @@ func (sub *subscription) read(ctx context.Context) ([]store.TaskEvent, error) {
 		if errors.Is(err, redis.Nil) {
 			return nil, nil
 		}
+		if redis.HasErrorPrefix(err, "NOGROUP") {
+			return nil, sub.restoreConsumerGroup(ctx)
+		}
 		return nil, fmt.Errorf("reading task events: %w", err)
 	}
 
@@ -913,7 +1083,7 @@ func (sub *subscription) claim(ctx context.Context) ([]store.TaskEvent, error) {
 	if sub.claimCursor == "0-0" && time.Since(sub.lastClaim) < sub.store.opts.ClaimInterval {
 		return nil, nil
 	}
-	msgs, cursor, err := sub.store.client.XAutoClaim(ctx, &redis.XAutoClaimArgs{
+	msgs, cursor, deleted, err := sub.store.client.XAutoClaimWithDeleted(ctx, &redis.XAutoClaimArgs{
 		Stream:   sub.store.opts.StreamName,
 		Group:    sub.group,
 		Consumer: sub.consumer,
@@ -922,7 +1092,15 @@ func (sub *subscription) claim(ctx context.Context) ([]store.TaskEvent, error) {
 		Count:    sub.store.opts.ReadBatchSize,
 	}).Result()
 	if err != nil {
+		if redis.HasErrorPrefix(err, "NOGROUP") {
+			return nil, sub.restoreConsumerGroup(ctx)
+		}
 		return nil, fmt.Errorf("reclaiming idle task events: %w", err)
+	}
+	if len(deleted) > 0 {
+		if err := sub.store.client.HDel(ctx, sub.store.checkpointKey(sub.group), deleted...).Err(); err != nil {
+			return nil, fmt.Errorf("removing trimmed task events from the checkpoint: %w", err)
+		}
 	}
 	sub.claimCursor = cursor
 	if cursor == "0-0" {
@@ -936,51 +1114,22 @@ func (sub *subscription) claim(ctx context.Context) ([]store.TaskEvent, error) {
 	ids := make([]string, 0, len(msgs))
 	for _, msg := range msgs {
 		ev := eventFromMessage(msg)
-		dropped, err := sub.dropIfPoison(ctx, ev)
-		if err != nil {
-			return nil, err
-		}
-		if dropped {
-			continue
-		}
 		events = append(events, ev)
 		ids = append(ids, ev.ID)
 	}
-	if len(events) > 0 {
-		slog.Info("reclaimed idle task events", "consumer", sub.consumer, "count", len(events), "ids", ids)
-	}
+	slog.Info("reclaimed idle task events", "consumer", sub.consumer, "count", len(events), "ids", ids)
 	return events, nil
 }
 
-// dropIfPoison checks ev's delivery count and, when it is past
-// Options.MaxDeliveries, acks and drops ev instead of returning it. This
-// stops an event that always crashes its processor from cycling between
-// consumers forever: it caps a poison event's cost at MaxDeliveries tries.
-func (sub *subscription) dropIfPoison(ctx context.Context, ev store.TaskEvent) (bool, error) {
-	pending, err := sub.store.client.XPendingExt(ctx, &redis.XPendingExtArgs{
-		Stream: sub.store.opts.StreamName,
-		Group:  sub.group,
-		Start:  ev.ID,
-		End:    ev.ID,
-		Count:  1,
-	}).Result()
-	if err != nil {
-		return false, fmt.Errorf("checking delivery count for task event %s: %w", ev.ID, err)
-	}
-	if len(pending) == 0 || pending[0].RetryCount <= sub.store.opts.MaxDeliveries {
-		return false, nil
-	}
-	deliveries := pending[0].RetryCount
-	if err := sub.store.client.XAck(ctx, sub.store.opts.StreamName, sub.group, ev.ID).Err(); err != nil {
-		return false, fmt.Errorf("acking poison task event %s: %w", ev.ID, err)
-	}
-	slog.Error("dropping task event after too many deliveries",
-		"id", ev.ID, "atespace", ev.Atespace, "name", ev.Name, "action", ev.Action, "deliveries", deliveries)
-	return true, nil
-}
-
 func (sub *subscription) Ack(ctx context.Context, ev store.TaskEvent) error {
-	return sub.store.client.XAck(ctx, sub.store.opts.StreamName, sub.group, ev.ID).Err()
+	_, err := sub.store.consumerGroupCheckpoint(ctx, sub.group, "ack", ev.ID)
+	if redis.HasErrorPrefix(err, "NOGROUP") {
+		if err := sub.restoreConsumerGroup(ctx); err != nil {
+			return err
+		}
+		_, err = sub.store.consumerGroupCheckpoint(ctx, sub.group, "ack", ev.ID)
+	}
+	return err
 }
 
 // Close releases the subscription. It deliberately leaves the consumer

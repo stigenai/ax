@@ -24,6 +24,14 @@ pvc='select(.kind == "PersistentVolumeClaim" and .metadata.name == "ax-redis-dat
 q() { yq "$1" "$manifest"; }
 
 # --- static checks ---
+controller='select(.kind == "Deployment" and .metadata.name == "ax-controller")'
+[ "$(yq "$controller | .spec.strategy.type" "$here/../ax-controller.yaml")" = Recreate ] ||
+  fail "Deployment ax-controller must use strategy Recreate"
+[ "$(yq "$controller | .spec.strategy | has(\"rollingUpdate\")" "$here/../ax-controller.yaml")" = true ] &&
+  [ "$(yq "$controller | .spec.strategy.rollingUpdate | tag" "$here/../ax-controller.yaml")" = '!!null' ] ||
+  fail "Deployment ax-controller must clear the rollingUpdate field"
+[ "$(yq "$controller | .spec.replicas" "$here/../ax-controller.yaml")" = 1 ] ||
+  fail "Deployment ax-controller must use one replica"
 [ "$(q "$pvc | .spec.accessModes[0]")" = ReadWriteOnce ] || fail "PVC ax-redis-data must be ReadWriteOnce"
 [ "$(q "$pvc | .spec.resources.requests.storage")" = 1Gi ] || fail "PVC ax-redis-data must request 1Gi"
 [ "$(q "$pvc | .spec.storageClassName")" = null ] || fail "PVC ax-redis-data must not set storageClassName"

@@ -45,9 +45,11 @@ go_test(
     deps = [
         "//internal/store",
         "//internal/store/memory",
+        "//internal/store/redis",
         "//internal/substrate",
         "//pkg/apis/v1alpha1",
         "@com_github_agent_substrate_substrate//pkg/proto/ateapipb",
+        "@com_github_redis_go_redis_v9//:go-redis",
         "@io_k8s_apimachinery//pkg/api/resource",
         "@org_golang_google_grpc//:grpc",
         "@org_golang_google_grpc//codes",
