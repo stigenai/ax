@@ -221,6 +221,16 @@ ax --context=dev-cluster get tasks
 | `--server` | Control plane address, bypassing auto-detection | derived from kube context, or `$AX_SERVER` |
 | `--trace` | Trace the command and print its trace ID to stderr. Its RPCs send a sampled W3C `traceparent`, and CLI spans are exported over OTLP when `OTEL_EXPORTER_OTLP_ENDPOINT` is set. Without it, the CLI sends no trace context and ax-server samples on its own. See [CLI traces](docs/observability.md#cli-traces) | off |
 
+### Caller authentication
+
+`ax-server` can require a bearer token on every gRPC call. Set `AX_AUTH_TOKEN`
+on `ax-server` to a value of 32 bytes or more. If it is unset, authentication is
+off, which is the default. `/healthz` stays open.
+
+Set the same `AX_AUTH_TOKEN` for the `ax` CLI. The CLI sends it as
+`authorization: Bearer <token>`, and only over TLS (`https://`) or to a
+loopback address. For any other plaintext address, the CLI returns an error.
+
 ## AX and Agent Substrate
 
 [Agent Substrate](https://github.com/agent-substrate/substrate) is the compute runtime layer AX relies on. It schedules actors onto workers, isolates them, and suspends, resumes and snapshots them. It also handles their networking, egress policies and credential injection.

@@ -382,3 +382,27 @@ Entries are in stack order, the same order as the commits.
 **Reason:** Upstream ax-server has a plaintext h2c listener only.
 
 **Removal condition:** Remove the carry when upstream merges an equal change.
+
+## Bearer-token caller auth (AX_AUTH_TOKEN)
+
+**Bead:** `ax-cyt` · **Branch:** `stigenai/deploy` · **Upstream status:** `upstream-candidate`
+
+**Upstream files edited:**
+
+- `README.md`
+- `client/client.go`
+- `cmd/ax-server/main.go`
+- `cmd/ax/main.go`
+- `internal/server/server.go`
+
+**Tests:**
+
+- `client/auth_test.go`
+- `cmd/ax-server/main_test.go`
+- `internal/server/auth_test.go`
+
+**Notes:** With `AX_AUTH_TOKEN` set, every gRPC call must send `authorization: Bearer <token>`. The server compares it in constant time, and `/healthz` stays open. `client.Dial` sends the token only over TLS or to a loopback address. Off by default. Donation branch: `donate/server-auth`, based on `donate/cli-tls`.
+
+**Reason:** Upstream ax-server accepts every caller.
+
+**Removal condition:** Remove the carry when upstream merges an equal change.

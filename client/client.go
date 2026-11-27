@@ -28,6 +28,7 @@ package client
 import (
 	"context"
 	"fmt"
+	"net"
 
 	"github.com/google/ax/internal/tunnel"
 	"github.com/google/ax/pkg/apis/v1alpha1"
@@ -58,6 +59,11 @@ type Options struct {
 	// FromEnv reads $AX_SERVER (when Context is empty) and
 	// $AX_SYSTEM_NAMESPACE (when Namespace is empty).
 	FromEnv bool
+	// AuthToken, when set, is sent on every call as "authorization: Bearer
+	// <token>", for an ax-server that runs with caller authentication on.
+	// Dial refuses to send it over plaintext to an address that is not
+	// loopback.
+	AuthToken string
 }
 
 // ServerURL returns the address of the ax-server that opts selects, in the
@@ -95,12 +101,42 @@ func Dial(ctx context.Context, opts Options, dialOpts ...grpc.DialOption) (v1alp
 	if err != nil {
 		return nil, nil, fmt.Errorf("connecting to %s: %w", serverURL, err)
 	}
-	all := append([]grpc.DialOption{grpc.WithTransportCredentials(creds)}, dialOpts...)
-	conn, err := grpc.NewClient(target, all...)
+	base := []grpc.DialOption{grpc.WithTransportCredentials(creds)}
+	if opts.AuthToken != "" {
+		if creds.Info().SecurityProtocol != "tls" && !isLoopbackTarget(target) {
+			return nil, nil, fmt.Errorf("connecting to %s: an auth token needs TLS (https://) or a loopback address", serverURL)
+		}
+		base = append(base, grpc.WithPerRPCCredentials(bearerCreds{opts.AuthToken}))
+	}
+	conn, err := grpc.NewClient(target, append(base, dialOpts...)...)
 	if err != nil {
 		return nil, nil, fmt.Errorf("connecting to %s: %w", target, err)
 	}
 	return v1alpha1.NewAXClient(conn), conn, nil
+}
+
+// bearerCreds adds "Bearer <token>" to every call. It does not require
+// transport security itself: Dial allows plaintext only to a loopback address.
+type bearerCreds struct{ token string }
+
+func (b bearerCreds) GetRequestMetadata(context.Context, ...string) (map[string]string, error) {
+	return map[string]string{"authorization": "Bearer " + b.token}, nil
+}
+
+func (bearerCreds) RequireTransportSecurity() bool { return false }
+
+// isLoopbackTarget reports whether a host:port target names localhost or a
+// loopback IP. A target it cannot parse is not loopback.
+func isLoopbackTarget(target string) bool {
+	host, _, err := net.SplitHostPort(target)
+	if err != nil {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // Context is a context defined in the user's kubeconfig files.

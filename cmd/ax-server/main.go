@@ -114,6 +114,12 @@ func main() {
 		os.Exit(1)
 	}
 
+	authToken, err := resolveAuthToken(os.Getenv("AX_AUTH_TOKEN"))
+	if err != nil {
+		slog.Error("invalid AX_AUTH_TOKEN", "error", err)
+		os.Exit(1)
+	}
+
 	tlsConfig, err := newTLSConfig(tlsCertFile, tlsKeyFile)
 	if err != nil {
 		slog.Error("invalid TLS flags", "error", err)
@@ -184,6 +190,7 @@ func main() {
 		WorkspaceManager:     workspaces,
 		MaxTaskCPUMillicores: maxCPUMillicores,
 		MaxTaskMemoryBytes:   maxMemoryBytes,
+		AuthToken:            authToken,
 	})
 
 	httpServer := &http.Server{
@@ -279,6 +286,23 @@ func parseTaskCaps(cpu, memory string) (cpuMillicores, memoryBytes int64, err er
 		}
 	}
 	return cpuMillicores, memoryBytes, nil
+}
+
+// minAuthTokenLen is the shortest AX_AUTH_TOKEN the server accepts.
+const minAuthTokenLen = 32
+
+// resolveAuthToken reads the AX_AUTH_TOKEN value. An empty value turns caller
+// authentication off. Any other value is trimmed and must then hold at least
+// minAuthTokenLen bytes. If it does not, the server must not start.
+func resolveAuthToken(value string) (string, error) {
+	if value == "" {
+		return "", nil
+	}
+	token := strings.TrimSpace(value)
+	if len(token) < minAuthTokenLen {
+		return "", fmt.Errorf("must hold at least %d bytes after trimming whitespace", minAuthTokenLen)
+	}
+	return token, nil
 }
 
 // validateRouterURL checks that the router URL is an http:// or https:// URL,

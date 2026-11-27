@@ -298,7 +298,10 @@ Flags:
   --context string            Kubernetes context (defaults to active kubectx / current-context)
   --server string             AX API server address (default: auto-detected from kube context or $AX_SERVER)
                               https:// uses TLS; $AX_CA_FILE adds a CA to the system roots
-  --trace                     Trace this command and print its trace ID to stderr`)
+  --trace                     Trace this command and print its trace ID to stderr
+
+Environment:
+  AX_AUTH_TOKEN               Bearer token for ax-server; sent only over TLS or to a loopback address`)
 }
 
 // ensureKubectl finds kubectl for the CLI's port-forwards, downloading the
@@ -308,7 +311,8 @@ func ensureKubectl(ctx context.Context) (string, error) {
 }
 
 func getAXClient(serverURL string) (v1alpha1.AXClient, *grpc.ClientConn, error) {
-	return client.Dial(context.Background(), client.Options{ServerURL: serverURL}, activeTrace.dialOptions()...)
+	opts := client.Options{ServerURL: serverURL, AuthToken: strings.TrimSpace(os.Getenv("AX_AUTH_TOKEN"))}
+	return client.Dial(context.Background(), opts, activeTrace.dialOptions()...)
 }
 
 // A nil atespace leaves manifest atespaces unchanged and lets the server default missing ones.

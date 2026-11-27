@@ -19,6 +19,30 @@ import (
 	"testing"
 )
 
+func TestResolveAuthToken(t *testing.T) {
+	const token = "test-auth-token-for-unit-tests-only"
+	for _, tt := range []struct {
+		name    string
+		value   string
+		want    string
+		wantErr bool
+	}{
+		{name: "unset is off", value: ""},
+		{name: "long enough is on", value: token, want: token},
+		{name: "value is trimmed", value: "  " + token + "\n", want: token},
+		{name: "short is an error", value: token[:minAuthTokenLen-1], wantErr: true},
+		{name: "whitespace only is an error", value: "   \n", wantErr: true},
+		{name: "short after trim is an error", value: " " + token[:minAuthTokenLen-1] + " ", wantErr: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := resolveAuthToken(tt.value)
+			if (err != nil) != tt.wantErr || got != tt.want {
+				t.Fatalf("resolveAuthToken(%q) = %q, %v; want %q, error %v", tt.value, got, err, tt.want, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestValidateRunnerVolumeImage(t *testing.T) {
 	for _, tt := range []struct {
 		image   string

@@ -16,6 +16,7 @@ package server
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -36,6 +37,8 @@ import (
 	ateapipb "go.ate.dev/substrate/api/ateapi/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/emptypb"
@@ -57,6 +60,10 @@ type Options struct {
 	// default, turns the check off.
 	MaxTaskCPUMillicores int64
 	MaxTaskMemoryBytes   int64
+	// AuthToken is the bearer token every gRPC call must carry, as
+	// "authorization: Bearer <token>". Empty, the default, turns caller
+	// authentication off. /healthz is plain HTTP and stays open.
+	AuthToken string
 }
 
 // Server provides the gRPC API for AX.
@@ -72,6 +79,7 @@ type Server struct {
 	grpcServer *grpc.Server
 
 	maxTaskCPUMillicores, maxTaskMemoryBytes int64
+	authToken                                string
 }
 
 // NewServer creates a new AX API server.
@@ -104,12 +112,51 @@ func NewServer(s store.Store, taskManager *controller.TaskManager, opts ...Optio
 
 		maxTaskCPUMillicores: opt.MaxTaskCPUMillicores,
 		maxTaskMemoryBytes:   opt.MaxTaskMemoryBytes,
+		authToken:            opt.AuthToken,
 	}
-	srv.grpcServer = grpc.NewServer(grpc.StatsHandler(telemetry.ServerStatsHandler(func() map[string]grpc.ServiceInfo {
-		return srv.grpcServer.GetServiceInfo()
-	})))
+	srv.grpcServer = grpc.NewServer(
+		grpc.StatsHandler(telemetry.ServerStatsHandler(func() map[string]grpc.ServiceInfo {
+			return srv.grpcServer.GetServiceInfo()
+		})),
+		grpc.ChainUnaryInterceptor(srv.unaryAuth),
+		grpc.ChainStreamInterceptor(srv.streamAuth),
+	)
 	v1alpha1.RegisterAXServer(srv.grpcServer, srv)
 	return srv
+}
+
+// authorize lets a call pass only if it has exactly one authorization value
+// and that value is "Bearer " plus the configured token. It does nothing when
+// no token is configured.
+func (s *Server) authorize(ctx context.Context, method string) error {
+	if s.authToken == "" {
+		return nil
+	}
+	md, _ := metadata.FromIncomingContext(ctx)
+	if v := md.Get("authorization"); len(v) == 1 &&
+		subtle.ConstantTimeCompare([]byte(v[0]), []byte("Bearer "+s.authToken)) == 1 {
+		return nil
+	}
+	var peerAddr string
+	if p, ok := peer.FromContext(ctx); ok {
+		peerAddr = p.Addr.String()
+	}
+	slog.Info("rejected unauthenticated call", "method", method, "peer", peerAddr)
+	return status.Error(codes.Unauthenticated, "missing or invalid credentials")
+}
+
+func (s *Server) unaryAuth(ctx context.Context, req any, info *grpc.UnaryServerInfo, next grpc.UnaryHandler) (any, error) {
+	if err := s.authorize(ctx, info.FullMethod); err != nil {
+		return nil, err
+	}
+	return next(ctx, req)
+}
+
+func (s *Server) streamAuth(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, next grpc.StreamHandler) error {
+	if err := s.authorize(ss.Context(), info.FullMethod); err != nil {
+		return err
+	}
+	return next(srv, ss)
 }
 
 // GRPCServer returns the underlying gRPC server instance.
