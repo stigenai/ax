@@ -11,14 +11,22 @@ go_library(
         "@org_golang_google_grpc//credentials",
         "@org_golang_google_grpc//credentials/insecure",
         "@org_golang_google_grpc//metadata",
+        "@org_golang_google_protobuf//types/known/durationpb",
     ],
 )
 
 go_test(
     name = "guest_test",
-    srcs = ["client_test.go"],
+    srcs = [
+        "client_stdio_test.go",
+        "client_test.go",
+    ],
+    embed = [":guest"],
     deps = [
-        ":guest",
         "@com_github_agent_substrate_env//guest",
+        "@com_github_agent_substrate_env//proto/ateenv/v1alpha",
+        "@org_golang_google_grpc//:grpc",
+        "@org_golang_google_grpc//codes",
+        "@org_golang_google_grpc//status",
     ],
 )

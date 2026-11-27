@@ -65,3 +65,6 @@ tool (
 	google.golang.org/grpc/cmd/protoc-gen-go-grpc
 	google.golang.org/protobuf/cmd/protoc-gen-go
 )
+
+// live_output (stigenai/env#1), not yet upstream: ax stdio needs it for long sessions.
+replace github.com/agent-substrate/env => github.com/stigenai/env v0.0.11-0.20261109021355-45314510bec4

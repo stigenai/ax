@@ -25,6 +25,7 @@ import (
 	"os/signal"
 	"sort"
 	"strings"
+	"syscall"
 	"text/tabwriter"
 	"time"
 
@@ -110,7 +111,7 @@ func main() {
 			os.Exit(1)
 		}
 		return
-	case "ssh":
+	case "ssh", "stdio":
 		// Answer help and usage errors before resolving the server, which may
 		// start a port-forward to the cluster.
 		if _, _, help, err := parseSSHArgs(cleanArgs); help || err != nil {
@@ -170,7 +171,9 @@ func main() {
 	case "delete":
 		err = runDelete(serverURL, atespace, cleanArgs)
 	case "ssh":
-		err = runSSH(serverURL, atespace, kubeContext, axNamespace, cleanArgs)
+		err = runSSH(serverURL, atespace, kubeContext, axNamespace, cleanArgs, false)
+	case "stdio":
+		err = runSSH(serverURL, atespace, kubeContext, axNamespace, cleanArgs, true)
 	default:
 		activeTrace.end(fmt.Errorf("unknown command %q", cmd))
 		fmt.Fprintf(os.Stderr, "unknown command: %s\n", cmd)
@@ -272,6 +275,7 @@ Available Commands:
   describe gateway <name> Show detailed information about a gateway
   describe model <name>   Show detailed information about a model
   ssh <task-name> [-- cmd] Run a command or shell inside the running task container
+  stdio <task-name> -- cmd Run cmd with local stdin/stdout attached (e.g. ssh ProxyCommand ... -- sshd -i)
                           (Ctrl-C is forwarded; press it twice quickly, or Ctrl-\, to exit locally)
   suspend task <name>     Suspend execution of a task and checkpoint state
   resume task <name>      Resume execution of a suspended task
@@ -1087,10 +1091,20 @@ func parseSSHArgs(args []string) (taskName string, command []string, help bool, 
 	return taskName, command, false, nil
 }
 
-func runSSH(serverURL, atespace, kubeContext, axNamespace string, args []string) error {
+// stdioTimeout replaces the 1h guest watchdog for ax stdio, so a long ssh
+// session is not killed. ponytail: fixed value, add a flag if 30 days is wrong.
+const stdioTimeout = 30 * 24 * time.Hour
+
+// runSSH runs a command in the task container. With stdio set (ax stdio) the
+// command needs an explicit argument, runs under a 30-day guest timeout with
+// live_output, and a signal stops the remote command and ends ax quietly.
+func runSSH(serverURL, atespace, kubeContext, axNamespace string, args []string, stdio bool) error {
 	taskName, cmdToRun, _, err := parseSSHArgs(args)
 	if err != nil {
 		return err
+	}
+	if stdio && len(strings.TrimPrefix(strings.Join(args[1:], " "), "--")) == 0 {
+		return errors.New("usage: ax stdio <task-name> -- command...")
 	}
 
 	client, conn, err := getAXClient(serverURL)
@@ -1137,31 +1151,39 @@ func runSSH(serverURL, atespace, kubeContext, axNamespace string, args []string)
 	}
 	defer guestClient.Close()
 
-	// A bare shell on a terminal runs with -i, so it prompts and Ctrl-C stops the
-	// command it is running rather than the shell itself.
-	if stdinIsTerminal() && len(cmdToRun) == 1 && cmdToRun[0] == "/bin/sh" {
-		cmdToRun = []string{"/bin/sh", "-i"}
+	opts := guest.ExecOptions{Command: cmdToRun, Stdin: os.Stdin, Stdout: os.Stdout, Stderr: os.Stderr}
+	execCtx := context.Background()
+	if stdio {
+		// ssh sends SIGHUP to its ProxyCommand on exit; Exec then stops the remote process.
+		var stop context.CancelFunc
+		execCtx, stop = signal.NotifyContext(execCtx, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM)
+		defer stop()
+		opts.Timeout = stdioTimeout
+		opts.LiveOutput = true // A long ssh session outgrows the 10 MiB spool cap.
+	} else {
+		// A bare shell on a terminal runs with -i, so it prompts and Ctrl-C stops the
+		// command it is running rather than the shell itself.
+		if stdinIsTerminal() && len(cmdToRun) == 1 && cmdToRun[0] == "/bin/sh" {
+			opts.Command = []string{"/bin/sh", "-i"}
+		}
+
+		// Ctrl-C is passed on to the remote command instead of ending ax ssh. Pressing
+		// it twice in quick succession gives up on the session and exits locally, so
+		// a hung connection never traps the terminal.
+		rawSigs := make(chan os.Signal, 4)
+		signal.Notify(rawSigs, os.Interrupt)
+		defer signal.Stop(rawSigs)
+		opts.Signals = escalateInterrupts(rawSigs, interruptExitWindow, func() {
+			fmt.Fprintln(os.Stderr, "\nax ssh: interrupted twice, exiting")
+			activeTrace.endWithin(errors.New("ax ssh: interrupted twice"), interruptFlushTimeout)
+			os.Exit(130)
+		})
 	}
 
-	// Ctrl-C is passed on to the remote command instead of ending ax ssh. Pressing
-	// it twice in quick succession gives up on the session and exits locally, so
-	// a hung connection never traps the terminal.
-	rawSigs := make(chan os.Signal, 4)
-	signal.Notify(rawSigs, os.Interrupt)
-	defer signal.Stop(rawSigs)
-	sigs := escalateInterrupts(rawSigs, interruptExitWindow, func() {
-		fmt.Fprintln(os.Stderr, "\nax ssh: interrupted twice, exiting")
-		activeTrace.endWithin(errors.New("ax ssh: interrupted twice"), interruptFlushTimeout)
-		os.Exit(130)
-	})
-
-	exitCode, err := guestClient.Exec(context.Background(), guest.ExecOptions{
-		Command: cmdToRun,
-		Stdin:   os.Stdin,
-		Stdout:  os.Stdout,
-		Stderr:  os.Stderr,
-		Signals: sigs,
-	})
+	exitCode, err := guestClient.Exec(execCtx, opts)
+	if err != nil && stdio && execCtx.Err() != nil {
+		return nil // A signal ended it, e.g. ssh closed its ProxyCommand.
+	}
 	if err != nil {
 		return err
 	}

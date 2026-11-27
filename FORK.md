@@ -265,3 +265,31 @@ Entries are in stack order, the same order as the commits.
 **Reason:** stigenai task image in images/lap-pi-task; new files and a workflow only.
 
 **Removal condition:** Remove the carry when stigenai stops using it, or when upstream adds the same behavior.
+
+## ax stdio: local stdin, live_output, stream-reset resume
+
+**Bead:** `ax-eah` · **Branch:** `stigenai/deploy` · **Upstream status:** `fork-only`
+
+**Upstream files edited:**
+
+- `cmd/ax/main.go`
+- `go.mod`
+- `go.sum`
+- `internal/guest/client.go`
+
+**New files:**
+
+- `internal/guest/client_stdio_test.go`
+
+**Tests:**
+
+- `internal/guest/client_stdio_test.go`
+
+**Notes:**
+
+- Upstream #413 forwards stdin and Ctrl-C in `ax ssh`. This carry keeps that and adds the `ax stdio` command, a 30-day guest timeout, `live_output`, resume of the output stream after the 300 s router reset, rotation of idle stdin, and a stop of the remote process on SIGHUP.
+- `go.mod` replaces `github.com/agent-substrate/env` with `github.com/stigenai/env` at `45314510bec4` (`live_output`, stigenai/env#1). Upstream env has no `live_output`.
+
+**Reason:** Factory workers use `ax stdio` as an ssh ProxyCommand for long sessions.
+
+**Removal condition:** Remove the carry when stigenai stops using it, or when upstream adds the same behavior.
