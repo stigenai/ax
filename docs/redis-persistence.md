@@ -30,7 +30,7 @@ One class must show `(default)`.
 
 The migration operator keeps the rollback copy. The operator is the person who runs the migration. Keep the copy on persistent local storage outside the checkout. Do not use shared temporary storage (`/tmp`) or a path with automatic cleanup.
 
-Make one new private directory under your home. Run all local steps in it. Start at the root of the checkout. Run `umask 077` before the first capture.
+Start at the root of the checkout. Make one new private directory under your home. Run all local steps in it. Run `umask 077` before the first capture.
 
 ```bash
 umask 077
@@ -48,7 +48,11 @@ The `test -O` and `ls -ld` checks make sure that you own the directory and that 
 
 Use this one shell for all steps. The steps use relative paths in `WORK`. Step 3 needs `REDIS_MANIFEST`. Cleanup needs `WORK`.
 
-If you lose the shell, stop. Do not go on. Start again from the checkout root with a new private directory, before step 1.
+If you lose the shell before the first capture or before step 1, start again from the checkout root. Make a new private directory.
+
+If you lose the shell after step 1, stop. Do not repeat step 1. Do not make a new directory. Keep the original directory. It holds the dump and the baseline.
+
+Seed, rollback and cleanup need the dump and the baseline. Ask the owner how to go on.
 
 The `kubectl exec` command does not use the local umask. Set the mode of each directory in the pod yourself.
 
