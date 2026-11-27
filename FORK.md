@@ -138,3 +138,31 @@ Entries are in stack order, the same order as the commits.
 **Reason:** The fork rules, the carry list and the weekly trial rebase exist only for the fork.
 
 **Removal condition:** Remove the carry when stigenai stops using it, or when upstream adds the same behavior.
+
+## Beads and agent tool files
+
+**Bead:** `ax-not` · **Branch:** `stigenai/deploy` · **Upstream status:** `fork-only`
+
+**Upstream files edited:**
+
+- `.gitignore`
+
+**New files:**
+
+- `CLAUDE.md` (imports the upstream `AGENTS.md`, then adds the beads block)
+- `skills/beads/SKILL.md` (`.agents/skills` is the upstream link to `skills/`)
+- `skills/beads/agents/openai.yaml`
+- `.beads/` (4 files)
+- `.claude/settings.json`
+- `.codex/config.toml`
+- `.codex/hooks.json`
+- `.cursor/hooks.json`
+- `.cursor/rules/beads.mdc`
+
+**Tests:**
+
+- none
+
+**Reason:** The fork tracks work with bd; upstream does not. The fork does not edit the upstream `AGENTS.md`.
+
+**Removal condition:** Remove the carry when stigenai stops using it, or when upstream adds the same behavior.
