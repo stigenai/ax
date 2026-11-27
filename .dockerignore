@@ -14,3 +14,5 @@ bin/*
 ax
 ax-server
 ax-runner
+
+images/lap-pi-task/node_modules/

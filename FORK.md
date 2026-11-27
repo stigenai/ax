@@ -241,3 +241,27 @@ Entries are in stack order, the same order as the commits.
 **Reason:** The workflow guards the fork's deploy branch only.
 
 **Removal condition:** Remove the carry when stigenai stops using it, or when upstream adds the same behavior.
+
+## LAP Pi task image and turn server
+
+**Bead:** `ax-tzl` · **Branch:** `stigenai/deploy` · **Upstream status:** `fork-only`
+
+**Upstream files edited:**
+
+- `.dockerignore`
+
+**New files:**
+
+- `.github/workflows/lap-pi-task.yml`
+- `images/lap-pi-task/` (8 files)
+
+**Tests:**
+
+- `images/lap-pi-task/pi.test.mjs`
+- `images/lap-pi-task/server.test.mjs`
+
+**Notes:** The image builds `FROM` the upstream `ax-runner:v0.4.0-rc.2` image, pinned by digest. Before v0.4.0 it used `ax-task-runner:v0.3.1-stigenai.1`. Test it against a v0.4.0 `ax-server` before the cutover (`ax-mvu.4`).
+
+**Reason:** stigenai task image in images/lap-pi-task; new files and a workflow only.
+
+**Removal condition:** Remove the carry when stigenai stops using it, or when upstream adds the same behavior.
