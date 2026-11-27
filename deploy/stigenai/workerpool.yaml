@@ -1,0 +1,200 @@
+# Warm workers for ordinary AX tasks. ax-server gives a task with no
+# spec.profile.workerLabels the labels workload=ax (AX_DEFAULT_WORKER_LABELS),
+# and Substrate matches them against the metadata.labels of this pool.
+# The worker image must match the installed Substrate version.
+#
+# PHASE-C: two values come from the Substrate 1.0 install (stigenai/substrate
+# v1.0.1-stigenai.1, nix-fleet-hosts, bead ax-gh9.1). Fill them in before an
+# apply:
+#   - spec.workerImage: the ateworker-gvisor image digest.
+#   - spec.template.nodeSelector: the label that marks the worker nodes. The
+#     1.0 install does not stamp ate.dev/substrate-version; the nodes keep the
+#     value from ate-setup until Phase C sets it again.
+apiVersion: ate.dev/v1
+kind: WorkerPool
+metadata:
+  name: ax
+  namespace: ax-system
+  labels:
+    workload: ax
+spec:
+  # 28 workers hold 56 tasks at 2 tasks per worker (see below).
+  #
+  # On 2026-10-20, 6 workers held 12 tasks, and 11 more tasks waited for
+  # hours with WaitingForCapacity.
+  #
+  # gtr-150, gtr-151 and gtr-152 hold 9 workers.
+  # On 2026-11-03 the owner asked for 30 workers. gtr-151 had about 13.9Gi
+  # and gtr-152 about 10.6Gi of memory not requested, so each takes one more
+  # worker (8Gi request).
+  # With 30 live, gtr-150 still had about 14.8Gi and 9.7 CPU not requested, so
+  # it takes a 31st worker. That is the most the labeled nodes hold: gtr-151
+  # and gtr-152 then had 5.9Gi and 2.6Gi left, and hs-2 has 1.6 CPU left.
+  # On 2026-10-22, hs-2 got the substrate label. It has 40 CPU and about
+  # 247Gi allocatable, and it holds the other 19 workers. CPU sets this
+  # limit: 19 requests of 2 CPU plus 2.35 CPU of other pods.
+  #
+  # On 2026-11-07 the owner asked for a little room for the ax-microvm pool
+  # (Nix builds). Two hs-2 workers go: 29 workers hold 58 tasks (24 ran then),
+  # and hs-2 gets 4 CPU back for microvm workers (1 CPU, 16Gi each).
+  #
+  # On 2026-11-14 hs-2 went offline (with the DGX Sparks). Its 16 workers go:
+  # gtr-150, gtr-151 and gtr-152 hold the other 13, and their memory is about
+  # 90% requested. To bring hs-2 back, set replicas to 29 again.
+  #
+  # On 2026-11-25 one worker moves to WorkerPool sluis (nix-fleet-hosts
+  # flux/apps/overlays/nixfleet/ax-sluis): the factory filled all 13, and sluis
+  # reviews waited 20 min and failed. The nodes have no memory for a 14th.
+  # Tasks with no spec.workerLabels get workload=ax from ax-server
+  # (AX_DEFAULT_WORKER_LABELS), so they stay here. With hs-2 back: 28 here.
+  #
+  # On 2026-11-26 one more worker moves to WorkerPool factory-manager
+  # (nix-fleet-hosts flux/apps/overlays/nixfleet/ax-factory-manager): two 8Gi
+  # actors killed the worker that held the manager, and a 12Gi manager then
+  # waited with all 12 full. With hs-2 back: 27 here.
+  #
+  # The comments below still describe the 6-worker sizing.
+  replicas: 11
+  # Substrate 1.0 requires exactly one sandbox class. gvisor is the class of
+  # the old pool. The microvm pool is a separate WorkerPool (see the end).
+  sandboxClasses:
+    - name: gvisor
+  workerImage: ghcr.io/stigenai/substrate/ateworker-gvisor:v1.0.1-stigenai.1@sha256:PHASE-C
+  template:
+    nodeSelector:
+      ate.dev/substrate-version: PHASE-C
+    # Each pod runs one ateom container. The worker shares its memory limit
+    # between all tasks placed on it. One OOM kills every task on that
+    # worker.
+    #
+    # A single kubectl top sample on 2026-10-15 measured one task's memory
+    # at about 2200Mi. This is a point-in-time delta. It is not a peak or a
+    # load test. An idle worker used about 400Mi.
+    #
+    # Six workers at 16Gi (16384Mi) hold 7 tasks per worker. The calculation
+    # is 7*2200+400=15800Mi. The simulation places 20 tasks at random across
+    # the workers. It runs 200,000 trials. Each worker's capacity is set by
+    # floor((limit-400Mi)/2200Mi).
+    #
+    # The simulation gives this probability, P(at least one of the N workers
+    # exceeds its limit), for each option:
+    #   - 4 workers at 20Gi: 5.55%
+    #   - 8 workers at 14Gi: 6.67%
+    #   - 6 workers at 16Gi: 6.74%
+    #   - 5 workers at 16Gi: 16.0%
+    #   - 8 workers at 12Gi: 24.2%
+    #   - 6 workers at 12Gi: 55.4%
+    #
+    # 6 workers at 16Gi is not the lowest-risk option. It accepts a little
+    # more risk. The risk is 6.74% here, vs 5.55% for 4x20Gi and 6.67% for
+    # 8x14Gi.
+    #
+    # In return, it gives three benefits:
+    #   - A smaller blast radius per OOM: 1/6 of total capacity is lost,
+    #     vs 1/4 for 4x20Gi.
+    #   - A smaller per-pod memory request: 8Gi. The scheduler fits it more
+    #     easily than the bigger 4x20Gi pods.
+    #   - A smaller total limit across all workers: 96Gi, vs 112Gi for 8x14Gi.
+    #
+    # See ax-ci8 for the full placement model, the node headroom check and
+    # the rejected options.
+    #
+    # The 8Gi (8192Mi) request equals the average load per worker at 20
+    # tasks. The calculation is 20/6*2200+400=7733Mi. This lets the scheduler
+    # place workers by their real need.
+    #
+    # ax-768: the sizing above bounds the risk of random placement. That
+    # was the worst case this pool ever saw.
+    #
+    # Placement is no longer random. For each task, Substrate books a specified
+    # quantity against the reported memory limit of its worker.
+    # On v0.4.0 the caller sets this quantity in
+    # spec.profile.resources.limits.memory (8Gi). A task with no memory gets
+    # the upstream default, 512Mi. (Before v0.4.0, AX_DEFAULT_TASK_MEMORY set
+    # it.)
+    #
+    # ax-9qu increased this quantity from 4Gi to 8Gi. A Claude Code session
+    # needs more than 4Gi. A Go or Node build also needs more than 4Gi.
+    #
+    # At this time, a 16Gi (16384Mi) worker accepts at most 2 tasks.
+    # 2*8192Mi=16384Mi equals the worker limit exactly. 3*8192Mi=24576Mi is
+    # more than 16384Mi.
+    #
+    # 6 workers accept 12 tasks in total. A 13th task on a full pool waits.
+    # Its state is QUEUED, with reason WaitingForCapacity (ax-16h). It is not
+    # put on a full worker.
+    #
+    # This same booked quantity is also the hard cgroup memory cap of the task
+    # (ax-768). ax-j8u tells Substrate to divide booking from cap.
+    #
+    # 2*8192Mi leaves no margin inside the 16384Mi pod limit for ateom's own
+    # overhead (about 400Mi). The earlier 7680Mi default left that margin;
+    # 8Gi does not. So 2 tasks, each already at its own 8Gi cap, can still
+    # push the pod itself to its limit. The person accepted this risk when
+    # setting the live value. This change does not fix it.
+    #
+    # ax-9gp: AX_MAX_TASK_MEMORY is set in
+    # deploy/stigenai/kustomization.yaml, on ax-server. It must equal this
+    # limits.memory value.
+    # CreateTask refuses a task that asks for more.
+    # It does not wait forever for a worker that can never fit it.
+    #
+    # ax-6cj: AX_MAX_TASK_CPU is the cpu twin of AX_MAX_TASK_MEMORY above.
+    # It is set the same way. It must equal this limits.cpu value (6).
+    #
+    # ax-1iw: The cpu request of 500m and the limit of 4 throttled the workers.
+    # The workers ran 2 tasks at once.
+    #
+    # The script deploy/stigenai/measure-workerpool-cpu.sh reads each pod's CFS
+    # throttle ratio from cadvisor.
+    # The throttle ratio is the share of CPU scheduling periods that the kernel
+    # throttled.
+    # It counts since each pod's last start.
+    #
+    # On 2026-10-16, the busiest worker ran 2 booked tasks.
+    # 5 of 6 pods were at or above 5%: 3.1-21.4%.
+    # kubectl top also read one pod at 3324-3998m of its 4000m limit.
+    # The 6 samples were 15s apart.
+    # This shows sustained near-limit use, not a one-off spike.
+    #
+    # The density cap does not change here. The cap is 2 tasks/worker, from
+    # 8Gi tasks on a 16Gi worker.
+    # Only the cpu request and limit change.
+    #
+    # The limit of 6 gives 3 cores per task at 2 tasks.
+    # The ax-ci8 measurement is about 2042m per task.
+    # The limit also leaves room for a burst.
+    #
+    # The request of 2 gives 1 core per booked task.
+    # This is closer to the observed sustained use (357-3998m) than the old
+    # 500m request.
+    # The old request was 6-8x under that use.
+    #
+    # Pool sums: requests go from 3 cores (6 x 500m) to 12 cores (6 x 2).
+    # Limits go from 24 cores (6 x 4) to 36 cores (6 x 6).
+    #
+    # This change adds to the cluster-wide cpu overcommit. See ax-052.
+    # This change does not close it.
+    #
+    # Each node has 2 workers. Requests rise by 3 cores per node.
+    # Limits rise by 4 cores per node.
+    #
+    # gtr-150 is the busiest node. Its requests go from 15600m to 18600m.
+    # The requested 18600m is 58% of its 32 cores.
+    #
+    # See ax-1iw for the throttle data, the rejected options and the rollout note.
+    # The rejected options are:
+    #   - no cpu limit
+    #   - request-only
+    #   - more replicas
+    #   - spread placement, filed as ax-ok6
+    #
+    # The rollout note: any resources change restarts every worker.
+    resources:
+      limits:
+        cpu: "6"
+        memory: 16Gi
+      requests:
+        cpu: "2"
+        memory: 8Gi
+# The microvm WorkerPool and SandboxConfig live in nix-fleet-hosts: flux/apps/overlays/nixfleet/ax-microvm/. Flux ax-workerpool can only patch WorkerPool ax.

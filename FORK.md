@@ -492,3 +492,28 @@ Entries are in stack order, the same order as the commits.
 **Reason:** A full pool must not look like a hard failure. Before this carry, it gave `ActorResumeFailed` and gRPC `Internal`, and Fabriek marked good work failed.
 
 **Removal condition:** Remove the carry when upstream merges an equal change.
+
+## WorkerPool ax and its measure scripts
+
+**Bead:** `ax-rrr` · **Branch:** `stigenai/deploy` · **Upstream status:** `fork-only`
+
+**Upstream files edited:** none.
+
+**New files:**
+
+- `deploy/stigenai/workerpool.yaml`
+- `deploy/stigenai/measure-workerpool.sh`
+- `deploy/stigenai/measure-workerpool-cpu.sh`
+
+**Tests:** none. Validate the manifest with `kubectl apply --dry-run=server -f deploy/stigenai/workerpool.yaml` on the Substrate 1.0 cluster.
+
+**Notes:**
+
+- The pool is on `ate.dev/v1` with `sandboxClasses: [{name: gvisor}]`. The worker binary is `ateworker-gvisor`.
+- Substrate matches a template `worker_selector` against the pool `metadata.labels` (`workload: ax`).
+- `spec.workerImage` and the `nodeSelector` value come from the Substrate 1.0 install. The file marks them `PHASE-C` until then.
+- The other pools (`sluis`, `factory-manager`, `ax-microvm`) are in `nix-fleet-hosts`.
+
+**Reason:** The pool size and limits are stigenai fleet sizing. The comments in the file keep the sizing history.
+
+**Removal condition:** none. It is fleet config.
