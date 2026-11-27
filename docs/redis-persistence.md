@@ -28,16 +28,19 @@ One class must show `(default)`.
 
 ## Private work directory
 
-Make one private directory outside the checkout. Run all local steps in it. Run `umask 077` in each new shell.
+The migration operator keeps the rollback copy. The operator is the person who runs the migration. Keep the copy on persistent local storage outside the checkout. Do not use shared temporary storage (`/tmp`) or a path with automatic cleanup.
+
+Make one new private directory under your home. Run all local steps in it. Run `umask 077` in each new shell before the first capture.
 
 ```bash
 umask 077
-WORK=$(mktemp -d "${TMPDIR:-/tmp}/ax-redis-migration.XXXXXX")
-cd "$WORK"
-stat -c %a "$WORK"
+WORK="$HOME/ax-redis-migration.$(date +%Y%m%d%H%M%S).$$"
+mkdir -m 700 "$WORK" || exit 1
+test "$(stat -c '%u %a' "$WORK")" = "$(id -u) 700" || exit 1
+cd "$WORK" || exit 1
 ```
 
-`mktemp -d` makes the directory with mode 700. The `stat` command must print `700`. The `kubectl exec` command does not use the local umask. Set the mode of each directory in the pod yourself.
+If a command fails, stop. Do not start a capture. The `stat` check makes sure that you own the directory and that its mode is 700. The `kubectl exec` command does not use the local umask. Set the mode of each directory in the pod yourself.
 
 ## Task inventory
 
@@ -69,7 +72,7 @@ A plain apply of the new manifest starts Redis with 0 keys. Redis with `--append
 
 2. Record the baseline after the writers are gone: the task inventory (see "Task inventory") and `DBSIZE`. Then save the data and keep the file. It is the rollback copy.
 
-   The file holds the full database. It can contain tokens. Run this step in the private work directory. Its `ls -l` must show mode `-rw-------`.
+   The file holds the full database. It can contain tokens. Run this step in the private work directory. For the RDB file, `ls -l` must show `-rw-------`.
 
    ```bash
    kubectl --context gtr -n ax-system exec deploy/ax-redis -- redis-cli SAVE
@@ -132,7 +135,24 @@ A plain apply of the new manifest starts Redis with 0 keys. Redis with `--append
 
    Wait until Redis answers PING, then record the task inventory again. It must equal the inventory of step 2. Run `ax -a <atespace> get task <name>` for the 3 tasks that you kept before step 1. Each command must succeed.
 
-Remove the private work directory with each local file in it (`ax-redis-before.rdb`, the inventory files and the saved `ax get task` output) when the owner accepts the migration. Leave the directory, then run `rm -r "$WORK"` and `ls -d "$WORK"`. The `ls` must fail with "No such file".
+7. After the migration checks pass, follow [Local backup cleanup](#local-backup-cleanup).
+
+## Local backup cleanup
+
+Keep the private work directory and its files. This includes `ax-redis-before.rdb`, the inventory files and the saved `ax get task` output. Before the writers resume, keep the copy available for rollback. After the writers resume, fix forward (see "Rollback").
+
+If a check fails or the owner has not accepted the outcome, keep the files. After the migration or rollback checks pass and the owner accepts that outcome, the migration operator must do these steps.
+
+1. In the private work directory, remove the dump, each inventory file and each saved task output file by name.
+2. Leave the private work directory.
+3. Remove the empty directory. If `rmdir` fails, check which files remain before you remove them.
+4. Verify that the directory is absent. The `test` command must exit 0.
+
+   ```bash
+   cd "$WORK/.." &&
+     rmdir -- "$WORK" &&
+     test ! -e "$WORK"
+   ```
 
 ## Restart check
 
@@ -193,6 +213,7 @@ Use this procedure only before the writers resume.
 4. Wait until Redis answers PING. Check `DBSIZE` and the task inventory against the baseline of Migration step 2. Scale the writers back to 1. Wait for the rollout.
 5. Run `ax -a <atespace> get task <name>` for 3 tasks. Each command must succeed.
 6. Remove `/tmp/seed` from the pod (Migration step 4). Delete the claim only after steps 4 and 5 pass: `kubectl --context gtr -n ax-system delete pvc ax-redis-data`.
+7. After the rollback checks pass, follow [Local backup cleanup](#local-backup-cleanup).
 
 ### Do not apply the old manifest after the writers resume
 
