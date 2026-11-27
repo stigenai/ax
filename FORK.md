@@ -360,3 +360,25 @@ Entries are in stack order, the same order as the commits.
 **Reason:** Upstream `client.Dial` removes the scheme and dials plaintext, so the CLI cannot reach an ax-server behind TLS.
 
 **Removal condition:** Remove the carry when upstream merges an equal change.
+
+## ax-server TLS listener with cert reload, --plain-addr
+
+**Bead:** `ax-bo9` · **Branch:** `stigenai/deploy` · **Upstream status:** `upstream-candidate`
+
+**Upstream files edited:**
+
+- `cmd/ax-server/main.go`
+
+**New files:**
+
+- `cmd/ax-server/tls.go`
+
+**Tests:**
+
+- `cmd/ax-server/tls_test.go`
+
+**Notes:** `--tls-cert-file` and `--tls-key-file` serve `--addr` with TLS, and the files reload when they change. `--plain-addr` adds a plaintext listener for probes and the ax tunnel. All are off by default. Donation branch: `donate/server-tls`.
+
+**Reason:** Upstream ax-server has a plaintext h2c listener only.
+
+**Removal condition:** Remove the carry when upstream merges an equal change.

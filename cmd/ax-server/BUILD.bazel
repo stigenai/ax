@@ -2,7 +2,10 @@ load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
 
 go_library(
     name = "ax-server_lib",
-    srcs = ["main.go"],
+    srcs = [
+        "main.go",
+        "tls.go",
+    ],
     importpath = "github.com/google/ax/cmd/ax-server",
     visibility = ["//visibility:private"],
     deps = [
@@ -26,6 +29,9 @@ go_binary(
 
 go_test(
     name = "ax-server_test",
-    srcs = ["main_test.go"],
+    srcs = [
+        "main_test.go",
+        "tls_test.go",
+    ],
     embed = [":ax-server_lib"],
 )
