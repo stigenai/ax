@@ -325,7 +325,11 @@ func (m *TaskManager) Resume(ctx context.Context, task *v1alpha1.Task, ws *v1alp
 	slog.Info("resuming actor on Substrate worker", "actor", actorName)
 	_, workerIP, err := m.client.ResumeActor(ctx, atespace, actorName)
 	if err != nil {
-		if substrate.IsTransientError(err) {
+		switch {
+		case status.Code(err) == codes.ResourceExhausted:
+			m.setNotReady(task, v1alpha1.ReasonWaitingForCapacity, err.Error(), now)
+			return fmt.Errorf("resuming actor: %w", err)
+		case substrate.IsTransientError(err):
 			m.setNotReady(task, v1alpha1.ReasonSubstrateUnavailable, err.Error(), now)
 			return fmt.Errorf("resuming actor: %w", err)
 		}

@@ -620,6 +620,9 @@ func TestIsTransientError(t *testing.T) {
 	if !IsTransientError(context.DeadlineExceeded) {
 		t.Error("expected context.DeadlineExceeded to be transient")
 	}
+	if !IsTransientError(status.Error(codes.ResourceExhausted, "no worker has room")) {
+		t.Error("expected codes.ResourceExhausted to be transient")
+	}
 	if IsTransientError(status.Error(codes.InvalidArgument, "bad spec")) {
 		t.Error("expected codes.InvalidArgument to be non-transient")
 	}

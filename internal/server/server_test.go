@@ -1584,6 +1584,42 @@ func TestServer_TransientSubstrateUnavailableRecovery(t *testing.T) {
 	}
 }
 
+// A full pool (Substrate returns ResourceExhausted) is a capacity wait, not a
+// failure: ResumeTask returns Unavailable and stores Queued with reason
+// WaitingForCapacity, and a later ResumeTask runs the task.
+func TestServer_ResumeTaskWaitsForCapacity(t *testing.T) {
+	st := memory.NewStore()
+	sub := substratetest.NewServer(t)
+	srv := server.NewServer(st, newTestTaskManager(sub))
+	ctx := context.Background()
+	if _, err := srv.CreateTask(ctx, &v1alpha1.CreateTaskRequest{Task: &v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{Name: "full-pool"},
+		Spec:     &v1alpha1.TaskSpec{Profile: &v1alpha1.Profile{Image: "alpine"}},
+	}}); err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+
+	sub.SetErrors(substratetest.Errors{ResumeActor: status.Error(codes.ResourceExhausted, "no worker has room for the actor")})
+	if _, err := srv.ResumeTask(ctx, &v1alpha1.ResumeTaskRequest{Name: "full-pool"}); status.Code(err) != codes.Unavailable {
+		t.Fatalf("ResumeTask on a full pool: got %v, want Unavailable", err)
+	}
+	got, err := srv.GetTask(ctx, &v1alpha1.GetTaskRequest{Name: "full-pool"})
+	if err != nil {
+		t.Fatalf("GetTask: %v", err)
+	}
+	if got.GetStatus().GetState() != v1alpha1.TaskState_TASK_STATE_QUEUED {
+		t.Errorf("state = %v, want QUEUED", got.GetStatus().GetState())
+	}
+	if c := readyCondition(got); c.GetReason() != v1alpha1.ReasonWaitingForCapacity {
+		t.Errorf("Ready condition = %v, want reason %s", c, v1alpha1.ReasonWaitingForCapacity)
+	}
+
+	sub.SetErrors(substratetest.Errors{})
+	if _, err := srv.ResumeTask(ctx, &v1alpha1.ResumeTaskRequest{Name: "full-pool"}); err != nil {
+		t.Fatalf("ResumeTask after a worker frees: %v", err)
+	}
+}
+
 // Resuming and reverting actors map to TASK_STATE_RESUMING and
 // TASK_STATE_REVERTING on read, and CreateTask must reject re-applying an
 // already-created task rather than running the create path and suspending the

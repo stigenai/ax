@@ -226,7 +226,8 @@ var (
 )
 
 // IsTransientError reports whether err represents a transient Substrate
-// control-plane unavailability or timeout rather than a permanent failure.
+// control-plane unavailability, timeout or lack of capacity (no worker has
+// room) rather than a permanent failure.
 func IsTransientError(err error) bool {
 	if err == nil {
 		return false
@@ -236,7 +237,7 @@ func IsTransientError(err error) bool {
 	}
 	if st, ok := status.FromError(err); ok {
 		switch st.Code() {
-		case codes.Unavailable, codes.DeadlineExceeded, codes.Aborted:
+		case codes.Unavailable, codes.DeadlineExceeded, codes.Aborted, codes.ResourceExhausted:
 			return true
 		}
 	}

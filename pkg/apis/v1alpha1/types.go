@@ -84,6 +84,9 @@ const (
 	ReasonGatewayBindingFailed = "GatewayBindingFailed"
 	// ReasonActorResumeFailed: Ready is False; the actor could not be resumed.
 	ReasonActorResumeFailed = "ActorResumeFailed"
+	// ReasonWaitingForCapacity: Ready is False with state Queued; no Agent
+	// Substrate worker had room to resume the actor. Resuming again can succeed.
+	ReasonWaitingForCapacity = "WaitingForCapacity"
 
 	// Actor lifecycle reasons reported on Ready when the actor is not running.
 	ReasonResuming       = "Resuming"

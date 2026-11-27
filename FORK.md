@@ -464,3 +464,31 @@ Entries are in stack order, the same order as the commits.
 **Reason:** Tasks must run only on the WorkerPool that is for them. For example, normal tasks must stay off the `sluis` pool.
 
 **Removal condition:** Remove the carry when upstream merges an equal change.
+
+## WaitingForCapacity when no worker has room
+
+**Bead:** `ax-16h` · **Branch:** `stigenai/deploy` · **Upstream status:** `upstream-candidate`
+
+**Upstream files edited:**
+
+- `internal/substrate/client.go`
+- `internal/controller/task.go`
+- `pkg/apis/v1alpha1/types.go`
+
+**Tests:**
+
+- `internal/substrate/client_test.go` (`TestIsTransientError`)
+- `internal/controller/task_test.go` (`TestTaskManager_TransientSubstrateUnavailable`)
+- `internal/server/server_test.go` (`TestServer_ResumeTaskWaitsForCapacity`)
+
+**Notes:**
+
+- Substrate 1.0 returns `ResourceExhausted` from `ResumeActor` when no worker has room.
+- `IsTransientError` now accepts `ResourceExhausted`. So `ResumeTask` stores state `Queued` and returns `Unavailable`, the same as for a Substrate outage. `Resume` sets the `Ready` reason `WaitingForCapacity`.
+- `IsTransientError` also runs in the template, atespace and workspace paths. A Substrate quota refusal there is now transient too, which is correct: it can clear later.
+- There is no server retry loop. The caller calls `ResumeTask` again. Fabriek reads the reason in `isCapacityWait`.
+- Donation branch: `donate/resume-capacity`.
+
+**Reason:** A full pool must not look like a hard failure. Before this carry, it gave `ActorResumeFailed` and gRPC `Internal`, and Fabriek marked good work failed.
+
+**Removal condition:** Remove the carry when upstream merges an equal change.

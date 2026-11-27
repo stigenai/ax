@@ -1513,6 +1513,19 @@ func TestTaskManager_TransientSubstrateUnavailable(t *testing.T) {
 		t.Errorf("expected actor 'transient-resume' resumed after recovery, got %v", mockSrv.resumedActors)
 	}
 
+	// A full pool (ResourceExhausted) is a transient capacity wait with its
+	// own reason.
+	mockSrv.resumeActorErr = status.Error(codes.ResourceExhausted, "no worker has room for the actor")
+	taskFull := &v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{Name: "full-pool"},
+		Spec:     &v1alpha1.TaskSpec{Profile: &v1alpha1.Profile{Image: "ghrc.io/my-org/my-image"}},
+	}
+	if err := manager.Resume(ctx, taskFull, nil, nil); !substrate.IsTransientError(err) {
+		t.Fatalf("Resume on a full pool: got %v, want a transient error", err)
+	}
+	assertCondition(t, taskFull, "Ready", "False", v1alpha1.ReasonWaitingForCapacity)
+	mockSrv.resumeActorErr = nil
+
 	// 4. A permanent error is recorded with its own reason.
 	mockSrv.createActorErr = status.Error(codes.InvalidArgument, "invalid actor specification")
 	task4 := &v1alpha1.Task{
