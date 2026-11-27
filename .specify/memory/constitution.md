@@ -10,11 +10,11 @@ Each spec, plan and task in this fork MUST obey these principles.
 
 **Branches:**
 
-- `main` MUST mirror `google/ax` `main`.
+- `stigenai/deploy` MUST be an upstream release tag plus a linear stack of fork commits. `FORK.md` gives the workflow.
 
-- `main` can also hold fork changes that upstream has accepted or will accept soon.
+- Each fork commit MUST hold one change and its tests. It MUST have the `Fork-Topic` and `Fork-Upstream` trailers. `hack/fork/fork.sh check` MUST pass.
 
-- `stigenai/deploy` holds the fork carry: all changes that upstream does not have.
+- `main` is the same as `google/ax` `main`. It holds only the fork files that GitHub reads from the default branch, for example the `upstream-sync` workflow.
 
 **Sync and wire formats:**
 
@@ -111,6 +111,7 @@ CLA. An agent error there is public and permanent.
 - Each entry MUST give the bead, the upstream files that the carry edits, the new files, the tests, the reason, the status and the removal condition.
 - A PR that adds, changes or drops carry MUST update `FORK.md` and the bead in the same PR.
 - A carry that edits upstream code MUST name at least one test in its entry. These tests MUST pass after each sync.
+- The `Fork-Topic` trailer of each commit MUST name the bead of its carry, for example `Fork-Topic: ax-cyt`. The `Fork-Upstream` trailer is `candidate` (bead `upstream-candidate`), `fork-only` or `test-only`. A `test-only` commit holds a test that checks upstream behavior that we need.
 
 **Rationale:** Without a ledger, carry stays in the fork after nobody needs it.
 
@@ -118,23 +119,22 @@ CLA. An agent error there is public and permanent.
 
 **Sync steps:**
 
-- The `upstream-sync` workflow on `main` merges `google/ax` `main` into `main` and `stigenai/deploy` each week, on the runner only. Then it runs the tests.
-- If the workflow fails, a human makes a sync bead from the job summary.
-- Do a real sync every two weeks, or more often.
-
-- Merge it into `main`, then into `stigenai/deploy`.
-
-- Do not rewrite published history on `main` or `stigenai/deploy`.
+- Rebase the stack onto each new upstream release tag with `hack/fork/fork.sh rebase <tag>`. Do not merge upstream into `stigenai/deploy`.
+- Do the rebase on a `stigenai/rebase-<tag>` branch. Open a PR to `stigenai/deploy` with the `git range-diff` output in its description.
+- After a human approves the PR, force-push the rebased head to `stigenai/deploy` with `--force-with-lease`. Then tag it `<tag>-stigenai.<n>`. Do not merge the PR. Only this step can rewrite `stigenai/deploy`.
+- After each rebase, commit `hack/fork/fork.sh export` to the `stigenai/patches` branch.
+- The `upstream-sync` workflow on `main` does a trial rebase each week onto the most recent upstream tag. It also runs the tests. It fails when the stack is not on that tag, or when the rebase or a test fails.
+- Fetch `google/ax` `main` with the release tags every two weeks, or more often. Merge `main` forward to `google/ax` `main`.
 
 **Conflicts and checks:**
 
-- The person who does the sync resolves the conflicts.
+- The person who does the rebase resolves the conflicts.
 
-- If a conflict is in fork carry, prefer the upstream code and reapply the carry on top of it.
+- If upstream already has the change, drop the commit with `git rebase --skip`. If its tests pass on the upstream code, keep them in a `test-only` commit.
 
-- If a carry conflicts on two syncs in sequence, examine it again. Then donate it, move it to new files, or drop it.
+- If a carry conflicts on two syncs in sequence, examine it again. Then send it upstream, move it to new files, or drop it.
 
-- After a sync, `make build` and `make test` MUST pass on both branches before a deploy.
+- After a rebase, `make build`, `make test` and `hack/fork/fork.sh check` MUST pass before a deploy.
 
 ## Development Workflow
 
@@ -180,4 +180,6 @@ Versions use semantic versioning. Use the version parts in this table:
 
 - Reviews of upstream branches MUST also check Principles III and IV.
 
-**Version**: 1.1.0 | **Ratified**: 2026-11-07 | **Last Amended**: 2026-11-26
+**Version**: 2.0.0 | **Ratified**: 2026-11-07 | **Last Amended**: 2026-11-26
+
+**2.0.0:** `stigenai/deploy` changes from a merged branch to a patch stack on an upstream release tag. This is the same change as `stigenai/substrate` 2.0.0. The old merged history stays until the `v0.4.0` stack (bead `ax-mvu`) replaces it. Until then, `hack/fork/fork.sh check` fails on the old commits.
