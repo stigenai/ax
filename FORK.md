@@ -515,6 +515,30 @@ Entries are in this order: upstream status, then the number of upstream files ed
 
 **Removal condition:** Remove the carry when stigenai stops using it, or when upstream adds the same behavior.
 
+## Task spec.guestDevices for microvm guests
+
+**Bead:** `substrate-any` · **Branch:** `stigenai/deploy` · **Upstream status:** `fork-only`
+
+**Upstream files edited:**
+
+- `docs/manifests.md`
+- `internal/controller/reconciler.go`
+- `internal/controller/reconciler_test.go`
+- `internal/substrate/client.go`
+- `internal/substrate/client_test.go`
+- `pkg/apis/v1alpha1/ax.pb.go`
+- `pkg/apis/v1alpha1/ax.proto`
+- `pkg/apis/v1alpha1/types.go`
+- `pkg/apis/v1alpha1/types_test.go`
+
+**New files:** None.
+
+**Tests:** `TestValidateTaskGuestDevices`, `TestBuildActorTemplateGuestDevices`, `TestTaskReconciler_GuestDevices`.
+
+**Reason:** LayerFS tasks need a microvm WorkerPool that supplies `/dev/fuse`.
+
+**Removal condition:** Remove this change when upstream supplies equivalent device selection or the factory stops using it.
+
 ## microvm sandbox class on the pre-1.0 Substrate API
 
 **Bead:** `ax-6so` · **Branch:** `stigenai/deploy` · **Upstream status:** `fork-only`

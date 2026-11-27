@@ -265,7 +265,7 @@ func sandboxConfigFor(sandboxClass string) *ateapipb.SandboxConfig {
 }
 
 // BuildActorTemplate constructs a Substrate ActorTemplate based on the standard ate-env specification.
-func BuildActorTemplate(atespace, name, image string, envMap map[string]string, command []string, snapshotsBucket, supervisorProfile, sandboxClass string, resources *v1alpha1.ResourceReqs, capabilities []string, workerLabels map[string]string) *ateapipb.ActorTemplate {
+func BuildActorTemplate(atespace, name, image string, envMap map[string]string, command []string, snapshotsBucket, supervisorProfile, sandboxClass string, guestDevices []string, resources *v1alpha1.ResourceReqs, capabilities []string, workerLabels map[string]string) *ateapipb.ActorTemplate {
 	if atespace == "" {
 		atespace = "default"
 	}
@@ -364,10 +364,12 @@ func BuildActorTemplate(atespace, name, image string, envMap map[string]string, 
 			Name: "fabriek-supervisor", MountPath: "/run/substrate/fabriek-supervisor",
 		})
 	}
-	// The selector is the union of the supervisor label and workerLabels. It
-	// stays nil when both are empty.
+	// Add device and supervisor labels after the task's worker labels.
 	selector := map[string]string{}
 	maps.Copy(selector, workerLabels)
+	for _, d := range guestDevices {
+		selector[v1alpha1.GuestDeviceLabel(d)] = "true"
+	}
 	if supervisorProfile == v1alpha1.FabriekSupervisorProfile {
 		selector["fabriek.dev/supervisor-profile"] = v1alpha1.FabriekSupervisorProfile
 	}
@@ -378,7 +380,7 @@ func BuildActorTemplate(atespace, name, image string, envMap map[string]string, 
 }
 
 // EnsureActorTemplateWithImage creates an ActorTemplate using the specified container image and optional environment variables.
-func (c *Client) EnsureActorTemplateWithImage(ctx context.Context, baseAtespace, baseTemplate, targetAtespace, targetTemplate, image, supervisorProfile, sandboxClass string, resources *v1alpha1.ResourceReqs, capabilities []string, workerLabels map[string]string, extraEnv ...map[string]string) (*ateapipb.ActorTemplate, error) {
+func (c *Client) EnsureActorTemplateWithImage(ctx context.Context, baseAtespace, baseTemplate, targetAtespace, targetTemplate, image, supervisorProfile, sandboxClass string, guestDevices []string, resources *v1alpha1.ResourceReqs, capabilities []string, workerLabels map[string]string, extraEnv ...map[string]string) (*ateapipb.ActorTemplate, error) {
 	envMap := make(map[string]string)
 	for _, envs := range extraEnv {
 		for k, v := range envs {
@@ -386,7 +388,7 @@ func (c *Client) EnsureActorTemplateWithImage(ctx context.Context, baseAtespace,
 		}
 	}
 
-	tmpl := BuildActorTemplate(targetAtespace, targetTemplate, image, envMap, nil, "", supervisorProfile, sandboxClass, resources, capabilities, workerLabels)
+	tmpl := BuildActorTemplate(targetAtespace, targetTemplate, image, envMap, nil, "", supervisorProfile, sandboxClass, guestDevices, resources, capabilities, workerLabels)
 	existing, err := c.GetActorTemplate(ctx, targetAtespace, targetTemplate)
 	if err == nil && existing != nil {
 		if supervisorProfile != "" && !sameTemplateSpec(existing, tmpl) {

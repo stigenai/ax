@@ -103,9 +103,13 @@ message TaskSpec {
   // cluster-scoped SandboxConfig named "microvm".
   string sandbox_class = 13;
   // worker_labels pin the task to workers: it runs only on workers whose
-  // WorkerPool labels contain all these pairs. Empty means the server default
-  // (AX_DEFAULT_WORKER_LABELS on ax-controller).
+  // WorkerPool labels match the task's selector. A device or supervisor
+  // selector replaces AX_DEFAULT_WORKER_LABELS. Device labels take precedence.
   map<string, string> worker_labels = 14;
+  // guest_devices requests device nodes for a microvm task. Use "fuse" to
+  // request /dev/fuse. The ActorTemplate selects WorkerPools with the label
+  // ate.dev/guest-device-fuse: "true". A FUSE mount also needs SYS_ADMIN.
+  repeated string guest_devices = 15;
 }
 
 message EnvVar {

@@ -910,6 +910,45 @@ func TestTaskReconciler_SandboxClass(t *testing.T) {
 	}
 }
 
+// spec.guestDevices sets the template's WorkerSelector and its name digest,
+// but stays out of AX_TASK_YAML, which a runner built before the field would refuse.
+func TestTaskReconciler_GuestDevices(t *testing.T) {
+	reconcile := func(devices []string, labels map[string]string) *ateapipb.ActorTemplate {
+		mockSrv := &mockControlServer{}
+		task := envTask("x")
+		task.Spec.SandboxClass = v1alpha1.SandboxClassMicroVM
+		task.Spec.GuestDevices = devices
+		task.Spec.WorkerLabels = labels
+		r := newTestReconciler(t, mockSrv)
+		r.DefaultWorkerLabels = map[string]string{"workload": "ax"}
+		if _, err := r.Reconcile(context.Background(), task); err != nil {
+			t.Fatalf("Reconcile(%v) failed: %v", devices, err)
+		}
+		return mockSrv.lastTemplate
+	}
+	devices := []string{v1alpha1.GuestDeviceFUSE}
+	plain, fuse := reconcile(nil, nil), reconcile(devices, nil)
+
+	if got := plain.GetWorkerSelector().GetMatchLabels(); len(got) != 1 || got["workload"] != "ax" {
+		t.Errorf("no guest devices: MatchLabels = %v, want workload=ax", got)
+	}
+	if got := fuse.GetWorkerSelector().GetMatchLabels(); len(got) != 1 || got["ate.dev/guest-device-fuse"] != "true" {
+		t.Errorf("fuse: WorkerSelector = %v", fuse.GetWorkerSelector())
+	}
+	pinned := reconcile(devices, map[string]string{"workload": "ax-microvm-fuse", "ate.dev/guest-device-fuse": "false"})
+	if got := pinned.GetWorkerSelector().GetMatchLabels(); len(got) != 2 || got["workload"] != "ax-microvm-fuse" || got["ate.dev/guest-device-fuse"] != "true" {
+		t.Errorf("fuse with worker labels: MatchLabels = %v", got)
+	}
+	if plain.GetMetadata().GetName() == fuse.GetMetadata().GetName() {
+		t.Errorf("guest devices did not change the template name %q", plain.GetMetadata().GetName())
+	}
+	for _, e := range fuse.GetContainers()[0].GetEnv() {
+		if e.GetName() == "AX_TASK_YAML" && strings.Contains(e.GetValue(), "fuse") {
+			t.Errorf("AX_TASK_YAML carries the guest devices: %q", e.GetValue())
+		}
+	}
+}
+
 // taskTopLevelMemory returns the top-level memory limit quantity the mock
 // server captured, or "" if the template carries no top-level Resources.
 func taskTopLevelMemory(tmpl *ateapipb.ActorTemplate) string {

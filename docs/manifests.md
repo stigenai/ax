@@ -38,7 +38,9 @@ spec:
 
 ### Worker labels
 
-`spec.workerLabels` (protojson name `workerLabels`) pins a task to the workers whose WorkerPool labels contain all the given pairs. It becomes the `workerSelector.matchLabels` of the task's ActorTemplate. Keys must be Kubernetes label names, values must be label values, and a task may set at most 8 pairs. A task that sets none runs on the workers that match `AX_DEFAULT_WORKER_LABELS`, a comma-separated `key=value` list (for example `workload=ax`) that ax-controller reads. If the variable is empty or unset, such a task can use any worker. A malformed value stops ax-controller at start. The labels apply when the task's ActorTemplate is created; an existing template is not changed.
+`spec.workerLabels` (protojson name `workerLabels`) sets the `workerSelector.matchLabels` of the task's ActorTemplate. The WorkerPool must match the selector. Use Kubernetes label names and label values. A task can set up to 8 pairs.
+
+The controller reads `AX_DEFAULT_WORKER_LABELS` as a comma-separated `key=value` list (for example `workload=ax`). AX uses those defaults for tasks without worker labels, guest devices or a supervisor profile. An empty or unset variable adds no labels. An invalid value stops ax-controller at start. AX applies these labels when it creates the ActorTemplate.
 
 ### Capabilities
 
@@ -49,6 +51,23 @@ The task container starts as root with Substrate's default capabilities, `AUDIT_
 `spec.sandboxClass` selects the Substrate sandbox for the task actor. Empty or `gvisor` uses gVisor and the `gvisor-default` SandboxConfig. `microvm` uses a Cloud Hypervisor guest with a real Linux kernel and the cluster-scoped SandboxConfig named `microvm`. Use `microvm` for work that gVisor cannot run, such as Nix builds. A `microvm` task stays pending until a WorkerPool with `sandboxClass: microvm` has a free worker. The Fabriek supervisor profile rejects `microvm`.
 
 A root Nix build inside a `microvm` task also needs capabilities, because Nix changes the owner of `/nix/store` and starts its builds as the `nixbld` users. In a test on 2026-10-26, a build with these capabilities passed: `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `FSETID`, `SETUID`, `SETGID`, `SETPCAP`, `SETFCAP`, `MKNOD`, `SYS_ADMIN`, `SYS_CHROOT` and `SYS_PTRACE`. A smaller set was not tested.
+
+### Guest devices
+
+`spec.guestDevices` requests device nodes in the guest of a `microvm` task. Use `guestDevices: [fuse]` to request `/dev/fuse`. AX rejects this field on other sandbox classes.
+
+```yaml
+spec:
+  sandboxClass: microvm
+  guestDevices: [fuse]
+  capabilities: [SYS_ADMIN, SETUID, SETGID]
+```
+
+The ActorTemplate selects WorkerPools with the label `ate.dev/guest-device-fuse: "true"`. Set that label on a `microvm` WorkerPool that sets the same Substrate `spec.guestDevices`. If no pool with that label has a free worker, the task stays pending.
+
+The device selector replaces `AX_DEFAULT_WORKER_LABELS`. If the task sets `spec.workerLabels`, AX adds the device label to those labels. The device label takes precedence if the task sets the same key.
+
+A FUSE mount also needs `SYS_ADMIN` in `spec.capabilities`. LayerFS needs `SETUID` and `SETGID` to run its command as a non-root user.
 
 ### Binding several workspaces
 
