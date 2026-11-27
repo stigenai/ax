@@ -30,17 +30,31 @@ One class must show `(default)`.
 
 The migration operator keeps the rollback copy. The operator is the person who runs the migration. Keep the copy on persistent local storage outside the checkout. Do not use shared temporary storage (`/tmp`) or a path with automatic cleanup.
 
-Make one new private directory under your home. Run all local steps in it. Run `umask 077` in each new shell before the first capture.
+Start at the root of the checkout. Make one new private directory under your home. Run all local steps in it. Run `umask 077` before the first capture.
 
 ```bash
 umask 077
+REDIS_MANIFEST="$(pwd -P)/deploy/redis.yaml"
+test -r "$REDIS_MANIFEST" || exit 1
 WORK="$HOME/ax-redis-migration.$(date +%Y%m%d%H%M%S).$$"
 mkdir -m 700 "$WORK" || exit 1
-test "$(stat -c '%u %a' "$WORK")" = "$(id -u) 700" || exit 1
+test -O "$WORK" && test "$(ls -ld "$WORK" | cut -c1-10)" = "drwx------" || exit 1
 cd "$WORK" || exit 1
 ```
 
-If a command fails, stop. Do not start a capture. The `stat` check makes sure that you own the directory and that its mode is 700. The `kubectl exec` command does not use the local umask. Set the mode of each directory in the pod yourself.
+`REDIS_MANIFEST` keeps the absolute path of the manifest. If a command fails, stop. Do not start a capture.
+
+The `test -O` and `ls -ld` checks make sure that you own the directory and that its mode is 700. They work on Linux and macOS.
+
+Use this one shell for all steps. The steps use relative paths in `WORK`. Step 3 needs `REDIS_MANIFEST`. Cleanup needs `WORK`.
+
+If you lose the shell before the first capture, start again from the checkout root. Make a new private directory.
+
+If you lose the shell after any capture or after the start of step 1, stop. Do not repeat step 1. Do not make a new directory. Keep the original directory and all files that you captured so far.
+
+Partial shutdown, seed, rollback and cleanup need these files. Ask the owner how to go on.
+
+The `kubectl exec` command does not use the local umask. Set the mode of each directory in the pod yourself.
 
 ## Task inventory
 
@@ -87,7 +101,7 @@ Before step 1, while ax-server still runs, keep the output of `ax -a <atespace> 
 3. Apply the manifest. The Recreate strategy stops the old pod first.
 
    ```bash
-   kubectl --context gtr apply -f deploy/redis.yaml
+   kubectl --context gtr apply -f "$REDIS_MANIFEST"
    kubectl --context gtr -n ax-system rollout status deploy/ax-redis
    ```
 
@@ -210,7 +224,7 @@ Use this procedure only before the writers resume.
 ### Rollback before the writers resume (before Migration step 6)
 
 1. Scale the writers to 0 (they are 0 already).
-2. Apply the old `deploy/redis.yaml`. Redis starts with no data.
+2. Apply the old `deploy/redis.yaml` with its absolute path. Redis starts with no data.
 3. Seed it from `ax-redis-before.rdb` with the same steps as in "Migration" step 4. No write happened after that file, so no data is lost.
 4. Wait until Redis answers PING. Check `DBSIZE` and the task inventory against the baseline of Migration step 2. Scale the writers back to 1. Wait for the rollout.
 5. Run `ax -a <atespace> get task <name>` for 3 tasks. Each command must succeed.
