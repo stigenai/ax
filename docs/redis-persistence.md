@@ -28,18 +28,21 @@ One class must show `(default)`.
 
 ## Private work directory
 
-Start at the root of the checkout. Make one private directory outside the checkout. Run all subsequent local steps in it. Run `umask 077` in each new shell.
+The migration operator keeps the rollback copy. The operator is the person who runs the migration. Keep the copy on persistent local storage outside the checkout. Do not use shared temporary storage (`/tmp`) or a path with automatic cleanup.
+
+Make one new private directory under your home. Run all local steps in it. Start at the root of the checkout. Run `umask 077` in each new shell before the first capture.
 
 ```bash
 umask 077
 REDIS_MANIFEST="$(pwd -P)/deploy/redis.yaml"
-WORK=$(mktemp -d "${TMPDIR:-/tmp}/ax-redis-migration.XXXXXX") &&
-  cd "$WORK" &&
-  ls -ld "$WORK" &&
-  test -r "$REDIS_MANIFEST"
+test -r "$REDIS_MANIFEST" || exit 1
+WORK="$HOME/ax-redis-migration.$(date +%Y%m%d%H%M%S).$$"
+mkdir -m 700 "$WORK" || exit 1
+test "$(stat -c '%u %a' "$WORK")" = "$(id -u) 700" || exit 1
+cd "$WORK" || exit 1
 ```
 
-`mktemp -d` makes the directory with mode 700. The permissions from `ls -ld` must start with `drwx------`. If the block fails or the permissions differ, stop before you stop the writers. Keep the same shell for the migration. The `kubectl exec` command does not use the local umask. Set the mode of each directory in the pod yourself.
+`REDIS_MANIFEST` keeps the absolute path of the manifest. If a command fails, stop. Do not start a capture. The `stat` check makes sure that you own the directory and that its mode is 700. The `kubectl exec` command does not use the local umask. Set the mode of each directory in the pod yourself.
 
 ## Task inventory
 
@@ -61,6 +64,8 @@ The task inventory and the `ax get task` output name tasks and can show task spe
 
 A plain apply of the new manifest starts Redis with 0 keys. Redis with `--appendonly yes` ignores `dump.rdb` when it has no AOF file. Seed the new Redis from the old data.
 
+Before step 1, while ax-server still runs, keep the output of `ax -a <atespace> get task <name>` for 3 tasks. Compare the inventory in step 6.
+
 1. Stop the writers. If a writer runs during the save, the saved file lacks its last writes.
 
    ```bash
@@ -71,7 +76,7 @@ A plain apply of the new manifest starts Redis with 0 keys. Redis with `--append
 
 2. Record the baseline after the writers are gone: the task inventory (see "Task inventory") and `DBSIZE`. Then save the data and keep the file. It is the rollback copy.
 
-   The file holds the full database. It can contain tokens. Run this step in the private work directory. Its `ls -l` must show mode `-rw-------`.
+   The file holds the full database. It can contain tokens. Run this step in the private work directory. For the RDB file, `ls -l` must show `-rw-------`.
 
    ```bash
    kubectl --context gtr -n ax-system exec deploy/ax-redis -- redis-cli SAVE
@@ -80,8 +85,6 @@ A plain apply of the new manifest starts Redis with 0 keys. Redis with `--append
    ls -l ax-redis-before.rdb
    kubectl --context gtr -n ax-system exec deploy/ax-redis -- redis-cli DBSIZE
    ```
-
-   Before step 1, while ax-server still runs, keep the output of `ax -a <atespace> get task <name>` for 3 tasks. Compare the inventory in step 6.
 
 3. Apply the manifest. The Recreate strategy stops the old pod first.
 
@@ -119,6 +122,8 @@ A plain apply of the new manifest starts Redis with 0 keys. Redis with `--append
 
 5. Check. `DBSIZE` must equal the baseline. `INFO persistence` must show `aof_enabled:1` and `aof_last_write_status:ok`.
 
+   The replica sync of step 4 starts an AOF rewrite. Until the rewrite ends, the AOF on the volume does not hold the seeded data. Repeat `INFO persistence` until it shows `aof_rewrite_in_progress:0` and `aof_last_bgrewrite_status:ok`. Do this before step 6 scales the writers back.
+
    ```bash
    kubectl --context gtr -n ax-system exec "$POD" -- redis-cli DBSIZE
    kubectl --context gtr -n ax-system exec "$POD" -- redis-cli INFO persistence
@@ -134,7 +139,24 @@ A plain apply of the new manifest starts Redis with 0 keys. Redis with `--append
 
    Wait until Redis answers PING, then record the task inventory again. It must equal the inventory of step 2. Run `ax -a <atespace> get task <name>` for the 3 tasks that you kept before step 1. Each command must succeed.
 
-Remove the private work directory with each local file in it (`ax-redis-before.rdb`, the inventory files and the saved `ax get task` output) when the owner accepts the migration. Leave the directory, then run `rm -r "$WORK"` and `ls -d "$WORK"`. The `ls` must fail with "No such file".
+7. After the migration checks pass, follow [Local backup cleanup](#local-backup-cleanup).
+
+## Local backup cleanup
+
+Keep the private work directory and its files. This includes `ax-redis-before.rdb`, the inventory files and the saved `ax get task` output. Before the writers resume, keep the copy available for rollback. After the writers resume, fix forward (see "Rollback").
+
+If a check fails or the owner has not accepted the outcome, keep the files. After the migration or rollback checks pass and the owner accepts that outcome, the migration operator must do these steps.
+
+1. In the private work directory, remove the dump, each inventory file and each saved task output file by name.
+2. Leave the private work directory.
+3. Remove the empty directory. If `rmdir` fails, check which files remain before you remove them.
+4. Verify that the directory is absent. The `test` command must exit 0.
+
+   ```bash
+   cd "$WORK/.." &&
+     rmdir -- "$WORK" &&
+     test ! -e "$WORK"
+   ```
 
 ## Restart check
 
@@ -179,9 +201,9 @@ Only the owner runs these steps. They need the live cluster. CI and the offline 
 | AC1 manifest | Static check in `deploy/stigenai/redis-persistence-test.sh` | Pre-check: `kubectl --context gtr get storageclass` |
 | AC2 restart keeps data | `bash deploy/stigenai/redis-persistence-test.sh` against a local Redis with a data directory | "Migration", then "Restart check" |
 | AC4, AC5 orphan report | `go test ./internal/controller -run TestDeleteSweepOrphanActors` | Apply ax-controller with `ko`, then read the `delete sweep: orphan actor` log lines |
-| AC7 live migration | None | "Migration" steps 1 to 6 |
-| AC8 soak | None | "Restart check" on the live pod, then watch the controller logs |
-| ax-89l k0s-agents | None (same `deploy/redis.yaml`) | Run "Pre-check", "Migration" and "Restart check" with the k0s-agents context and namespace |
+| AC7 live migration and restart check | None | "Migration" steps 1 to 6, then "Restart check" on the live pod |
+| AC8 soak | None | After the `ko` apply of ax-controller, watch the controller logs for the `orphan_actors` field of `delete sweep: stuck deletions` |
+| ax-89l k0s-agents | None (same `deploy/redis.yaml`) | Run "Pre-check", "Migration" and "Restart check" with the k0s-agents context. The namespace stays `ax-system` |
 
 ## Rollback
 
@@ -195,6 +217,7 @@ Use this procedure only before the writers resume.
 4. Wait until Redis answers PING. Check `DBSIZE` and the task inventory against the baseline of Migration step 2. Scale the writers back to 1. Wait for the rollout.
 5. Run `ax -a <atespace> get task <name>` for 3 tasks. Each command must succeed.
 6. Remove `/tmp/seed` from the pod (Migration step 4). Delete the claim only after steps 4 and 5 pass: `kubectl --context gtr -n ax-system delete pvc ax-redis-data`.
+7. After the rollback checks pass, follow [Local backup cleanup](#local-backup-cleanup).
 
 ### Do not apply the old manifest after the writers resume
 

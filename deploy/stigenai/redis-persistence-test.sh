@@ -29,7 +29,7 @@ q() { yq "$1" "$manifest"; }
 [ "$(q "$pvc | .spec.storageClassName")" = null ] || fail "PVC ax-redis-data must not set storageClassName"
 [ "$(q "$dep | .spec.strategy.type")" = Recreate ] || fail "Deployment ax-redis must use strategy Recreate"
 [ "$(q "$ctr | .command")" = null ] || fail "container redis must use args, not command"
-args=$(q "$ctr | .args | join(\" \")")
+args=$(q "$ctr | .args // [] | join(\" \")")
 case " $args " in *" --appendonly yes "*) ;; *) fail "args must have --appendonly yes" ;; esac
 case " $args " in *" --appendfsync everysec "*) ;; *) fail "args must have --appendfsync everysec" ;; esac
 case " $args " in *" --dir /data "*) ;; *) fail "args must have --dir /data" ;; esac
@@ -46,6 +46,7 @@ work=$(mktemp -d)
 chmod 700 "$work"
 pid=""
 cid=""
+cidfile="$work/cid"
 dvol=""
 read -ra rargs <<<"$args"
 
@@ -54,7 +55,7 @@ read -ra rargs <<<"$args"
 # no TCP port, so it cannot reach a Redis that already runs on the host.
 cleanup() {
   [ -z "$pid" ] || kill -9 "$pid" 2>/dev/null || true
-  [ -z "$cid" ] || docker rm -f "$cid" >/dev/null 2>&1 || true
+  [ ! -s "$cidfile" ] || docker rm -f "$(cat "$cidfile")" >/dev/null 2>&1 || true
   [ -z "$dvol" ] || docker volume rm "$dvol" >/dev/null 2>&1 || true
   rm -rf "$work"
 }
@@ -65,10 +66,20 @@ if command -v docker >/dev/null; then
   dvol=$(docker volume create)
   rc() { docker exec "$cid" redis-cli "$@"; }
   start() {
-    cid=$(docker run -d -v "$dvol:/data" "$image" "${rargs[@]}")
+    # --cidfile keeps the id for cleanup when docker run fails after it made the container.
+    docker run -d --cidfile "$cidfile" -v "$dvol:/data" "$image" "${rargs[@]}" >/dev/null
+    cid=$(cat "$cidfile")
   }
-  crash() { docker kill "$cid" >/dev/null; docker rm "$cid" >/dev/null; cid=""; }
-  stop() { rc SHUTDOWN NOSAVE >/dev/null 2>&1 || true; docker wait "$cid" >/dev/null; docker rm "$cid" >/dev/null; cid=""; }
+  crash() { docker kill "$cid" >/dev/null; docker rm "$cid" >/dev/null; cid=""; rm -f "$cidfile"; }
+  stop() {
+    rc SHUTDOWN NOSAVE >/dev/null 2>&1 || true
+    for _ in $(seq 1 60); do
+      [ "$(docker inspect -f '{{.State.Running}}' "$cid")" = true ] || break
+      sleep 0.5
+    done
+    [ "$(docker inspect -f '{{.State.Running}}' "$cid")" != true ] || fail "container did not stop after SHUTDOWN NOSAVE"
+    docker rm "$cid" >/dev/null; cid=""; rm -f "$cidfile"
+  }
 else
   command -v redis-server >/dev/null || fail "need docker or redis-server on PATH"
   rc() { redis-cli -s "$work/redis.sock" "$@"; }
@@ -83,7 +94,12 @@ else
     pid=$!
   }
   crash() { kill -9 "$pid"; wait "$pid" 2>/dev/null || true; pid=""; rm -f "$work/redis.sock"; }
-  stop() { rc SHUTDOWN NOSAVE >/dev/null 2>&1 || true; wait "$pid" 2>/dev/null || true; pid=""; }
+  stop() {
+    rc SHUTDOWN NOSAVE >/dev/null 2>&1 || true
+    for _ in $(seq 1 60); do kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done
+    ! kill -0 "$pid" 2>/dev/null || fail "redis did not stop after SHUTDOWN NOSAVE"
+    wait "$pid" 2>/dev/null || true; pid=""
+  }
 fi
 
 wait_ready() {
