@@ -221,3 +221,23 @@ Entries are in stack order, the same order as the commits.
 **Reason:** The devenv serves the fork's CI and workers only.
 
 **Removal condition:** Remove the carry when stigenai stops using it, or when upstream adds the same behavior.
+
+## Deploy CI workflow
+
+**Bead:** `ax-brx` · **Branch:** `stigenai/deploy` · **Upstream status:** `fork-only`
+
+**Upstream files edited:**
+
+- none
+
+**New files:**
+
+- `.github/workflows/deploy-ci.yml`
+
+**Tests:**
+
+- none
+
+**Reason:** The workflow guards the fork's deploy branch only.
+
+**Removal condition:** Remove the carry when stigenai stops using it, or when upstream adds the same behavior.
